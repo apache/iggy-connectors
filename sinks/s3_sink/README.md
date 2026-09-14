@@ -16,7 +16,7 @@ Writes messages from Iggy streams to Amazon S3 and S3-compatible object stores (
 
 ### Connector Runtime Config
 
-Build and start the matching 0.9.0/edge broker and connector runtime from the checkout root. Use the [sink guide](https://iggy.apache.org/docs/connectors/sinks/sink/) for broker credentials and the main runtime configuration. Save the following connector entry in its configured connector directory and append one `[plugin_config]` table. Create the bucket separately before startup.
+Build and start the broker and connector runtime from the matching Iggy checkout root. Use the [sink guide](https://iggy.apache.org/docs/connectors/sinks/sink/) for broker credentials and the main runtime configuration. Save the following connector entry in its configured connector directory and append one `[plugin_config]` table. Create the bucket separately before startup.
 
 ```toml
 type = "sink"
@@ -111,7 +111,9 @@ The pinned `aws-creds` chain tries these sources in order:
 
 For temporary key pairs, supply the token through the environment or shared credentials file. This is not the AWS SDK credential chain.
 
-Startup writes an empty object at bucket-root `.iggy-sink-probe`, ignoring `prefix`, and then attempts deletion. It requires `PutObject` on the probe key, not `ListBucket`; non-success HTTP statuses prevent startup. Delete permission is optional and cleanup errors are ignored. Reserve this key: any existing object there is overwritten and, if cleanup succeeds, deleted.
+Startup initiates a multipart upload at `<prefix>/.iggy-sink-probe` (bucket root when the prefix is empty) and aborts it before consuming messages. No parts are uploaded and no object is published or deleted. Both steps must succeed: missing buckets, denied writes or failed cleanup prevent startup. The credentials need `s3:PutObject` and `s3:AbortMultipartUpload` on the probe key, plus `s3:PutObject` on data and loss-marker keys. Neither `ListBucket` nor `DeleteObject` is required.
+
+Each probe step uses `max_attempts` and `retry_delay` for HTTP 408, 429 and 5xx failures. Abort also retries transport failures. Initiation does not add retries for an ambiguous transport failure because the upload ID may be lost; rust-s3 can still retry internally. A crash or lost response can leave an incomplete upload, so configure an `AbortIncompleteMultipartUpload` lifecycle rule. Failed aborts report the upload ID for cleanup.
 
 ## Output Example
 
@@ -162,7 +164,7 @@ secret_access_key = "..."
 
 The runtime auto-commits while polling, logs/counts a failed plugin callback, and continues without replaying that batch. A successful callback may only mean that messages were buffered; processed counts do not establish S3 delivery. A crash loses unflushed buffers.
 
-The sink retries HTTP 408, 429, 5xx and client errors, using exponential backoff with jitter capped at 60 seconds. Other HTTP statuses stop that upload. `Retry-After` is not parsed. The S3 library also retries transport errors once internally and has a 60-second request timeout, so `max_attempts` counts outer `PutObject` calls, not individual network requests or a total time budget. The startup probe does not use the sink's upload retry loop.
+The sink retries HTTP 408, 429 and 5xx responses, plus rust-s3 request errors, using exponential backoff with jitter capped at 60 seconds. Other HTTP statuses stop that upload. `Retry-After` is not parsed. The S3 library also retries transport errors once internally and has a 60-second request timeout, so `max_attempts` counts outer `PutObject` calls, not individual network requests or a total time budget.
 
 ## Known Limitations
 

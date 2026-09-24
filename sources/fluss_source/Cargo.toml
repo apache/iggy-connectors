@@ -52,5 +52,17 @@ simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+ctor = { workspace = true }
+dtor = { workspace = true }
+iggy = { workspace = true }
+iggy_common = { workspace = true }
+iggy_connector_sdk = { workspace = true, features = ["api"] }
+iggy_connector_testing = { workspace = true }
+integration = { workspace = true }
+reqwest = { workspace = true }
+serial_test = { workspace = true }
+testcontainers-modules = { workspace = true }
+
 [lints]
 workspace = true

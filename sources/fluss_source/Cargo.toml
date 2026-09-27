@@ -44,7 +44,6 @@ fluss-rs = { workspace = true }
 humantime = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
-rmp-serde = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -61,6 +60,7 @@ iggy_connector_sdk = { workspace = true, features = ["api"] }
 iggy_connector_testing = { workspace = true }
 integration = { workspace = true }
 reqwest = { workspace = true }
+rmp-serde = { workspace = true }
 serial_test = { workspace = true }
 testcontainers-modules = { workspace = true }
 

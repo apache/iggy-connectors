@@ -5607,7 +5607,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "simd-json",
  "testcontainers-modules",
  "tokio",
  "tracing",

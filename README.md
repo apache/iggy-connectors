@@ -193,6 +193,7 @@ A `Sink` implementation uses the `sink_connector!` macro, which exposes the FFI 
 | [Meilisearch](sinks/meilisearch_sink/README.md)     | a Meilisearch index                                                     |
 | [MongoDB](sinks/mongodb_sink/README.md)             | a MongoDB collection                                                    |
 | [PostgreSQL](sinks/postgres_sink/README.md)         | PostgreSQL tables                                                       |
+| [QuestDB](sinks/questdb_sink/README.md)             | QuestDB tables, through QWP over WebSocket, with store-and-forward      |
 | [Quickwit](sinks/quickwit_sink/README.md)           | a Quickwit index                                                        |
 | [RabbitMQ](sinks/rabbitmq_sink/README.md)           | RabbitMQ exchanges, through AMQP 0.9.1                                  |
 | [Amazon Redshift](sinks/redshift_sink/README.md)    | Redshift tables, with Parquet files in S3 as the staging area           |

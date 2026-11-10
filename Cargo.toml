@@ -30,6 +30,7 @@ members = [
     "sinks/meilisearch_sink",
     "sinks/mongodb_sink",
     "sinks/postgres_sink",
+    "sinks/questdb_sink",
     "sinks/quickwit_sink",
     "sinks/rabbitmq_sink",
     "sinks/redshift_sink",
@@ -140,6 +141,12 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 protox = "0.10.0"
 protox-parse = "0.10.0"
+questdb-rs = { version = "7.2.1", default-features = false, features = [
+    "sync-sender-qwp-ws",
+    "tls-webpki-certs",
+    "tls-native-certs",
+    "ring-crypto",
+] }
 rand = "0.10.3"
 regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }

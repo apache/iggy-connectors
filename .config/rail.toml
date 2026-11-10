@@ -137,6 +137,12 @@ cargo_prerequisites = [
         { package = "iggy_connector_postgres_source", target = { name = "iggy_connector_postgres_source", kind = "cdylib" } },
     ] },
     { source_work = "cargo.test", when = [
+        { package = "iggy_connector_questdb_sink", target = { name = "questdb", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_questdb_sink", target = { name = "iggy_connector_questdb_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
         { package = "iggy_connector_quickwit_sink", target = { name = "quickwit", kind = "test" } },
     ], require = [
         { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },

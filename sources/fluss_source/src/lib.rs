@@ -167,6 +167,8 @@ pub struct FlussSource {
     table_path: TablePath,
     poll_interval: Duration,
     poll_timeout: Duration,
+    /// The most records one scanner poll returns, `batch_size` or the client default.
+    max_poll_records: usize,
     include_metadata: bool,
     verbose_logging: bool,
     /// Set when a saved state was handed over but could not be decoded. `open()` refuses to
@@ -187,6 +189,9 @@ pub struct FlussSource {
     /// collected, dropping them, so the next poll points it back at the committed offsets
     /// before reading again.
     rewind_required: AtomicBool,
+    /// Set when the last scanner poll returned `max_poll_records` records, so more are likely
+    /// waiting and the next poll reads without waiting for `poll_interval`.
+    full_batch_read: AtomicBool,
     /// Set when `open()` resolved start offsets that are not on disk yet. Polls send them alone,
     /// holding back any rows read, until a batch is acknowledged, so a restart does not resolve
     /// `latest` again and skip what was written in between.
@@ -224,6 +229,10 @@ impl FlussSource {
             "poll_timeout",
             id,
         );
+        let max_poll_records = config.batch_size.map_or_else(
+            || Config::default().scanner_log_max_poll_records,
+            |batch_size| batch_size as usize,
+        );
         let include_metadata = config.include_metadata.unwrap_or(false);
         let verbose_logging = config.verbose_logging.unwrap_or(false);
         let table_path = TablePath::new(config.database.clone(), config.table.clone());
@@ -247,6 +256,7 @@ impl FlussSource {
             table_path,
             poll_interval,
             poll_timeout,
+            max_poll_records,
             include_metadata,
             verbose_logging,
             unreadable_state,
@@ -256,6 +266,7 @@ impl FlussSource {
             staged: Mutex::new(None),
             replay: Mutex::new(None),
             rewind_required: AtomicBool::new(false),
+            full_batch_read: AtomicBool::new(false),
             start_offsets_unsaved: AtomicBool::new(false),
         }
     }
@@ -263,9 +274,15 @@ impl FlussSource {
     /// After a failed poll `poll()` waits at least [`MIN_PAUSE_AFTER_FAILED_POLL`]. The SDK
     /// polls again as soon as `poll()` returns an error, so with a zero `poll_interval` an error
     /// that repeats, such as an offset out of range, would be retried at network speed.
+    ///
+    /// After a full batch it reads again at once, since waiting `poll_interval` between full
+    /// batches would cap the source at `batch_size` rows per interval. An idle table still
+    /// waits on the server for up to `poll_timeout`.
     fn pause_before_poll(&self) -> Duration {
         if self.rewind_required.load(Ordering::Acquire) {
             self.poll_interval.max(MIN_PAUSE_AFTER_FAILED_POLL)
+        } else if self.full_batch_read.load(Ordering::Acquire) {
+            Duration::ZERO
         } else {
             self.poll_interval
         }
@@ -280,9 +297,7 @@ impl FlussSource {
             bootstrap_servers: self.config.bootstrap_servers.clone(),
             ..Config::default()
         };
-        if let Some(batch_size) = self.config.batch_size {
-            config.scanner_log_max_poll_records = batch_size as usize;
-        }
+        config.scanner_log_max_poll_records = self.max_poll_records;
         if let (Some(username), Some(password)) =
             (&self.config.sasl_username, &self.config.sasl_password)
         {
@@ -727,7 +742,10 @@ impl Source for FlussSource {
                         self.id
                     )));
                 };
-                self.read(scanner).await?
+                let records = self.read(scanner).await?;
+                self.full_batch_read
+                    .store(records.count() >= self.max_poll_records, Ordering::Release);
+                records
             }
         };
         // Unsaved start offsets go out alone first. A batch without rows has nothing for the
@@ -1510,6 +1528,33 @@ mod tests {
         source.rewind_required.store(true, Ordering::Release);
 
         assert_eq!(source.pause_before_poll(), MIN_PAUSE_AFTER_FAILED_POLL);
+    }
+
+    #[test]
+    fn given_full_batch_should_read_again_without_pausing() {
+        let source = FlussSource::new(1, test_config(), None);
+        source.full_batch_read.store(true, Ordering::Release);
+
+        assert_eq!(source.pause_before_poll(), Duration::ZERO);
+
+        source.rewind_required.store(true, Ordering::Release);
+        assert_eq!(source.pause_before_poll(), MIN_PAUSE_AFTER_FAILED_POLL);
+    }
+
+    #[test]
+    fn given_no_batch_size_should_count_a_full_batch_at_the_client_default() {
+        let mut config = test_config();
+        config.batch_size = None;
+        let source = FlussSource::new(1, config, None);
+
+        assert_eq!(
+            source.max_poll_records,
+            Config::default().scanner_log_max_poll_records
+        );
+        assert_eq!(
+            source.client_config().scanner_log_max_poll_records,
+            source.max_poll_records
+        );
     }
 
     #[test]

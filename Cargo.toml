@@ -29,6 +29,7 @@ members = [
     "sinks/influxdb_sink",
     "sinks/meilisearch_sink",
     "sinks/mongodb_sink",
+    "sinks/otlp_sink",
     "sinks/postgres_sink",
     "sinks/quickwit_sink",
     "sinks/rabbitmq_sink",
@@ -90,6 +91,7 @@ elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-
 figlet-rs = "1.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 flatbuffers = "25.12.19"
+flate2 = "1.1.10"
 flume = "0.12.0"
 futures = "0.3.34"
 gcloud-bigquery = { version = "1.8.0", default-features = false, features = [
@@ -129,6 +131,7 @@ opentelemetry-otlp = { version = "0.33.1", features = [
     "http-proto",
     "reqwest-client",
 ] }
+opentelemetry-proto = { version = "0.33.1", default-features = false }
 opentelemetry-semantic-conventions = "0.33.1"
 opentelemetry_sdk = { version = "0.33.1", features = [
     "logs",

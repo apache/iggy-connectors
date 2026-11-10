@@ -67,7 +67,7 @@ pub struct FlussSourceConfig {
     /// silently ignored.
     pub table_type: Option<String>,
     /// `earliest` (default), `latest`, or an explicit numeric offset applied to every bucket.
-    pub starting_offset: Option<String>,
+    pub starting_offset: Option<StartingOffsetValue>,
     /// Columns written to each message, in this order. Omit to write every column. An empty
     /// list or a repeated name is rejected.
     pub columns: Option<Vec<String>>,
@@ -143,6 +143,15 @@ enum StartingOffset {
     Explicit(i64),
 }
 
+/// `starting_offset` as written in the configuration. A TOML integer, or an environment
+/// override made of digits, reaches the connector as a number rather than a string.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StartingOffsetValue {
+    Offset(i64),
+    Name(String),
+}
+
 impl FromStr for StartingOffset {
     type Err = Error;
 
@@ -150,15 +159,42 @@ impl FromStr for StartingOffset {
         match value {
             "earliest" => Ok(StartingOffset::Earliest),
             "latest" => Ok(StartingOffset::Latest),
-            other => match other.parse::<i64>() {
-                Ok(offset) if offset >= 0 => Ok(StartingOffset::Explicit(offset)),
-                _ => Err(Error::InitError(format!(
-                    "invalid starting_offset '{other}' for {CONNECTOR_NAME}, expected 'earliest', \
-                     'latest' or a non-negative offset"
-                ))),
-            },
+            other => other
+                .parse::<i64>()
+                .map_err(|_| invalid_starting_offset(other))
+                .and_then(StartingOffset::try_from),
         }
     }
+}
+
+impl TryFrom<i64> for StartingOffset {
+    type Error = Error;
+
+    fn try_from(offset: i64) -> Result<Self, Self::Error> {
+        if offset >= 0 {
+            Ok(StartingOffset::Explicit(offset))
+        } else {
+            Err(invalid_starting_offset(offset))
+        }
+    }
+}
+
+impl TryFrom<&StartingOffsetValue> for StartingOffset {
+    type Error = Error;
+
+    fn try_from(value: &StartingOffsetValue) -> Result<Self, Self::Error> {
+        match value {
+            StartingOffsetValue::Offset(offset) => StartingOffset::try_from(*offset),
+            StartingOffsetValue::Name(name) => name.parse(),
+        }
+    }
+}
+
+fn invalid_starting_offset(value: impl std::fmt::Display) -> Error {
+    Error::InitError(format!(
+        "invalid starting_offset '{value}' for {CONNECTOR_NAME}, expected 'earliest', 'latest' or \
+         a non-negative offset"
+    ))
 }
 
 pub struct FlussSource {
@@ -378,9 +414,8 @@ impl FlussSource {
 
         self.config
             .starting_offset
-            .as_deref()
-            .unwrap_or("earliest")
-            .parse()
+            .as_ref()
+            .map_or(Ok(StartingOffset::Earliest), StartingOffset::try_from)
     }
 
     /// Only the table's current buckets are subscribed. A bucket already present in the restored
@@ -1020,7 +1055,7 @@ mod tests {
     fn given_invalid_state_should_refuse_to_open() {
         let invalid = ConnectorState(b"not valid msgpack".to_vec());
         let mut config = test_config();
-        config.starting_offset = Some("latest".to_owned());
+        config.starting_offset = Some(StartingOffsetValue::Name("latest".to_owned()));
 
         let mut source = FlussSource::new(1, config, Some(invalid));
 
@@ -1124,7 +1159,7 @@ mod tests {
     #[test]
     fn given_latest_starting_offset_should_be_parsed() {
         let mut config = test_config();
-        config.starting_offset = Some("latest".to_owned());
+        config.starting_offset = Some(StartingOffsetValue::Name("latest".to_owned()));
         let source = FlussSource::new(1, config, None);
 
         let start = source.validate_config().expect("latest should be accepted");
@@ -1135,7 +1170,7 @@ mod tests {
     #[test]
     fn given_explicit_starting_offset_should_be_parsed() {
         let mut config = test_config();
-        config.starting_offset = Some("128".to_owned());
+        config.starting_offset = Some(StartingOffsetValue::Name("128".to_owned()));
         let source = FlussSource::new(1, config, None);
 
         let start = source
@@ -1148,7 +1183,7 @@ mod tests {
     #[test]
     fn given_unparsable_starting_offset_should_be_rejected() {
         let mut config = test_config();
-        config.starting_offset = Some("beginning".to_owned());
+        config.starting_offset = Some(StartingOffsetValue::Name("beginning".to_owned()));
         let source = FlussSource::new(1, config, None);
 
         assert!(source.validate_config().is_err());
@@ -1157,7 +1192,7 @@ mod tests {
     #[test]
     fn given_negative_starting_offset_should_be_rejected() {
         let mut config = test_config();
-        config.starting_offset = Some("-1".to_owned());
+        config.starting_offset = Some(StartingOffsetValue::Name("-1".to_owned()));
         let source = FlussSource::new(1, config, None);
 
         let error = source
@@ -1165,6 +1200,49 @@ mod tests {
             .expect_err("A negative offset should be rejected");
 
         assert!(matches!(error, Error::InitError(message) if message.contains("-1")));
+    }
+
+    /// The runtime hands plugin configuration over as JSON, where a TOML integer and an
+    /// environment override made of digits both become numbers.
+    fn config_with_starting_offset(starting_offset: Value) -> FlussSourceConfig {
+        serde_json::from_value(serde_json::json!({
+            "bootstrap_servers": "localhost:9123",
+            "database": "analytics",
+            "table": "events",
+            "starting_offset": starting_offset,
+        }))
+        .expect("The configuration should deserialize")
+    }
+
+    #[test]
+    fn given_numeric_starting_offset_should_be_parsed() {
+        let source = FlussSource::new(1, config_with_starting_offset(Value::from(128)), None);
+
+        let start = source
+            .validate_config()
+            .expect("A numeric offset should be accepted");
+
+        assert!(matches!(start, StartingOffset::Explicit(128)));
+    }
+
+    #[test]
+    fn given_negative_numeric_starting_offset_should_be_rejected() {
+        let source = FlussSource::new(1, config_with_starting_offset(Value::from(-5)), None);
+
+        let error = source
+            .validate_config()
+            .expect_err("A negative offset should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("-5")));
+    }
+
+    #[test]
+    fn given_named_starting_offset_in_json_should_be_parsed() {
+        let source = FlussSource::new(1, config_with_starting_offset(Value::from("latest")), None);
+
+        let start = source.validate_config().expect("latest should be accepted");
+
+        assert!(matches!(start, StartingOffset::Latest));
     }
 
     #[test]

@@ -48,6 +48,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 ctor = { workspace = true }
 dtor = { workspace = true }
+http = { workspace = true }
 iggy = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_testing = { workspace = true }

@@ -5782,6 +5782,7 @@ dependencies = [
  "ctor 1.0.13",
  "dtor 1.0.6",
  "flate2",
+ "http",
  "humantime",
  "iggy",
  "iggy_common",

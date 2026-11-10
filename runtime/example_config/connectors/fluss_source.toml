@@ -25,8 +25,8 @@ plugin_config_format = "toml"
 verbose = false
 
 [[streams]]
-stream = "events"
-topic = "fluss_events"
+stream = "fluss_events"
+topic = "events"
 schema = "json"
 batch_length = 100
 linger_time = "5ms"

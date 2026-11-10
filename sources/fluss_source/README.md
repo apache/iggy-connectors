@@ -20,7 +20,7 @@ After five rejected batches in a row the source stops and needs a manual connect
 | `poll_timeout` | no | `5s` | How long a single server poll waits for records. It and `poll_interval` cannot both be zero. |
 | `batch_size` | no | `500` | Maximum records returned per poll (`scanner.log.max-poll-records`). Must be greater than 0. |
 | `payload_format` | no | `json` | Only `json` is accepted. See [Limitations](#limitations). |
-| `include_metadata` | no | `false` | Adds `_fluss_bucket`, `_fluss_offset` and `_fluss_timestamp` to each JSON object. While it is on, a column whose name starts with `_fluss_` is rejected at startup, since it would be overwritten. |
+| `include_metadata` | no | `false` | Adds `_fluss_bucket`, `_fluss_offset` and `_fluss_timestamp` (the record timestamp in epoch milliseconds) to each JSON object. While it is on, a column whose name starts with `_fluss_` is rejected at startup, since it would be overwritten. |
 | `sasl_username` | no | | Enables SASL/PLAIN together with `sasl_password`. Set both or neither. `fluss-rs` 1.0 has no TLS setting, so both cross the network in clear text. Use SASL only on a network you trust. |
 | `sasl_password` | no | | The connector never logs it and `/stats` never shows it, but the runtime does not redact it: it logs the raw plugin config at trace level and returns it from its config API, such as `GET /sources/{key}/configs/plugin`. |
 | `verbose_logging` | no | `false` | Logs per-batch counts at info instead of debug. |
@@ -51,7 +51,7 @@ batch_size = 500
 
 The connector produces JSON, so give each `[[streams]]` entry `schema = "json"` or another schema the runtime can encode JSON into. `raw` is not one: the runtime rejects every batch, and the source stops after five of them.
 
-Bring up a local cluster with the [official Docker compose recipe](https://fluss.apache.org/docs/install-deploy/deploying-with-docker/) (ZooKeeper, one coordinator server, one tablet server), create the stream and topic with the Apache Iggy CLI, then start the connectors runtime.
+Bring up a local cluster with the [official Docker compose recipe](https://fluss.apache.org/docs/install-deploy/deploying-with-docker/) (ZooKeeper, one coordinator server, one tablet server), then start the connectors runtime. The runtime creates a missing stream and topic itself. A topic you create with the Apache Iggy CLI needs `--durability persisted`, since the runtime refuses a source topic with any other durability.
 
 ## Type mapping
 
@@ -98,5 +98,12 @@ These are limits of this connector, not of the `fluss-rs` client.
 
 ```bash
 cargo build --release -p iggy_connector_fluss_source
-cargo test -p iggy_connector_fluss_source
+cargo test -p iggy_connector_fluss_source --lib
+```
+
+The integration tests need Docker. Testcontainers starts Apache Fluss 1.0.0, and each test starts the `iggy-server` that `./scripts/build-test-server.sh` builds.
+
+```bash
+cargo build -p iggy-connectors -p iggy_connector_fluss_source
+cargo test -p iggy_connector_fluss_source --test fluss
 ```

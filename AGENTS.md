@@ -115,7 +115,7 @@ iggy-connectors/
 ├── sinks/<name>/         one sink plugin, iggy_connector_<name>, with its tests/
 ├── sources/<name>/       one source plugin, iggy_connector_<name>, with its tests/
 ├── testing/              iggy_connector_testing: fixtures that several test targets share
-├── scripts/              CI checks, test server build, R bump, PR port
+├── scripts/              CI checks, test server build, R bump
 ├── .config/              nextest.toml, rail.toml
 ├── .github/              workflows, actions, components.yml, publish.yml
 └── .claude/skills/       connector and review skills, plus the .agents/skills links
@@ -270,7 +270,6 @@ Created by the runtime or tests. Gitignored. Safe to delete to reset:
 - Post-merge publishes an `edge` SDK version that has no tag yet, and then tags it. A version without a suffix is a release and goes out only after the vote.
 - A release that ships with a core release has one vote for both. A connectors-only release has its own vote, with R at the last core release.
 - Third-party license enumeration: `scripts/ci/third-party-licenses.sh` (ASF policy).
-- `scripts/port-pr.sh` ports an open apache/iggy connectors PR to this layout.
 
 ## Discussion and support
 

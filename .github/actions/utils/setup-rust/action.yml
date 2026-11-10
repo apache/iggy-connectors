@@ -56,7 +56,7 @@ runs:
   steps:
     - name: Free runner disk space
       if: inputs.free-disk-space == 'true'
-      uses: apache/iggy/.github/actions/utils/free-disk-space@d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8
+      uses: apache/iggy/.github/actions/utils/free-disk-space@167dcd1fe088aa945928c7a9f55b31255170cb97
 
     - name: Install system dependencies (Linux)
       if: runner.os == 'Linux' && inputs.install-system-dependencies == 'true'

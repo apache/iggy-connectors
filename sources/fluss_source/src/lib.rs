@@ -51,6 +51,7 @@ const METADATA_OFFSET: &str = "_fluss_offset";
 const METADATA_TIMESTAMP: &str = "_fluss_timestamp";
 const METADATA_PREFIX: &str = "_fluss_";
 const NANOS_PER_MILLI: u64 = 1_000_000;
+const INITIAL_PAYLOAD_CAPACITY: usize = 128;
 /// Set on every message id. Sending replaces a zero id with a random one, which bucket 0,
 /// offset 0 would otherwise get on every delivery.
 const MESSAGE_ID_TAG: u128 = 1 << 127;
@@ -485,6 +486,9 @@ impl FlussSource {
         let mut messages = Vec::with_capacity(records.count());
         let mut polled_offsets = HashMap::with_capacity(buckets.len());
         let mut skipped = 0;
+        // Rows of one table come out at about the same size, so each payload starts at the size
+        // of the one before it instead of growing from serde_json's 128 bytes.
+        let mut payload_capacity = INITIAL_PAYLOAD_CAPACITY;
         for (bucket, bucket_records) in buckets {
             let bucket_id = bucket.bucket_id();
             for record in bucket_records {
@@ -493,8 +497,12 @@ impl FlussSource {
                     record.offset(),
                     record.timestamp(),
                     record.row(),
+                    payload_capacity,
                 ) {
-                    Ok(message) => messages.push(message),
+                    Ok(message) => {
+                        payload_capacity = message.payload.len();
+                        messages.push(message);
+                    }
                     Err(error) => {
                         skipped += 1;
                         error!(
@@ -532,12 +540,13 @@ impl FlussSource {
         }
     }
 
-    fn build_message(
+    fn build_message<R: InternalRow + ?Sized>(
         &self,
         bucket: i32,
         offset: i64,
         timestamp_millis: i64,
-        row: &dyn InternalRow,
+        row: &R,
+        payload_capacity: usize,
     ) -> Result<ProducedMessage, Error> {
         let record_metadata = [
             (METADATA_BUCKET, i64::from(bucket)),
@@ -550,8 +559,12 @@ impl FlussSource {
             &[]
         };
 
-        let payload = serde_json::to_vec(&mapping::JsonRow::new(row, &self.columns, metadata))
-            .map_err(|error| Error::InvalidRecordValue(error.to_string()))?;
+        let mut payload = Vec::with_capacity(payload_capacity);
+        serde_json::to_writer(
+            &mut payload,
+            &mapping::JsonRow::new(row, &self.columns, metadata),
+        )
+        .map_err(|error| Error::InvalidRecordValue(error.to_string()))?;
 
         Ok(ProducedMessage {
             id: Some(message_id(bucket, offset)),
@@ -1773,7 +1786,7 @@ mod tests {
         let (source, row) = source_with_id_column(true);
 
         let message = source
-            .build_message(2, 41, 1_700_000_000_123, &row)
+            .build_message(2, 41, 1_700_000_000_123, &row, INITIAL_PAYLOAD_CAPACITY)
             .expect("The row should build");
 
         let payload: Value =
@@ -1796,7 +1809,7 @@ mod tests {
         let (source, row) = source_with_id_column(false);
 
         let message = source
-            .build_message(2, 41, 1_700_000_000_123, &row)
+            .build_message(2, 41, 1_700_000_000_123, &row, INITIAL_PAYLOAD_CAPACITY)
             .expect("The row should build");
 
         let payload: Value =

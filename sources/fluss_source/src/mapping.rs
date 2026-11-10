@@ -26,6 +26,8 @@ use serde::{Serialize, Serializer};
 
 const MILLIS_PER_SECOND: i64 = 1_000;
 const NANOS_PER_MILLI: i64 = 1_000_000;
+/// The output of `DateTime::<Utc>::to_rfc3339`, written without the `String` it allocates.
+const RFC3339_UTC: &str = "%Y-%m-%dT%H:%M:%S%.f+00:00";
 
 /// One row written as a JSON object straight into the payload, with the `metadata` entries
 /// after the columns. Names and values are written from the schema and the Arrow batch as
@@ -35,18 +37,14 @@ const NANOS_PER_MILLI: i64 = 1_000_000;
 /// PostgreSQL source formats them. A number of milliseconds would drop the microseconds of
 /// the default `TIMESTAMP(6)`. `TIMESTAMP` carries no timezone and is written without one,
 /// while `TIMESTAMP_LTZ` is an instant and is written in UTC.
-pub(crate) struct JsonRow<'a> {
-    row: &'a dyn InternalRow,
+pub(crate) struct JsonRow<'a, R: InternalRow + ?Sized> {
+    row: &'a R,
     columns: &'a [Column],
     metadata: &'a [(&'a str, i64)],
 }
 
-impl<'a> JsonRow<'a> {
-    pub(crate) fn new(
-        row: &'a dyn InternalRow,
-        columns: &'a [Column],
-        metadata: &'a [(&'a str, i64)],
-    ) -> Self {
+impl<'a, R: InternalRow + ?Sized> JsonRow<'a, R> {
+    pub(crate) fn new(row: &'a R, columns: &'a [Column], metadata: &'a [(&'a str, i64)]) -> Self {
         Self {
             row,
             columns,
@@ -73,7 +71,7 @@ impl Column {
     }
 }
 
-impl Serialize for JsonRow<'_> {
+impl<R: InternalRow + ?Sized> Serialize for JsonRow<'_, R> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut object =
             serializer.serialize_map(Some(self.columns.len() + self.metadata.len()))?;
@@ -116,13 +114,13 @@ fn is_supported(data_type: &DataType) -> bool {
     )
 }
 
-struct JsonField<'a> {
-    row: &'a dyn InternalRow,
+struct JsonField<'a, R: InternalRow + ?Sized> {
+    row: &'a R,
     position: usize,
     field: &'a DataField,
 }
 
-impl Serialize for JsonField<'_> {
+impl<R: InternalRow + ?Sized> Serialize for JsonField<'_, R> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let row = self.row;
         let position = self.position;
@@ -208,7 +206,7 @@ impl Serialize for JsonField<'_> {
                     timestamp.get_nano_of_millisecond(),
                 )
                 .ok_or_else(out_of_range)?;
-                serializer.serialize_str(&instant.to_rfc3339())
+                serializer.collect_str(&instant.naive_utc().format(RFC3339_UTC))
             }
             DataType::Bytes(_) => serializer.collect_str(&Base64Display::new(
                 row.get_bytes(position).map_err(read_error)?,

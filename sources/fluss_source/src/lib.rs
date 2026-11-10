@@ -186,9 +186,9 @@ pub struct FlussSource {
     /// collected, dropping them, so the next poll points it back at the committed offsets
     /// before reading again.
     rewind_required: AtomicBool,
-    /// Set when `open()` resolved start offsets that are not on disk yet. The next poll carries
-    /// them through the ACK handshake even without rows, so a restart before the first row does
-    /// not resolve `latest` again and skip what was written in between.
+    /// Set when `open()` resolved start offsets that are not on disk yet. Polls send them alone,
+    /// holding back any rows read, until a batch is acknowledged, so a restart does not resolve
+    /// `latest` again and skip what was written in between.
     start_offsets_unsaved: AtomicBool,
 }
 
@@ -460,8 +460,11 @@ impl FlussSource {
             Ok(None) => Ok((messages, None)),
             Err(error) => {
                 // The scanner is already past these records, so they are built again on the
-                // next poll rather than skipped along with the error.
-                *self.replay.lock().await = Some(records);
+                // next poll rather than skipped along with the error. A batch of start offsets
+                // alone leaves the rows it held back in place.
+                if !records.is_empty() {
+                    *self.replay.lock().await = Some(records);
+                }
                 Err(error)
             }
         }
@@ -714,6 +717,15 @@ impl Source for FlussSource {
                 };
                 self.read(scanner).await?
             }
+        };
+        // Unsaved start offsets go out alone first. A batch without rows has nothing for the
+        // runtime to encode or send, so they reach disk even when every row would be rejected,
+        // and a restart after the NACK limit does not resolve `latest` again past these rows.
+        let records = if self.start_offsets_unsaved.load(Ordering::Acquire) && !records.is_empty() {
+            *self.replay.lock().await = Some(records);
+            ScanRecords::empty()
+        } else {
+            records
         };
         let (messages, state) = self.build_batch(records).await?;
 
@@ -1366,6 +1378,40 @@ mod tests {
                 .await
                 .expect("ACK should be applied");
             assert!(!source.start_offsets_unsaved.load(Ordering::Acquire));
+        });
+    }
+
+    /// The runtime can reject every row of a batch, for example under a `raw` stream schema,
+    /// so rows sent with unsaved start offsets could keep them off disk until the source stops.
+    #[test]
+    fn given_unsaved_start_offsets_when_rows_are_read_should_send_the_offsets_alone_first() {
+        let (source, _) = source_with_id_column(false);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 10)], 0);
+            source.start_offsets_unsaved.store(true, Ordering::Release);
+            *source.replay.lock().await = Some(scan_records(0, 10, &[1, 2, 3]));
+
+            for result in [SourceBatchResult::Nack, SourceBatchResult::Ack] {
+                let batch = source
+                    .poll()
+                    .await
+                    .expect("The start offsets should be polled");
+                assert!(batch.messages.is_empty());
+                let staged = batch
+                    .state
+                    .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                    .expect("The start offsets should be staged");
+                assert_eq!(staged.bucket_offsets.get(&0), Some(&10));
+                source
+                    .on_batch_result(result)
+                    .await
+                    .expect("The batch result should be applied");
+            }
+            assert!(!source.start_offsets_unsaved.load(Ordering::Acquire));
+
+            let rows = source.poll().await.expect("The held rows should be polled");
+            assert_eq!(rows.messages.len(), 3);
         });
     }
 

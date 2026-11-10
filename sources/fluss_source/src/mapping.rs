@@ -100,7 +100,7 @@ pub(crate) fn ensure_supported_types<'a>(
     for field in fields {
         if !is_supported(field.data_type()) {
             return Err(Error::SchemaMismatch(format!(
-                "column '{}' has type {:?}, which the Apache Fluss source cannot map to JSON",
+                "column '{}' has type {}, which the Apache Fluss source cannot map to JSON",
                 field.name(),
                 field.data_type()
             )));
@@ -133,7 +133,7 @@ impl Serialize for JsonField<'_> {
         };
         let out_of_range = || {
             S::Error::custom(format_args!(
-                "column '{name}' holds a {data_type:?} value outside the range that can be \
+                "column '{name}' holds a {data_type} value outside the range that can be \
                  formatted"
             ))
         };
@@ -221,7 +221,7 @@ impl Serialize for JsonField<'_> {
             )),
             DataType::Array(_) | DataType::Map(_) | DataType::Row(_) => {
                 Err(S::Error::custom(format_args!(
-                    "column '{name}' has nested type {data_type:?}, which the Apache Fluss \
+                    "column '{name}' has nested type {data_type}, which the Apache Fluss \
                      source does not support"
                 )))
             }

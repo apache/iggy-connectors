@@ -86,7 +86,10 @@ struct PolledMessage {
     server(connectors_runtime(config_path = "tests/fluss/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn log_table_rows_are_produced_to_iggy(harness: &TestHarness, fixture: FlussSourceFixture) {
+async fn given_log_table_rows_should_produce_them_to_iggy(
+    harness: &TestHarness,
+    fixture: FlussSourceFixture,
+) {
     let client = harness.root_client().await.unwrap();
 
     let payloads = test_payloads();

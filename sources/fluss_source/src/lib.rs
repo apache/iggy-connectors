@@ -591,9 +591,10 @@ impl FlussSource {
     }
 
     /// Reads the next records, first pointing the scanner back at the committed offsets if its
-    /// last poll failed. The rewind is safe in that case: the scanner fails a poll after
-    /// collecting records only when sending the next fetches fails, before any of them is sent,
-    /// so no fetch is in flight for the buckets whose records were dropped.
+    /// last poll failed. A failed poll can drop records it already collected, either when a later
+    /// fetch in the same poll fails or when sending the next fetches fails. The rewind is safe in
+    /// both cases: the scanner never fetches a bucket that still has buffered records, and sends
+    /// nothing between collecting them and failing, so no fetch is in flight for those buckets.
     async fn read(&self, scanner: &LogScanner) -> Result<ScanRecords, Error> {
         if self.rewind_required.load(Ordering::Acquire) {
             let committed = { self.state.lock().await.bucket_offsets.clone() };
@@ -625,7 +626,7 @@ impl FlussSource {
         if self.unreadable_state {
             return Err(Error::InitError(
                 "the saved state cannot be decoded. Starting over could skip rows that were never \
-                 delivered, so remove the state file to start again from starting_offset"
+                 delivered, so remove the saved state to start again from starting_offset"
                     .to_owned(),
             ));
         }
@@ -918,7 +919,7 @@ fn ensure_same_table(saved: Option<&TableIdentity>, current: &TableIdentity) -> 
     match saved {
         Some(saved) if saved != current => Err(Error::InitError(format!(
             "the saved state was read from table {saved}, not from table {current}. Its offsets \
-             could skip rows of this table, so remove the state file to start again from \
+             could skip rows of this table, so remove the saved state to start again from \
              starting_offset"
         ))),
         _ => Ok(()),

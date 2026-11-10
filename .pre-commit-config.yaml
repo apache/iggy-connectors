@@ -68,10 +68,11 @@ repos:
         files: ^(Cargo\.toml|sdk/Cargo\.toml|\.github/config/publish\.yml)$
         pass_filenames: false
 
-      # On pre-push, because cargo metadata --locked can fetch apache/iggy at R.
+      # On pre-push, because cargo metadata --locked can fetch apache/iggy
+      # at the core pin.
       - id: core-pin
         name: core pin
-        entry: ./scripts/ci/check-r-pin.sh
+        entry: ./scripts/ci/check-core-pin.sh
         language: system
         files: ^Cargo\.(toml|lock)$
         pass_filenames: false

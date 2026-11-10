@@ -5,7 +5,7 @@ external systems. The runtime `iggy-connectors` loads sink and source
 plugins (`cdylib`) with `dlopen` and drives them through a small FFI.
 Plugins build on the SDK `iggy_connector_sdk`. The Iggy server, the
 client SDKs and the CLI live in [apache/iggy](https://github.com/apache/iggy).
-This repository builds against one commit of apache/iggy, called R.
+This repository builds against one commit of apache/iggy, called the core pin.
 
 > Skills live under `.claude/skills/`, with per-skill links under
 > `.agents/skills/` for Codex. Load
@@ -20,7 +20,7 @@ This repository builds against one commit of apache/iggy, called R.
   - [Helping someone contribute](#helping-someone-contribute)
   - [Quick reference](#quick-reference)
   - [Structure](#structure)
-  - [R, the core pin](#r-the-core-pin)
+  - [The core pin](#the-core-pin)
   - [Where to look](#where-to-look)
   - [Skills](#skills)
   - [Repo-wide principles](#repo-wide-principles)
@@ -46,8 +46,8 @@ This repository builds against one commit of apache/iggy, called R.
   environment variables, the image `apache/iggy-connect`, the tag
   patterns `connectors-X.Y.Z` and `connectors-sdk-X.Y.Z`, or any other
   operator-facing identifier.
-- Moving R to an apache/iggy commit that is not a release (see
-  [R, the core pin](#r-the-core-pin)).
+- Moving the core pin to an apache/iggy commit that is not a release
+  (see [The core pin](#the-core-pin)).
 - Force-pushing to `master`, amending shipped commits, or skipping
   hooks with `--no-verify` / `--no-gpg-sign`.
 
@@ -73,8 +73,8 @@ cargo clippy --all-features --all-targets -- -D warnings   # step 3
 cargo machete --with-metadata                              # step 4
 cargo nextest run -p <package>                             # step 5
 
-# Integration tests need Docker, the server at R and fresh builds in target/debug/.
-./scripts/build-test-server.sh                             # once per R
+# Integration tests need Docker, the server at the core pin and fresh builds in target/debug/.
+./scripts/build-test-server.sh                             # once per core pin
 cargo build                                                # runtime and every plugin
 cargo nextest run -p iggy_connector_postgres_sink --test postgres
 
@@ -89,11 +89,11 @@ cargo nextest run -p iggy_connector_postgres_sink --test postgres
 ./scripts/ci/sync-rustc-version.sh
 ./scripts/ci/binary-artifacts.sh --check
 ./scripts/ci/third-party-licenses.sh --validate --manifest <path>
-./scripts/ci/check-r-pin.sh       # each core `version` matches the crate at R
+./scripts/ci/check-core-pin.sh    # each core `version` matches the crate at the core pin
 ./scripts/verify-sdk-publish.sh   # SDK into a scratch local registry
 
-# Move R, the apache/iggy commit
-./scripts/bump-r.sh <core tag or commit>
+# Move the core pin, the apache/iggy commit
+./scripts/bump-core-pin.sh <core tag or commit>
 
 # Run the runtime with the example configuration
 IGGY_CONNECTORS_CONFIG_PATH=runtime/example_config/config.toml cargo run --bin iggy-connectors
@@ -115,28 +115,28 @@ iggy-connectors/
 ├── sinks/<name>/         one sink plugin, iggy_connector_<name>, with its tests/
 ├── sources/<name>/       one source plugin, iggy_connector_<name>, with its tests/
 ├── testing/              iggy_connector_testing: fixtures that several test targets share
-├── scripts/              CI checks, test server build, R bump
+├── scripts/              CI checks, test server build, core pin bump
 ├── .config/              nextest.toml, rail.toml
 ├── .github/              workflows, actions, components.yml, publish.yml
 └── .claude/skills/       connector and review skills, plus the .agents/skills links
 ```
 
-## R, the core pin
+## The core pin
 
-The root `Cargo.toml` is the only place for R. Six
-`[workspace.dependencies]` entries take core crates from git at
-`rev = R`: `configs`, `configs_derive`, `iggy`, `iggy_common`,
-`integration` (the test `harness` and `#[iggy_harness]`) and
-`system_stats`. `iggy` and `iggy_common` also carry a `version`,
-because the published SDK takes them from crates.io. Each `version`
-must equal the crate version at R, and `scripts/ci/check-r-pin.sh`
-fails otherwise.
+The root `Cargo.toml` is the only place for the core pin. Six
+`[workspace.dependencies]` entries take core crates from git, with
+the core pin as `rev`: `configs`, `configs_derive`, `iggy`,
+`iggy_common`, `integration` (the test `harness` and
+`#[iggy_harness]`) and `system_stats`. `iggy` and `iggy_common` also
+carry a `version`, because the published SDK takes them from
+crates.io. Each `version` must equal the crate version at the core
+pin, and `scripts/ci/check-core-pin.sh` fails otherwise.
 
-- R stays at the last core release. When a connector needs an
-  unreleased core change, R moves to a core `master` commit. That
-  change lands in apache/iggy first.
-- `scripts/bump-r.sh` rewrites R and the two versions. Never edit them
-  by hand.
+- The core pin stays at the last core release. When a connector needs
+  an unreleased core change, the core pin moves to a core `master`
+  commit. That change lands in apache/iggy first.
+- `scripts/bump-core-pin.sh` rewrites the core pin and the two
+  versions. Never edit them by hand.
 - No `[patch]` section, no submodule and no sibling checkout of
   apache/iggy. A local edit under `~/.cargo/git/checkouts/` is lost on
   the next fetch.
@@ -224,7 +224,7 @@ is a copy of the apache/iggy skill. Run
 
 - **Unit:** `#[cfg(test)] mod tests` at EOF of `src/lib.rs` (or per-module). They need no Docker: `cargo nextest run -p <package> --lib` (`--bins` for the runtime).
 - **Integration:** each plugin owns its suite in `<package dir>/tests/<suite>/`, for example `sinks/postgres_sink/tests/postgres/`. A backend with a sink and a source has a target in both packages. The runtime owns `runtime/tests/runtime/`, `runtime/tests/api/`, `runtime/tests/http_config_provider/` and `runtime/tests/config_env_listing.rs`. `bigquery_sink` has no `#[iggy_harness]` tests. Its `tests/bigquery_sink.rs` runs the sink against an in-process fake BigQuery and needs no Docker.
-- **`#[iggy_harness]`:** the tests use this macro and the `harness` types of the core crate `integration` at R. A test starts `target/debug/iggy-server` and `target/debug/iggy-connectors`. The runtime loads each plugin by its bare file name, such as `libiggy_connector_stdout_sink`, from its own directory.
+- **`#[iggy_harness]`:** the tests use this macro and the `harness` types of the core crate `integration` at the core pin. A test starts `target/debug/iggy-server` and `target/debug/iggy-connectors`. The runtime loads each plugin by its bare file name, such as `libiggy_connector_stdout_sink`, from its own directory.
 - **Dev-dependencies:** the macro emits `::tokio::` and `::serial_test::` paths, so each package with integration tests declares both. A test binary installs the per-test log capture with `integration::install_log_capture!()`, which needs `ctor` and `dtor` too.
 - **Backends:** external systems run in Docker through `testcontainers-modules`. Container names start with `iggy-test-`. Fixtures that several test targets share live in `testing/`.
 - **Logs:** per-test logs land in `test_logs/`, because `.cargo/config.toml` sets `IGGY_TEST_LOGS_DIR`.
@@ -246,7 +246,7 @@ A core test named `connectors::<suite>::<rest>` became the test `<rest>` in the 
 
 - **Docker is required for the integration tests.** `testcontainers-modules` spawns containers per test.
 - **The Doris tests need `vm.max_map_count` of at least 2000000 on Linux.** Run `sudo sysctl -w vm.max_map_count=2000000`.
-- **The tests run against the server at R.** `scripts/build-test-server.sh` builds it into `target/iggy-server-<R>/` and copies it to `target/debug/iggy-server`. Run it again after each R bump. A server from another commit fails in ways that look like the change under test.
+- **The tests run against the server at the core pin.** `scripts/build-test-server.sh` builds it into `target/iggy-server-<core-pin>/` and copies it to `target/debug/iggy-server`. Run it again after each core pin bump. A server from another commit fails in ways that look like the change under test.
 - **`#[iggy_harness]` runs prebuilt binaries and never builds them.** A stale `target/debug/iggy-connectors` or plugin library is used silently. Rebuild the runtime and the plugins that a target loads before you run it.
 - **`cargo sort` without `--no-format` will churn the workspace.** Use the pre-commit hook.
 - **Rust toolchain is pinned in `rust-toolchain.toml`.** Older system `cargo` fails on transitive deps. prefer rustup so the pin auto-resolves.
@@ -259,7 +259,7 @@ Created by the runtime or tests. Gitignored. Safe to delete to reset:
 
 - `local_state/` - runtime state files of the example configuration
 - `test_logs/` - per-test logs
-- `target/` - cargo build, plus the test server in `target/iggy-server-<R>/`
+- `target/` - cargo build, plus the test server in `target/iggy-server-<core-pin>/`
 
 ## Commits, PRs, releases
 
@@ -268,7 +268,7 @@ Created by the runtime or tests. Gitignored. Safe to delete to reset:
 - If a change has co-authors, add a `Co-authored-by` trailer for each.
 - The runtime ships only as the image `apache/iggy-connect`, tagged `connectors-X.Y.Z`. The SDK goes to crates.io, tagged `connectors-sdk-X.Y.Z`. Sinks and sources are `publish = false`.
 - Post-merge publishes an `edge` SDK version that has no tag yet, and then tags it. A version without a suffix is a release and goes out only after the vote.
-- A release that ships with a core release has one vote for both. A connectors-only release has its own vote, with R at the last core release.
+- A release that ships with a core release has one vote for both. A connectors-only release has its own vote, with the core pin at the last core release.
 - Third-party license enumeration: `scripts/ci/third-party-licenses.sh` (ASF policy).
 
 ## Discussion and support

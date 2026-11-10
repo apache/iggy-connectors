@@ -106,14 +106,14 @@ The Quickwit sink writes the records to the `events` index. The Quickwit UI at <
 | `sinks/<name>/`   | `iggy_connector_<name>`  | One sink plugin with its integration tests            |
 | `sources/<name>/` | `iggy_connector_<name>`  | One source plugin with its integration tests          |
 | `testing/`        | `iggy_connector_testing` | Test fixtures that several test targets share         |
-| `scripts/`        |                          | CI checks, the test server build and the R bump       |
+| `scripts/`        |                          | CI checks, test server build and the core pin bump    |
 | `.claude/skills/` |                          | Skills for AI agents, linked from `.agents/skills/`   |
 
 Only `iggy_connector_sdk` goes to crates.io. The runtime ships only as the Docker image, and the sinks and sources ship as source code.
 
 ## The core pin
 
-This repository builds against one commit of apache/iggy, called R. The root `Cargo.toml` holds R as the `rev` of each core crate that comes from git: `iggy`, `iggy_common`, `configs`, `configs_derive`, `system_stats` and the test crate `integration`. R is the last core release, unless a connector needs an unreleased core change, and `scripts/bump-r.sh` moves it.
+This repository builds against one commit of apache/iggy, called the core pin. The root `Cargo.toml` holds the core pin as the `rev` of each core crate that comes from git: `iggy`, `iggy_common`, `configs`, `configs_derive`, `system_stats` and the test crate `integration`. The core pin is the last core release, unless a connector needs an unreleased core change, and `scripts/bump-core-pin.sh` moves it.
 
 ## Build
 
@@ -132,7 +132,7 @@ Unit tests live in `src/` of each crate and need no services:
 cargo nextest run --workspace --lib --bins
 ```
 
-Integration tests live in `tests/` of each package. They need Docker, an Iggy server built at R, and fresh builds of the runtime and the plugins in `target/debug/`:
+Integration tests live in `tests/` of each package. They need Docker, an Iggy server built at the core pin, and fresh builds of the runtime and the plugins in `target/debug/`:
 
 ```bash
 ./scripts/build-test-server.sh
@@ -140,7 +140,7 @@ cargo build
 cargo nextest run -p iggy_connector_postgres_sink
 ```
 
-`scripts/build-test-server.sh` builds `iggy-server` from apache/iggy at R and copies it to `target/debug/iggy-server`. Run it again after R changes. The tests start that server and `target/debug/iggy-connectors`, but they never build them. After a change to the runtime or a plugin, run `cargo build` again.
+`scripts/build-test-server.sh` builds `iggy-server` from apache/iggy at the core pin and copies it to `target/debug/iggy-server`. Run it again after the core pin changes. The tests start that server and `target/debug/iggy-connectors`, but they never build them. After a change to the runtime or a plugin, run `cargo build` again.
 
 `cargo nextest run --workspace` runs all tests, as CI does. The Doris tests need `sudo sysctl -w vm.max_map_count=2000000` on Linux. Per-test logs go to `test_logs/`.
 

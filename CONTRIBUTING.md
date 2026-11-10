@@ -37,7 +37,7 @@ These require design discussion in the issue before coding:
 - The runtime HTTP API and the configuration format
 - Operator-facing names: the image `apache/iggy-connect`, the environment variables, the plugin path rules
   and the default consumer groups
-- The pinned apache/iggy commit (R)
+- The pinned apache/iggy commit (the core pin)
 
 ## PR Requirements
 

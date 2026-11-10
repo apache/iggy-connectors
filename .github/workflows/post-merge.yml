@@ -108,7 +108,7 @@ jobs:
 
           # The SDK publishes each pre-release version once, and only when
           # crates.io can resolve the core versions it pins: their core tags
-          # must point to R. A pin to a core release always passes.
+          # must point to the core pin. A pin to a core release always passes.
           CRATES_TO_PUBLISH=""
           crate=rust-connector-sdk
           VERSION=$(scripts/extract-version.sh "$crate")
@@ -119,11 +119,11 @@ jobs:
           elif git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "Tag exists - skipping"
           else
-            released=$(scripts/ci/core-released-at-r.sh)
+            released=$(scripts/ci/core-released-at-pin.sh)
             if [[ "$released" == true ]]; then
               CRATES_TO_PUBLISH=$crate
             else
-              echo "::notice::Skipping $crate $VERSION: core has not released the iggy and iggy_common versions that Cargo.toml pins at R"
+              echo "::notice::Skipping $crate $VERSION: core has not released the iggy and iggy_common versions that Cargo.toml pins at the core pin"
             fi
           fi
           echo "crates_to_publish=$CRATES_TO_PUBLISH" >> "$GITHUB_OUTPUT"

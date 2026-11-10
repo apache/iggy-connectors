@@ -143,7 +143,7 @@ cargo sort --no-format --workspace
 cargo clippy -p iggy_connector_<name>_sink --all-targets -- -D warnings
 cargo nextest run -p iggy_connector_<name>_sink --lib
 
-# Integration tests (Docker, ./scripts/build-test-server.sh once per R).
+# Integration tests (Docker, ./scripts/build-test-server.sh once per core pin).
 # The harness launches target/debug/iggy-connectors, which loads the plugin from target/debug/:
 cargo build -p iggy-connectors -p iggy_connector_<name>_sink
 cargo nextest run -p iggy_connector_<name>_sink --test <backend> <test_name>

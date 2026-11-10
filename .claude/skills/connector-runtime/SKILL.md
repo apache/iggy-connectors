@@ -275,7 +275,7 @@ cargo nextest run -p iggy-connectors --bins
 # The runtime test targets launch target/debug/iggy-connectors and load these plugins:
 cargo build -p iggy-connectors -p iggy_connector_stdout_sink -p iggy_connector_random_source
 
-# Unit + runtime integration tests (Docker, plus ./scripts/build-test-server.sh once per R):
+# Unit + runtime integration tests (Docker, plus ./scripts/build-test-server.sh once per core pin):
 cargo nextest run -p iggy-connectors
 
 # Smoke-test with example config:

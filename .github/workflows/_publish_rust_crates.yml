@@ -16,9 +16,9 @@
 # under the License.
 
 # Publishes iggy_connector_sdk to crates.io and tags it. The SDK depends on
-# the iggy and iggy_common versions that Cargo.toml pins next to R, so it
-# goes out only after core released those versions at R and crates.io
-# serves them.
+# the iggy and iggy_common versions that Cargo.toml pins next to the core
+# pin, so it goes out only after core released those versions at the core
+# pin and crates.io serves them.
 
 name: _publish_rust_crates
 on:
@@ -95,17 +95,17 @@ jobs:
             tee -a "$GITHUB_OUTPUT"
 
       # A dry run fails here too: it shows what the real run would do.
-      - name: Check that core released its crates at R
+      - name: Check that core released its crates at the core pin
         run: |
           set -euo pipefail
-          released=$(scripts/ci/core-released-at-r.sh)
+          released=$(scripts/ci/core-released-at-pin.sh)
           if [[ "$released" != true ]]; then
-            echo "::error::Core has not released the iggy and iggy_common versions that Cargo.toml pins at R"
+            echo "::error::Core has not released the iggy and iggy_common versions that Cargo.toml pins at the core pin"
             exit 1
           fi
 
-      # The local registry gets the core crates from the git checkout at R,
-      # so a dry run needs no core release on crates.io.
+      # The local registry gets the core crates from the git checkout at
+      # the core pin, so a dry run needs no core release on crates.io.
       - name: Dry-run publish chain via local alt-registry
         if: inputs.dry_run == true
         env:

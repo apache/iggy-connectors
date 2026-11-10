@@ -16,14 +16,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Builds iggy-server from apache/iggy at R, the core commit that Cargo.toml
-# pins, and copies it to <target>/debug/iggy-server. The integration tests
-# start the server from there. A build for the same R is reused, so CI can
-# cache <target>/iggy-server-<R> by R.
+# Builds iggy-server from apache/iggy at the core pin, the commit that
+# Cargo.toml pins, and copies it to <target>/debug/iggy-server. The
+# integration tests start the server from there. A build for the same core
+# pin is reused, so CI can cache <target>/iggy-server-<core-pin> by the core
+# pin.
 #
 # Usage:
 #   scripts/build-test-server.sh              build if needed, then copy
-#   scripts/build-test-server.sh --print-dir  print <target>/iggy-server-<R>
+#   scripts/build-test-server.sh --print-dir  print <target>/iggy-server-<core-pin>
 
 set -euo pipefail
 
@@ -33,9 +34,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/ci/lib/core-pin.sh"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-R=$(core_rev Cargo.toml)
+CORE_REV=$(core_rev Cargo.toml)
 TARGET_DIR=$(cargo metadata --format-version 1 --no-deps --offline | jq -r .target_directory)
-SERVER_ROOT="$TARGET_DIR/iggy-server-$R"
+SERVER_ROOT="$TARGET_DIR/iggy-server-$CORE_REV"
 SERVER_BIN="$SERVER_ROOT/bin/iggy-server"
 
 case "${1:-}" in
@@ -53,11 +54,11 @@ esac
 if [[ -x "$SERVER_BIN" ]]; then
   echo "Reusing $SERVER_BIN"
 else
-  cargo install --locked --debug --git "$CORE_GIT_URL" --rev "$R" --root "$SERVER_ROOT" --bin iggy-server server
+  cargo install --locked --debug --git "$CORE_GIT_URL" --rev "$CORE_REV" --root "$SERVER_ROOT" --bin iggy-server server
 fi
 
 mkdir -p "$TARGET_DIR/debug"
 # A rename replaces a binary that a running test still executes.
 cp "$SERVER_BIN" "$TARGET_DIR/debug/iggy-server.tmp"
 mv -f "$TARGET_DIR/debug/iggy-server.tmp" "$TARGET_DIR/debug/iggy-server"
-echo "Copied iggy-server at $R to $TARGET_DIR/debug/iggy-server"
+echo "Copied iggy-server at $CORE_REV to $TARGET_DIR/debug/iggy-server"

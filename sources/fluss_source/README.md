@@ -14,7 +14,7 @@ After five rejected batches in a row the source stops and needs a manual connect
 | `database` | yes | | Apache Fluss database name. |
 | `table` | yes | | Apache Fluss table name. |
 | `table_type` | no | `log` | Only `log` is accepted. See [Limitations](#limitations). |
-| `starting_offset` | no | `earliest` | `earliest`, `latest` (each bucket's tail, resolved at startup), or an explicit non-negative offset. Applies only to buckets absent from the persisted state. An explicit offset is used as is for every such bucket, so it suits a table whose bucket offsets you know, such as one with a single bucket. |
+| `starting_offset` | no | `earliest` | `earliest`, `latest` (each bucket's tail, resolved at startup), or an explicit non-negative offset such as `128`. Applies only to buckets absent from the persisted state. An explicit offset is used as is for every such bucket, so it suits a table whose bucket offsets you know, such as one with a single bucket. |
 | `columns` | no | all columns | Columns written to each message, in this order. Must name at least one column, and no column twice. They are picked after the rows are read, so the server still sends every column: a projection pushed down to `fluss-rs` 1.0 fails on rows tiered to remote storage before a column was added. |
 | `poll_interval` | no | `1s` | Delay before each poll. A poll that follows a full `batch_size` read starts at once, since more rows are likely waiting. After a failed poll the delay is at least `1s`, since the connector is polled again right after an error. |
 | `poll_timeout` | no | `5s` | How long a single server poll waits for records. It and `poll_interval` cannot both be zero. |

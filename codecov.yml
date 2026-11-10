@@ -1,0 +1,91 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+codecov:
+  require_ci_to_pass: false
+  notify:
+    # Codecov edits its PR comment after every processed upload, and the
+    # pre-merge coverage legs finish minutes apart. Hold the comment and
+    # statuses until codecov-notify.yml sends one trigger per finished run.
+    manual_trigger: true
+
+coverage:
+  precision: 2
+  round: down
+  range: "50...90"
+  status:
+    project:
+      default:
+        informational: true
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        informational: true
+        target: 50%
+        threshold: 5%
+
+flag_management:
+  default_rules:
+    carryforward: true
+    statuses:
+      - type: project
+        target: auto
+        threshold: 1%
+        informational: true
+      - type: patch
+        target: 50%
+        threshold: 5%
+        informational: true
+  individual_flags:
+    - name: rust
+      paths:
+        - runtime/
+        - sdk/
+        - sinks/
+        - sources/
+
+component_management:
+  individual_components:
+    - component_id: runtime
+      name: "Runtime"
+      paths:
+        - runtime/
+    - component_id: sdk
+      name: "SDK"
+      paths:
+        - sdk/
+    - component_id: sinks
+      name: "Sinks"
+      paths:
+        - sinks/
+    - component_id: sources
+      name: "Sources"
+      paths:
+        - sources/
+
+comment:
+  layout: "header, diff, components, files"
+  behavior: default
+  require_changes: true
+  require_base: true
+  require_head: true
+
+ignore:
+  - "testing/**"
+  - "**/tests/**"
+  - "**/target/**"

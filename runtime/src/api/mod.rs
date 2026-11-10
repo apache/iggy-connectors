@@ -45,7 +45,7 @@ const NAME: &str = env!("CARGO_PKG_NAME");
 /// path: the published image carries the binary and its licences, nothing else,
 /// so the reader most likely to see these lines has no source tree.
 const EXPOSURE_DOC: &str =
-    "https://github.com/apache/iggy/blob/master/core/connectors/runtime/README.md";
+    "https://github.com/apache/iggy-connectors/blob/master/runtime/README.md";
 
 pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
     if !config.enabled {

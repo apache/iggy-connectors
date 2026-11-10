@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-connectors"
-version = "0.6.0"
+version = "0.6.1-edge.1"
 description = "Connectors runtime for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -25,7 +25,7 @@ keywords = ["iggy", "messaging", "streaming", "connectors"]
 categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
-repository = "https://github.com/apache/iggy"
+repository = "https://github.com/apache/iggy-connectors"
 readme = "README.md"
 publish = false
 
@@ -81,10 +81,19 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 apache-avro = { workspace = true }
+assert_cmd = { workspace = true }
+ctor = { workspace = true }
+dtor = { workspace = true }
+iggy_connector_testing = { workspace = true }
+integration = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 protox-parse = { workspace = true }
+reqwest = { workspace = true, features = ["http2", "json"] }
+serial_test = { workspace = true }
 tempfile = { workspace = true }
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 wiremock = { workspace = true }
 
 [lints]

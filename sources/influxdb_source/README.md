@@ -44,7 +44,7 @@ At the inflation cap, the connector emits no messages, resets the effective size
 
 ## Configuration
 
-Build the plugin and runtime from the same 0.9.0/edge checkout. The following snippets are plugin settings; place them under `[plugin_config]` in the full connector entry below. The example data has a numeric `usage` field and `host` as its only tag. Use an existing bucket/database and a token with query access. Unknown settings and unsupported versions are rejected.
+Build the plugin and the runtime from the root of this repository. The following snippets are plugin settings; place them under `[plugin_config]` in the full connector entry below. The example data has a numeric `usage` field and `host` as its only tag. Use an existing bucket/database and a token with query access. Unknown settings and unsupported versions are rejected.
 
 ### V2 - InfluxDB OSS 2.x / Cloud
 
@@ -145,7 +145,7 @@ Message IDs combine timestamp nanoseconds with result position. Distinct rows ca
 
 ## Full Configuration Example
 
-Save one connector entry in the runtime connector directory and start the runtime from the checkout root. Configure the broker connection in the main `connectors.toml` and create the `metrics` stream and `cpu` topic first.
+Save one connector entry in the runtime connector directory and start the runtime from the root of this repository. Configure the broker connection in the main `connectors.toml` and create the `metrics` stream and `cpu` topic first.
 
 ```toml
 type = "source"

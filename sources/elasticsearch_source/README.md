@@ -13,7 +13,7 @@ checkpoint to the Iggy connectors runtime.
 
 ## Configuration
 
-From the matching 0.9.0/edge Iggy checkout root, build the plugin:
+From the root of this repository, build the plugin:
 
 ```bash
 cargo build --release -p iggy_connector_elasticsearch_source
@@ -23,7 +23,7 @@ Use the [source guide](https://iggy.apache.org/docs/connectors/sources/source/)
 for the broker credentials and main runtime configuration. The
 [Elasticsearch source walkthrough](https://iggy.apache.org/docs/connectors/sources/elasticsearch/)
 provides local backend, index and Iggy CLI commands. Create a matching index
-before starting the connector and start the runtime from the checkout root.
+before starting the connector and start the runtime from the root of this repository.
 
 ### Basic Configuration
 

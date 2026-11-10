@@ -25,7 +25,7 @@ keywords = ["iggy", "messaging", "streaming"]
 categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
-repository = "https://github.com/apache/iggy"
+repository = "https://github.com/apache/iggy-connectors"
 readme = "../../README.md"
 publish = false
 
@@ -49,7 +49,19 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
+ctor = { workspace = true }
+dtor = { workspace = true }
+iggy = { workspace = true }
+iggy_common = { workspace = true }
+iggy_connector_sdk = { workspace = true, features = ["api"] }
+iggy_connector_testing = { workspace = true }
+integration = { workspace = true }
+reqwest = { workspace = true, features = ["http2", "json"] }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints]
 workspace = true

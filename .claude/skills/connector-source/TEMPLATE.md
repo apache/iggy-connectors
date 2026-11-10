@@ -1,6 +1,6 @@
 # Source plugin skeleton
 
-Boilerplate for a new `core/connectors/sources/<name>_source/`. Adapt
+Boilerplate for a new `sources/<name>_source/`. Adapt
 the `MySource` / `Client` / row types to the backend driver.
 
 `Cargo.toml` is identical to a sink's (see

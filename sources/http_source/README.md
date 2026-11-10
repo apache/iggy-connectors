@@ -11,8 +11,8 @@ Every instance of this plugin shares one listener, so a single port can serve ma
 Loss windows, explicitly:
 
 1. **Process crash** between HTTP 200 and the producer send. Buffered messages are volatile.
-2. **Producer failure.** Narrowed by #3855, which gave sources a delivery result. The runtime NACKs a batch it could not send, or whose state it could not persist, and neither is abandoned here: a message batch is held and replayed on the next `poll()`, and a state-only batch re-arms the flush so the mutation is handed out again. Answering 200 already told the sender this gateway owns the event, and the only honest way to shed load is the 429 handlers return once the bridge fills.
-3. **Shutdown.** Narrowed by #3321, which closes the plugin before tearing down the forwarding channel so in-flight batches drain. Messages still in the bridge when the poll task stops are lost; the connector logs the count and increments `http_source_dropped_on_close_total`.
+2. **Producer failure.** Narrowed by apache/iggy#3855, which gave sources a delivery result. The runtime NACKs a batch it could not send, or whose state it could not persist, and neither is abandoned here: a message batch is held and replayed on the next `poll()`, and a state-only batch re-arms the flush so the mutation is handed out again. Answering 200 already told the sender this gateway owns the event, and the only honest way to shed load is the 429 handlers return once the bridge fills.
+3. **Shutdown.** Narrowed by apache/iggy#3321, which closes the plugin before tearing down the forwarding channel so in-flight batches drain. Messages still in the bridge when the poll task stops are lost; the connector logs the count and increments `http_source_dropped_on_close_total`.
 4. **Poll task stopped by the SDK.** The HTTP source retries NACKed batches without a fixed stop limit by default, with capped backoff. A configured `max_consecutive_nacks` can still stop it; the runtime reports the stop as `Error` and removes it from the running gauge. Rebuild the plugin with the current SDK to enable stop reporting.
 
    The listener keeps answering 200 until its bridge fills, even though a stopped source cannot drain it. Restarting closes the old instance and loses its staged batch and buffered messages; `http_source_dropped_on_close_total` counts them. Do not set a NACK limit unless those accepted events can be replayed outside the connector.
@@ -31,7 +31,7 @@ Every accepted request is given a random 128-bit message id at accept time, and 
 
 It does **not** close the first two. A sender that retries because it never saw the 200 produces a genuinely new request, which gets a new id. For those, dedupe on the provider's delivery id (`X-GitHub-Delivery`, `svix-id`, Stripe's `event.id` in the body), which is why forwarding those headers is the default recommendation.
 
-Stronger guarantees need an SDK change, not a connector change: at-least-once by construction requires the runtime to hand the connector a producer handle so it can await the send before answering 200. See #3039.
+Stronger guarantees need an SDK change, not a connector change: at-least-once by construction requires the runtime to hand the connector a producer handle so it can await the send before answering 200. See apache/iggy#3039.
 
 ## Configuration
 
@@ -44,7 +44,7 @@ key = "http_github"
 enabled = true
 version = 0
 name = "HTTP source (GitHub)"
-path = "../../target/release/libiggy_connector_http_source"
+path = "target/release/libiggy_connector_http_source"
 verbose = false
 
 [[streams]]
@@ -87,7 +87,7 @@ key = "http_partner"
 enabled = true
 version = 0
 name = "HTTP source (partner)"
-path = "../../target/release/libiggy_connector_http_source"
+path = "target/release/libiggy_connector_http_source"
 
 [[streams]]
 stream = "webhooks"
@@ -128,7 +128,7 @@ Rebuild the HTTP source plugin with SDK 0.5.1-edge.2 to get this behavior and th
 | `auth_bearer_token` | string | none | Guards the named topic path. Unset leaves it unauthenticated, for deployments behind an authenticating gateway. A misspelled key reads as unset, so it opens the path rather than failing; see the note on unknown keys below. |
 | `management_token` | string | none | Enables `/admin/endpoints`. Unset means the management API does not exist. |
 | `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. **Max 64000000**, Iggy's message payload cap, since a body becomes the payload unchanged; a larger value fails `open()`. |
-| `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. **Max 1000000**; a larger value fails `open()`. |
+| `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since apache/iggy#3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. **Max 1000000**; a larger value fails `open()`. |
 | `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. **Max 100000**; a larger value fails `open()`. |
 | `max_consecutive_nacks` | positive integer | disabled | Optional SDK breaker limit. Omit to keep retrying NACKed batches and refused state flushes with capped backoff; set only when accepted events can be replayed after a restart. An idle gateway can hit this limit on state-flush NACKs alone. Zero is invalid. |
 | `include_http_metadata` | bool | `true` | Adds instance, peer address, and receive time as message headers. |
@@ -295,15 +295,15 @@ Dynamic endpoints ride the SDK's `ConnectorState`, which the runtime writes afte
 
 `GET /admin/endpoints` reports `submitted` per endpoint. It is named that, and not `persisted`, on purpose: it says the registry was handed to the runtime, not that the write landed.
 
-It is answered per endpoint but derived instance-wide, because that is what the mechanism is. The registry is serialized and handed over whole, so no endpoint in it can be submitted while another is not, and one outstanding flush makes every endpoint unsubmitted until it lands. Since #3855 the runtime acknowledges the batch, and a failed save comes back as a NACK that re-arms the flush for the next poll, which puts the endpoints back to `submitted: false` too.
+It is answered per endpoint but derived instance-wide, because that is what the mechanism is. The registry is serialized and handed over whole, so no endpoint in it can be submitted while another is not, and one outstanding flush makes every endpoint unsubmitted until it lands. Since apache/iggy#3855 the runtime acknowledges the batch, and a failed save comes back as a NACK that re-arms the flush for the next poll, which puts the endpoints back to `submitted: false` too.
 
 That errs toward reporting not-yet-durable, which is the safe direction.
 
 ## Backpressure
 
-The chain below holds end to end. It did not always: the runtime's forwarding channel is unbounded, so a slow Iggy used to show up as memory growth rather than backpressure, and #3795 proposed bounding it.
+The chain below holds end to end. It did not always: the runtime's forwarding channel is unbounded, so a slow Iggy used to show up as memory growth rather than backpressure, and apache/iggy#3795 proposed bounding it.
 
-What closed the gap instead was #3855. The SDK now keeps one batch in flight and will not call `poll()` again until the runtime acknowledges the last one, so a slow Iggy stalls the poll loop directly. The bridge then fills on arrival and the handlers answer 429, which is the coupling that was missing.
+What closed the gap instead was apache/iggy#3855. The SDK now keeps one batch in flight and will not call `poll()` again until the runtime acknowledges the last one, so a slow Iggy stalls the poll loop directly. The bridge then fills on arrival and the handlers answer 429, which is the coupling that was missing.
 
 After 30 seconds without a batch result, the SDK warns but continues waiting on the same batch. It does not poll again or enqueue a second copy. The bridge fills and handlers return 429 until the runtime replies. A prolonged stall makes readiness fail after 60 seconds.
 

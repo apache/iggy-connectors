@@ -13,7 +13,7 @@ The PostgreSQL sink connector consumes messages from Iggy topics and stores them
 
 ## Configuration
 
-Build from the matching Iggy checkout root:
+Build from the root of this repository:
 
 ```bash
 cargo build --release -p iggy_connector_postgres_sink
@@ -21,8 +21,8 @@ cargo build --release -p iggy_connector_postgres_sink
 
 Configure the broker connection and connector directory as described in the
 [runtime README](../../runtime/README.md). Save the following connector file
-there. Paths are relative to the process working directory, here the checkout
-root. The URI assumes a local `iggy` database and `iggy`/`iggy` credentials;
+there. Paths are relative to the process working directory, here the root of
+this repository. The URI assumes a local `iggy` database and `iggy`/`iggy` credentials;
 replace it for your deployment.
 
 ```toml

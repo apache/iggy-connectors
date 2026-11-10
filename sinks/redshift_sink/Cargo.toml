@@ -25,7 +25,7 @@ keywords = ["iggy", "messaging", "streaming", "redshift", "sink"]
 categories = ["command-line-utilities", "warehouse", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
-repository = "https://github.com/apache/iggy"
+repository = "https://github.com/apache/iggy-connectors"
 readme = "../../README.md"
 publish = false
 
@@ -53,4 +53,20 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
+bytes = { workspace = true }
+ctor = { workspace = true }
+dtor = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+iggy = { workspace = true }
+iggy_connector_sdk = { workspace = true, features = ["api"] }
+iggy_connector_testing = { workspace = true }
+integration = { workspace = true }
+pgwire = { workspace = true }
+reqwest = { workspace = true, features = ["http2", "json"] }
+serial_test = { workspace = true }
 simd-json = { workspace = true }
+sqlparser = { workspace = true }
+testcontainers = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-postgres = { workspace = true }

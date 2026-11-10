@@ -1,0 +1,433 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Publishes iggy_connector_sdk to crates.io and the apache/iggy-connect
+# image to Docker Hub, then tags each one at the published commit.
+# post-merge.yml dispatches it for edge versions. A release manager
+# dispatches it for a voted release.
+
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (build/test only, no actual publish)"
+        type: boolean
+        default: true
+      skip_tag_creation:
+        description: "Skip creating git tags (useful for re-publishing or testing)"
+        type: boolean
+        required: false
+        default: false
+      commit:
+        description: "Commit SHA to publish from"
+        type: string
+        required: true
+      publish_crates:
+        description: "Rust crates to publish (comma-separated: rust-connector-sdk)"
+        type: string
+        required: false
+        default: ""
+      publish_dockerhub:
+        description: "Docker images to publish (comma-separated: rust-connectors)"
+        type: string
+        required: false
+        default: ""
+      create_edge_docker_tag:
+        description: "Create rolling :edge Docker tag (used by post-merge automation)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+# One static group, so two dispatches cannot race the crates.io and Docker
+# Hub uploads. An upload in flight runs to completion.
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-26.04
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve commit
+        id: resolve
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          PUBLISH_CRATES: ${{ inputs.publish_crates }}
+          PUBLISH_DOCKERHUB: ${{ inputs.publish_dockerhub }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PUBLISH_CRATES// /}${PUBLISH_DOCKERHUB// /}" ]]; then
+            echo "::error::Name at least one component in publish_crates or publish_dockerhub"
+            exit 1
+          fi
+
+          # Every job publishes and tags this one full SHA, so a branch that
+          # moves during the run changes nothing.
+          FULL_SHA=$(git rev-parse --verify "${INPUT_COMMIT}^{commit}" 2>/dev/null || true)
+          if ! [[ "$FULL_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid commit: $INPUT_COMMIT"
+            exit 1
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run, skipping the master branch check"
+          else
+            git fetch origin master --depth=1000
+            if ! git merge-base --is-ancestor "$FULL_SHA" origin/master; then
+              echo "::error::Commit $FULL_SHA is not on the master branch. Publishing is only allowed from master."
+              exit 1
+            fi
+          fi
+
+          echo "commit=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          git log -1 --pretty=format:"Publishing %H%n  Author: %an <%ae>%n  Date: %ad%n  Subject: %s" "$FULL_SHA"
+
+  validate-licenses:
+    name: Validate third-party licenses (release gate)
+    needs: validate
+    runs-on: ubuntu-26.04
+    # Tags can point at commits older than the pre-merge gate, so the
+    # release runs the same check against its own commit.
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+      - uses: ./.github/actions/utils/validate-third-party-licenses
+
+  plan:
+    name: Build publish plan
+    needs: [validate, validate-licenses]
+    runs-on: ubuntu-26.04
+    outputs:
+      crates: ${{ steps.mk.outputs.crates }}
+      has_docker: ${{ steps.mk.outputs.has_docker }}
+      docker_components: ${{ steps.mk.outputs.docker_components }}
+      docker_matrix: ${{ steps.mk.outputs.docker_matrix }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Setup yq
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            sudo chmod +x /usr/local/bin/yq
+          fi
+
+      # The Docker Hub secrets are only tested for presence.
+      - name: Build publish plan
+        id: mk
+        env:
+          COMMIT: ${{ needs.validate.outputs.commit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SKIP_TAG_CREATION: ${{ inputs.skip_tag_creation }}
+          AUTO_PUBLISH: ${{ inputs.create_edge_docker_tag }}
+          PUBLISH_CRATES: ${{ inputs.publish_crates }}
+          PUBLISH_DOCKERHUB: ${{ inputs.publish_dockerhub }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          source scripts/ci/lib/git-tag.sh
+          COMPONENTS=$(yq -o=json -I=0 '.components' .github/config/publish.yml)
+
+          # Prints each name of the comma-separated list $2 after checking that
+          # publish.yml lists it under registry $1.
+          select_components() {
+            local registry=$1 name
+            local -a names
+            IFS=, read -ra names <<< "$2"
+            for name in "${names[@]}"; do
+              name=${name//[[:space:]]/}
+              [[ -n "$name" ]] || continue
+              if [[ "$(jq -r --arg name "$name" '.[$name].registry // ""' <<< "$COMPONENTS")" != "$registry" ]]; then
+                echo "::error::$name is not a $registry component of .github/config/publish.yml" >&2
+                return 1
+              fi
+              echo "$name"
+            done
+          }
+
+          crates=$(select_components crates "$PUBLISH_CRATES" | sort -u)
+          docker=$(select_components dockerhub "$PUBLISH_DOCKERHUB" | sort -u)
+
+          if [[ -n "$docker" && "$DRY_RUN" != true && ( -z "$DOCKERHUB_USER" || -z "$DOCKERHUB_TOKEN" ) ]]; then
+            echo "::notice::DOCKERHUB_USER or DOCKERHUB_TOKEN is not set, so the image publish is skipped"
+            docker=""
+          fi
+
+          failed=0
+          released=""
+          for key in $crates $docker; do
+            version=$(scripts/extract-version.sh "$key")
+            tag=$(scripts/extract-version.sh "$key" --tag)
+            tag_commit=$(tag_commit origin "$tag")
+            echo "$key: version $version, tag $tag at ${tag_commit:-<no tag>}"
+            [[ -n "$tag_commit" ]] || continue
+            if [[ "$AUTO_PUBLISH" == true ]]; then
+              # Post-merge runs on every push, but a version only changes when
+              # someone bumps it. So an existing tag means that the version is
+              # released. An image still refreshes :edge.
+              released="$released $key"
+            elif [[ "$tag_commit" != "$COMMIT" && "$SKIP_TAG_CREATION" != true ]]; then
+              echo "::error::Tag $tag points to $tag_commit, not to $COMMIT. Bump the version, delete the tag or rerun with skip_tag_creation."
+              failed=1
+            fi
+          done
+          [[ "$failed" == 0 ]] || exit 1
+
+          for key in $released; do
+            crates=$(grep -vx "$key" <<< "$crates" || true)
+          done
+
+          docker_components=$(jq -nc --argjson cfg "$COMPONENTS" --arg list "$docker" '
+            [$list | split("\n")[] | select(. != "") | {key: ., image: $cfg[.].image}] | {include: .}')
+          docker_matrix=$(jq -nc --argjson cfg "$COMPONENTS" --arg list "$docker" '
+            {"linux/amd64": "ubuntu-26.04", "linux/arm64": "ubuntu-26.04-arm"} as $runners
+            | [$list | split("\n")[] | select(. != "") as $key | $cfg[$key].platforms[]
+               | {key: $key, platform: ., arch: (split("/")[1]), runner: $runners[.]}]
+            | if any(.[]; .runner == null) then error("publish.yml names a platform without a runner") else {include: .} end')
+
+          {
+            echo "crates=$(paste -sd, <<< "$crates")"
+            echo "has_docker=$([[ -n "$docker" ]] && echo true || echo false)"
+            echo "docker_components=$docker_components"
+            echo "docker_matrix=$docker_matrix"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  publish-rust-crates:
+    name: Publish Rust crates
+    needs: [validate, plan]
+    if: needs.plan.outputs.crates != ''
+    uses: ./.github/workflows/_publish_rust_crates.yml
+    permissions:
+      contents: write
+      id-token: write
+    with:
+      dry_run: ${{ inputs.dry_run }}
+      commit: ${{ needs.validate.outputs.commit }}
+      skip_tag_creation: ${{ inputs.skip_tag_creation }}
+
+  # Each platform builds on a native runner, without QEMU.
+  publish-docker:
+    name: Docker ${{ matrix.key }} (${{ matrix.arch }})
+    needs: [validate, plan, publish-rust-crates]
+    if: |
+      !cancelled() &&
+      needs.plan.result == 'success' &&
+      needs.plan.outputs.has_docker == 'true' &&
+      (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.docker_matrix) }}
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout at commit
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Extract version
+        id: ver
+        env:
+          KEY: ${{ matrix.key }}
+        run: |
+          set -euo pipefail
+          VERSION=$(scripts/extract-version.sh "$KEY")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved $KEY -> version=$VERSION"
+
+      - name: Publish Docker image
+        id: docker
+        uses: ./.github/actions/utils/docker-buildx
+        with:
+          task: publish
+          component: ${{ matrix.key }}
+          version: ${{ steps.ver.outputs.version }}
+          platform: ${{ matrix.platform }}
+          dry_run: ${{ inputs.dry_run }}
+          gha-cache: "false" # Registry cache only, to save GHA cache space
+
+      - name: Export digest
+        if: ${{ !inputs.dry_run }}
+        env:
+          DIGEST: ${{ steps.docker.outputs.digest }}
+        run: |
+          if [ -z "$DIGEST" ]; then
+            echo "::error::No digest available"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+          echo "Exported digest: $DIGEST"
+
+      - name: Upload digest
+        if: ${{ !inputs.dry_run }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-digest-${{ matrix.key }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Joins the platform images of each component into one multi-arch manifest.
+  docker-manifests:
+    name: Docker manifests
+    needs: [validate, plan, publish-docker]
+    if: |
+      !cancelled() &&
+      needs.publish-docker.result == 'success' &&
+      inputs.dry_run == false
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write # tag push
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.docker_components) }}
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Extract version & tag
+        id: ver
+        env:
+          KEY: ${{ matrix.key }}
+          AUTO_PUBLISH: ${{ inputs.create_edge_docker_tag }}
+        run: |
+          set -euo pipefail
+          VERSION=$(scripts/extract-version.sh "$KEY")
+          TAG=$(scripts/extract-version.sh "$KEY" --tag)
+          SHOULD_TAG=true
+          # Post-merge gives a stable version only the rolling :edge tag. Its
+          # git tag and :version manifest come from a manual release.
+          if [[ "$AUTO_PUBLISH" == true && "$(scripts/extract-version.sh "$KEY" --is-pre-release)" != true ]]; then
+            SHOULD_TAG=false
+          fi
+          # An existing tag means that the versioned release is done. This
+          # run then refreshes :edge only.
+          if [[ "$SHOULD_TAG" == true ]] && git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "$TAG already exists on origin"
+            SHOULD_TAG=false
+          fi
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "should_tag=$SHOULD_TAG"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: docker-digest-${{ matrix.key }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to Docker Hub
+        uses: apache/iggy/.github/actions/utils/docker-login@bd679c39c61b6ab4fcb11410fd738ab9dcdb047b
+        with:
+          username: ${{ env.DOCKERHUB_USER }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Create and push manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHOULD_TAG: ${{ steps.ver.outputs.should_tag }}
+          AUTO_PUBLISH: ${{ inputs.create_edge_docker_tag }}
+        run: |
+          set -euo pipefail
+          sources=()
+          for digest in *; do
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+          echo "Creating manifests for $IMAGE from ${sources[*]}"
+
+          push() {
+            docker buildx imagetools create -t "${IMAGE}:$1" "${sources[@]}"
+            echo "Pushed manifest: ${IMAGE}:$1"
+          }
+
+          if [[ "$AUTO_PUBLISH" == true ]]; then
+            push edge
+            # The :version manifest ships only with a new git tag.
+            if [[ "$SHOULD_TAG" == true ]]; then
+              push "$VERSION"
+            fi
+          else
+            push "$VERSION"
+            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+              push latest
+            fi
+          fi
+
+      - name: Inspect manifest
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHOULD_TAG: ${{ steps.ver.outputs.should_tag }}
+          AUTO_PUBLISH: ${{ inputs.create_edge_docker_tag }}
+        run: |
+          if [[ "$AUTO_PUBLISH" == true && "$SHOULD_TAG" != true ]]; then
+            docker buildx imagetools inspect "${IMAGE}:edge"
+          else
+            docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          fi
+
+      - name: Tag Docker release (${{ matrix.key }})
+        if: success() && inputs.skip_tag_creation == false && steps.ver.outputs.should_tag == 'true'
+        uses: apache/iggy/.github/actions/utils/create-git-tag@bd679c39c61b6ab4fcb11410fd738ab9dcdb047b
+        with:
+          tag: ${{ steps.ver.outputs.tag }}
+          commit: ${{ needs.validate.outputs.commit }}
+          message: |
+            Release ${{ matrix.key }} ${{ steps.ver.outputs.version }}
+
+            Component: ${{ matrix.key }}
+            Tag: ${{ steps.ver.outputs.tag }}
+            Commit: ${{ needs.validate.outputs.commit }}
+            Released by: GitHub Actions (workflow ${{ github.run_id }})

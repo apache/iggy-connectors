@@ -16,7 +16,7 @@ Writes messages from Iggy streams to Amazon S3 and S3-compatible object stores (
 
 ### Connector Runtime Config
 
-Build and start the broker and connector runtime from the matching Iggy checkout root. Use the [sink guide](https://iggy.apache.org/docs/connectors/sinks/sink/) for broker credentials and the main runtime configuration. Save the following connector entry in its configured connector directory and append one `[plugin_config]` table. Create the bucket separately before startup.
+Start the broker. Then build and start the connector runtime from the root of this repository. Use the [sink guide](https://iggy.apache.org/docs/connectors/sinks/sink/) for broker credentials and the main runtime configuration. Save the following connector entry in its configured connector directory and append one `[plugin_config]` table. Create the bucket separately before startup.
 
 ```toml
 type = "sink"

@@ -6,21 +6,7 @@ Sink connectors are responsible for writing data from Iggy streams to external s
 
 ## Available Sinks
 
-| Sink | Description |
-| ---- | ----------- |
-| **bigquery_sink** | Writes messages to Google BigQuery tables through the Storage Write API |
-| **doris_sink** | Loads JSON messages into Apache Doris tables via the Stream Load HTTP API |
-| **elasticsearch_sink** | Sends messages to Elasticsearch indices for full-text search and analytics |
-| **iceberg_sink** | Writes data to Apache Iceberg tables via REST catalog with S3/GCS/Azure storage |
-| **influxdb_sink** | Writes messages to InfluxDB as line-protocol points; supports both V2 (org/bucket, Flux) and V3 (db, SQL) |
-| **meilisearch_sink** | Indexes messages in Meilisearch for full-text search |
-| **postgres_sink** | Stores messages in PostgreSQL database tables with configurable schemas |
-| **quickwit_sink** | Indexes messages in Quickwit search engine for log analytics |
-| **redshift_sink** | Stores messages in Redshift warehouse tables with configurable schemas vis S3 as staging |
-| **s3_sink** | Writes messages to Amazon S3 and S3-compatible stores (MinIO, R2, B2, DO Spaces) |
-| **stdout_sink** | Prints messages to standard output (useful for debugging and development) |
-| **surrealdb_sink** | Writes messages into SurrealDB with deterministic record IDs for idempotent replay |
-| **rabbitmq_sink** | Publishes messages to RabbitMQ exchanges via AMQP |
+The [sinks table](../README.md#sinks) of the repository README lists every sink, with a link to its documentation.
 
 The sink is represented by the single `Sink` trait, which defines the basic interface for all sink connectors. It provides methods for initializing the sink, writing data to external destination, and closing the sink.
 
@@ -263,4 +249,4 @@ Eventually, compile the source code and create a separate connector configuratio
 
 And that's all, enjoy using the sink connector!
 
-On a side note, if you'd like to produce the messages to the Iggy stream instead, you can implement your own **[Source connector](https://github.com/apache/iggy/tree/master/core/connectors/sources)** too :)
+To produce messages to an Iggy stream instead, write a [source connector](https://github.com/apache/iggy-connectors/tree/master/sources).

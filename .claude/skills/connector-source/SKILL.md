@@ -1,6 +1,6 @@
 ---
 name: connector-source
-description: Author a new Apache Iggy connector source plugin under core/connectors/sources/. Sources poll an external system (DB, API, queue) and produce messages into Apache Iggy streams. Load when creating, modifying, or reviewing a source crate. Use for source plugin authoring. NOT for runtime internals (see connector-runtime).
+description: Author a new Apache Iggy connector source plugin under sources/. Sources poll an external system (DB, API, queue) and produce messages into Apache Iggy streams. Load when creating, modifying, or reviewing a source crate. Use for source plugin authoring. NOT for runtime internals (see connector-runtime).
 ---
 
 # Writing an Apache Iggy Connector Source
@@ -59,7 +59,7 @@ let persisted = ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id)
 
 ### Delivery acknowledgment
 
-`on_batch_result` (added by #3855) is how a source learns what happened to the batch it just
+`on_batch_result` (added by apache/iggy#3855) is how a source learns what happened to the batch it just
 returned. The SDK keeps exactly one batch in flight: it will not call `poll()` again until this
 returns. By default it stops after `MAX_CONSECUTIVE_NACKS` (5) consecutive NACKs; a source can
 override `batch_policy()` to disable the limit when its accepted input cannot be replayed after
@@ -127,7 +127,7 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 ### IDs and timestamps
 
 - `ProducedMessage.id: Option<u128>` - set when a natural ID exists (DB PK, document id). It rides the wire as the message id, which is what a **consumer** can dedupe an at-least-once duplicate on.
-- **Iggy itself does not dedupe on that id.** The server's only read of the field is `core/server/src/http/wire.rs`, which mints a fresh uuid when the incoming id is 0 and otherwise passes it through. Its dedup path is a per-client request-id watermark (`dedup_clients_max`) that never looks at this field.
+- **Iggy itself does not dedupe on that id.** The server's only read of the field is `core/server/src/http/wire.rs` in apache/iggy, which mints a fresh uuid when the incoming id is 0 and otherwise passes it through. Its dedup path is a per-client request-id watermark (`dedup_clients_max`) that never looks at this field.
 - `origin_timestamp: Option<u64>` - source-system event time in nanoseconds. Lets downstream sinks reason about lag.
 - `timestamp` and `checksum` are Iggy-side - leave `None`.
 
@@ -185,7 +185,7 @@ Iggy consumer-loop labels use literal API names (`offset=`, `current_offset=`).
 
 Mandatory four canonical source state tests (see [connector-testing](../connector-testing/SKILL.md) for the full pattern). Copy from `sources/random_source/src/lib.rs::tests`. Plus config defaults, payload building, schema selection.
 
-Integration tests under `core/integration/tests/connectors/<backend>/` for any source backed by external infra. Use `#[iggy_harness]` + a `TestFixture` backed by `testcontainers-modules`. Reference: `core/integration/tests/connectors/postgres/postgres_source.rs` (multi-mode tests) + `restart.rs` (state survives restart). Exercise both ACK and NACK paths when the source stages cursors or destructive work.
+Integration tests live in the source's own test target `sources/<name>_source/tests/<backend>/` (entry `main.rs`) for any source backed by external infra. Use `#[iggy_harness]` + a `TestFixture` backed by `testcontainers-modules`. Reference: `sources/postgres_source/tests/postgres/postgres_source.rs` (multi-mode tests, plus `state_persists_across_connector_restart` for state that survives a restart). Exercise both ACK and NACK paths when the source stages cursors or destructive work.
 
 ## Before declaring done
 
@@ -193,13 +193,15 @@ Integration tests under `core/integration/tests/connectors/<backend>/` for any s
 cargo fmt --all
 cargo sort --no-format --workspace
 cargo clippy -p iggy_connector_<name>_source --all-targets -- -D warnings
-cargo test -p iggy_connector_<name>_source
+cargo nextest run -p iggy_connector_<name>_source --lib
 
-# Integration tests:
-cargo test -p integration -- connectors::<backend>::<test_name>
+# Integration tests (Docker, ./scripts/build-test-server.sh once per R).
+# The harness launches target/debug/iggy-connectors, which loads the plugin from target/debug/:
+cargo build -p iggy-connectors -p iggy_connector_<name>_source
+cargo nextest run -p iggy_connector_<name>_source --test <backend> <test_name>
 ```
 
-Update `core/connectors/sources/README.md` and add a sample TOML under `core/connectors/runtime/example_config/connectors/`.
+A new source also needs its directory in `members` of the root `Cargo.toml` (new dependencies go to `[workspace.dependencies]`), a row for its test target in `.config/rail.toml`, a row in the sources table of the root `README.md`, and a sample TOML under `runtime/example_config/connectors/`.
 
 ---
 

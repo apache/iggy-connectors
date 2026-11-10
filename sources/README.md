@@ -6,14 +6,7 @@ Source connectors are responsible for ingesting data from external sources into 
 
 ## Available Sources
 
-| Source | Description |
-| ------ | ----------- |
-| **elasticsearch_source** | Polls documents from Elasticsearch indices with timestamp-based tracking |
-| **http_source** | Webhook gateway: an embedded HTTP server shared by every instance, with per-endpoint bearer/HMAC auth and a management API for endpoints registered at runtime |
-| **influxdb_source** | Polls InfluxDB with cursor-based timestamp tracking; supports V2 (Flux, annotated CSV) and V3 (SQL, JSONL) |
-| **mqtt_source** | Subscribes to MQTT 3.1.1 or MQTT 5 brokers with QoS 0, 1, or 2 |
-| **postgres_source** | Reads rows from PostgreSQL tables with multiple strategies: delete after read, mark as processed, or timestamp tracking |
-| **random_source** | Generates random test messages (useful for testing and development) |
+The [sources table](../README.md#sources) of the repository README lists every source, with a link to its documentation.
 
 The source is represented by the single `Source` trait, which defines the basic interface for all source connectors. It provides methods for initializing the source, reading data from it, and closing the source.
 
@@ -296,4 +289,4 @@ iggy --username iggy --password iggy topic create example_stream example_topic 1
 
 And that's all, enjoy using the source connector!
 
-On a side note, if you'd like to process the messages consumed from the Iggy stream instead, you can implement your own **[Sink connector](https://github.com/apache/iggy/tree/master/core/connectors/sinks)** too :)
+To consume messages from an Iggy stream instead, write a [sink connector](https://github.com/apache/iggy-connectors/tree/master/sinks).

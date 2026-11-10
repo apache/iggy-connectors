@@ -18,7 +18,7 @@ The PostgreSQL source connector fetches data from PostgreSQL databases and strea
 
 Use the broker credentials and main runtime configuration from the
 [source guide](https://iggy.apache.org/docs/connectors/sources/source/#configuration).
-Build from the matching checkout root:
+Build from the root of this repository:
 
 ```bash
 cargo build --release -p iggy_connector_postgres_source
@@ -28,7 +28,7 @@ The examples use the `iggy` database and `iggy`/`iggy` credentials. Create the
 `users` and `orders` tables using the SQL on the
 [Postgres source page](https://iggy.apache.org/docs/connectors/sources/postgres/).
 Save one connector entry in the runtime's connector directory and run the runtime
-from the checkout root. Create its destination stream and topic before starting it.
+from the root of this repository. Create its destination stream and topic before starting it.
 
 ```toml
 type = "source"

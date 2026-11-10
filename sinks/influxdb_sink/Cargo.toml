@@ -25,7 +25,7 @@ keywords = ["iggy", "messaging", "streaming", "influxdb", "sink"]
 categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
-repository = "https://github.com/apache/iggy"
+repository = "https://github.com/apache/iggy-connectors"
 readme = "../../README.md"
 publish = false
 
@@ -48,7 +48,14 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+ctor = { workspace = true }
+dtor = { workspace = true }
+iggy = { workspace = true }
+iggy_connector_testing = { workspace = true }
+integration = { workspace = true }
+serial_test = { workspace = true }
 simd-json = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 toml = { workspace = true }
 
 [lints]

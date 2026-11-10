@@ -1,0 +1,310 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: _detect
+on:
+  workflow_call:
+    outputs:
+      third_party_licenses:
+        description: "Whether third-party license inputs changed"
+        value: ${{ jobs.detect.outputs.third_party_licenses }}
+      rust_plan:
+        description: "Selected Rust checks that need no CI artifacts; empty when none run"
+        value: ${{ jobs.detect.outputs.rust_plan }}
+      rust_tests:
+        description: "Whether the Rust tests run, which need the test server and the test archive"
+        value: ${{ jobs.detect.outputs.rust_tests }}
+      docker:
+        description: "Whether the apache/iggy-connect image gets a test build"
+        value: ${{ jobs.detect.outputs.docker }}
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    outputs:
+      third_party_licenses: ${{ github.event_name != 'pull_request' || steps.changed.outputs.third_party_licenses == 'true' }}
+      rust_plan: ${{ steps.mk.outputs.rust_plan }}
+      rust_tests: ${{ steps.mk.outputs.rust_tests }}
+      docker: ${{ steps.mk.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files (PR or push)
+        id: changed
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            all:
+              - '**'
+            third_party_licenses:
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '**/.cargo/**'
+              - 'rust-toolchain*'
+              - '**/LICENSE*'
+              - '**/NOTICE*'
+              - 'about.toml'
+              - 'about.hbs'
+              - 'scripts/ci/third-party-licenses.sh'
+              - 'scripts/ci/apt-install.sh'
+              - '.github/actions/utils/validate-third-party-licenses/**'
+              - '.github/actions/utils/setup-rust/**'
+              - '.github/workflows/_detect.yml'
+              - '.github/workflows/_common.yml'
+              - '.github/workflows/pre-merge.yml'
+          list-files: json
+
+      - name: Load components config
+        id: config
+        run: |
+          if ! command -v yq &> /dev/null; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            wget -qO /tmp/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /tmp/yq" | sha256sum -c - || exit 1
+            chmod +x /tmp/yq
+            sudo mv /tmp/yq /usr/local/bin/yq
+          fi
+          echo "components=$(yq -o=json -I=0 '.' .github/config/components.yml | jq -c)" >> "$GITHUB_OUTPUT"
+
+      - name: Build matrices
+        id: mk
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const componentsJson = `${{ steps.config.outputs.components }}`;
+            const changedFilesJson = `${{ steps.changed.outputs.all_files || '[]' }}`;
+
+            let componentsCfg = { components: {} };
+            try { componentsCfg = JSON.parse(componentsJson); } catch {}
+            const components = componentsCfg.components || {};
+
+            let changedFiles = [];
+            try { changedFiles = JSON.parse(changedFilesJson); } catch {}
+            const files = changedFiles.map(p => p.replace(/\\/g, '/'));
+
+            const escapeRe = s => s.replace(/([.+^${}()|[\]\\])/g, '\\$1');
+
+            const globToRegex = (pattern) => {
+              // Handle exclusion patterns
+              const isExclusion = pattern.startsWith('!');
+              const cleanPattern = isExclusion ? pattern.slice(1) : pattern;
+
+              let s = escapeRe(cleanPattern);
+
+              // First, replace ** patterns with placeholders to protect them
+              s = s.replace(/\*\*\/+/g, '___DOUBLESTAR_SLASH___');  // '**/' -> placeholder
+              s = s.replace(/\/\*\*$/g, '___SLASH_DOUBLESTAR___');   // '/**' at end -> placeholder
+              s = s.replace(/\*\*/g, '___DOUBLESTAR___');            // remaining '**' -> placeholder
+
+              // Now handle single * and ? (they won't match our placeholders)
+              s = s.replace(/\*/g, '[^/]*');                         // '*' -> match any except /
+              s = s.replace(/\?/g, '[^/]');                          // '?' -> match single char except /
+
+              // Finally, replace placeholders with actual regex patterns
+              s = s.replace(/___DOUBLESTAR_SLASH___/g, '(?:.*/)?');  // '**/' -> any subpath (optional)
+              s = s.replace(/___SLASH_DOUBLESTAR___/g, '(?:/.*)?');  // '/**' at end -> rest of path
+              s = s.replace(/___DOUBLESTAR___/g, '.*');              // remaining '**' -> match anything
+
+              return { regex: new RegExp(`^${s}$`), exclude: isExclusion };
+            };
+
+            const compiled = new Map();
+            const toRx = (p) => {
+              if (!compiled.has(p)) compiled.set(p, globToRegex(p));
+              return compiled.get(p).regex;
+            };
+            const test = (file, patterns) => {
+              const inc = patterns.filter(p => !p.startsWith('!')).map(toRx);
+              const exc = patterns.filter(p =>  p.startsWith('!')).map(p => toRx(p.slice(1)));
+              const included = inc.some(rx => rx.test(file));
+              const excluded = exc.some(rx => rx.test(file));
+              return included && !excluded;
+            };
+
+            // Build dependency graph and resolve affected components
+            const affectedComponents = new Set();
+            const componentTriggers = new Map(); // Track what triggered each component
+            const dependencyGraph = new Map();
+
+            // First pass: build dependency graph
+            for (const [name, cfg] of Object.entries(components)) {
+              if (cfg.depends_on) {
+                dependencyGraph.set(name, cfg.depends_on);
+              }
+            }
+
+            // Second pass: check which components are directly affected by file changes
+            console.log('=== Change Detection ===');
+            console.log(`Analyzing ${files.length} changed files...`);
+            console.log('');
+
+            for (const [name, cfg] of Object.entries(components)) {
+              const pats = (cfg.paths || []);
+              const matchedFiles = files.filter(f => test(f, pats));
+              if (matchedFiles.length > 0) {
+                affectedComponents.add(name);
+                componentTriggers.set(name, {
+                  reason: 'direct',
+                  files: matchedFiles,
+                  dependency: null
+                });
+
+                // Log direct matches
+                console.log(`✓ ${name} directly affected by:`);
+                if (matchedFiles.length <= 5) {
+                  matchedFiles.forEach(f => console.log(`    - ${f}`));
+                } else {
+                  matchedFiles.slice(0, 3).forEach(f => console.log(`    - ${f}`));
+                  console.log(`    ... and ${matchedFiles.length - 3} more files`);
+                }
+              }
+            }
+
+            // Third pass: resolve transitive dependencies
+            console.log('');
+            console.log('=== Dependency Resolution ===');
+
+            const resolveDependent = (componentName, depth = 0) => {
+              for (const [dependent, dependencies] of dependencyGraph.entries()) {
+                if (dependencies.includes(componentName) && !affectedComponents.has(dependent)) {
+                  affectedComponents.add(dependent);
+
+                  // Track why this component was added
+                  if (!componentTriggers.has(dependent)) {
+                    componentTriggers.set(dependent, {
+                      reason: 'dependency',
+                      files: [],
+                      dependency: componentName
+                    });
+                    console.log(`${'  '.repeat(depth)}→ ${dependent} (depends on ${componentName})`);
+                  }
+
+                  resolveDependent(dependent, depth + 1); // Recursively add dependents
+                }
+              }
+            };
+
+            // Apply dependency resolution
+            const initialAffected = [...affectedComponents];
+            for (const comp of initialAffected) {
+              resolveDependent(comp, 1);
+            }
+
+            // Summary output
+            console.log('');
+            console.log('=== Summary ===');
+            console.log(`Initially affected: ${initialAffected.length} components`);
+            console.log(`After dependencies: ${affectedComponents.size} components`);
+
+            if (files.length <= 10) {
+              console.log('');
+              console.log('Changed files:');
+              files.forEach(f => console.log(`  - ${f}`));
+            } else {
+              console.log(`Total files changed: ${files.length}`);
+            }
+
+            const groups = { rust: [], docker: [] };
+
+            // Process affected components and generate tasks
+            console.log('');
+            console.log('=== Task Generation ===');
+
+            const skippedComponents = [];
+            const taskedComponents = [];
+
+            for (const name of affectedComponents) {
+              const cfg = components[name];
+              const trigger = componentTriggers.get(name);
+
+              if (!cfg || !cfg.tasks || cfg.tasks.length === 0) {
+                skippedComponents.push(name);
+                continue;
+              }
+
+              const entries = cfg.tasks.map(task => ({ component: name, task }));
+              taskedComponents.push({ name, tasks: cfg.tasks, trigger });
+
+              if (name === 'rust' || name.startsWith('rust-')) groups.rust.push(...entries);
+              else if (name.startsWith('docker-')) groups.docker.push(...entries);
+              else core.setFailed(`Component ${name} has tasks but no task group`);
+            }
+
+            // Log components with tasks
+            if (taskedComponents.length > 0) {
+              console.log('Components with tasks to run:');
+              taskedComponents.forEach(({ name, tasks, trigger }) => {
+                const reason = trigger.reason === 'direct'
+                  ? `directly triggered by ${trigger.files.length} file(s)`
+                  : `dependency of ${trigger.dependency}`;
+                console.log(`  ✓ ${name}: ${tasks.length} task(s) - ${reason}`);
+              });
+            }
+
+            // Log skipped components (no tasks defined)
+            if (skippedComponents.length > 0) {
+              console.log('');
+              console.log('Components triggered but skipped (no tasks):');
+              skippedComponents.forEach(name => {
+                const trigger = componentTriggers.get(name);
+                const reason = trigger.reason === 'direct'
+                  ? `directly triggered by ${trigger.files.length} file(s)`
+                  : `dependency of ${trigger.dependency}`;
+                console.log(`  ○ ${name} - ${reason}`);
+              });
+            }
+
+            // Final summary of what will run
+            console.log('');
+            console.log('=== Test Jobs to Run ===');
+
+            const jobSummary = [
+              { name: 'Rust', tasks: groups.rust },
+              { name: 'Docker', tasks: groups.docker },
+            ];
+
+            jobSummary.forEach(({ name, tasks }) => {
+              if (tasks.length > 0) {
+                const uniqueTasks = [...new Set(tasks.map(t => t.task))];
+                console.log(`  ✓ ${name}: ${uniqueTasks.join(', ')}`);
+              } else {
+                console.log(`  ✗ ${name}: SKIPPED (no changes detected)`);
+              }
+            });
+
+            // Overall stats
+            const totalTasks = Object.values(groups).reduce((sum, g) => sum + g.length, 0);
+            console.log('');
+            console.log(`Total: ${affectedComponents.size} components affected, ${totalTasks} tasks to run`);
+
+            // Use environment files instead of deprecated setOutput
+            const setOutput = (name, value) => {
+              const output = `${name}=${value}`;
+              require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `${output}\n`);
+            };
+
+            const rustChecks = groups.rust.filter(({task}) => task !== 'test');
+            setOutput('rust_plan', rustChecks.length ? JSON.stringify({checks: rustChecks}) : '');
+            setOutput('rust_tests', String(groups.rust.some(({task}) => task === 'test')));
+            setOutput('docker', String(groups.docker.length > 0));

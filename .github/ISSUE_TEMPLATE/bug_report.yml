@@ -1,0 +1,141 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Bug Report
+description: Report a bug in Apache Iggy Connectors
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug description
+      description: What happened? What did you expect to happen instead?
+      placeholder: |
+        Describe the bug clearly. Include:
+        - What you were doing
+        - What you expected
+        - What actually happened
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area / component
+      description: |
+        Which part(s) of the project does this affect? Your selection is auto-labeled on the issue.
+      multiple: true
+      options:
+        - Connectors runtime
+        - Connector SDK
+        - Sinks
+        - Sources
+        - Transforms
+        - Configuration
+        - Docker image
+        - Performance
+        - Documentation
+        - CI / build / tooling
+        - Other / not sure
+    validations:
+      required: false
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      description: How is the connectors runtime deployed?
+      options:
+        - Docker (DockerHub image)
+        - Docker (self-built image)
+        - Compiled from source
+        - Not applicable
+    validations:
+      required: false
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Versions of the connectors runtime, the plugin and the Iggy server. A git tag, commit SHA or DockerHub tag is also acceptable.
+      placeholder: "e.g., apache/iggy-connect:0.6.0, postgres_sink at commit abc1234, server 0.10.0"
+    validations:
+      required: false
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware / environment
+      description: Where is this running, and which external system and version does the connector talk to?
+      placeholder: "e.g., AWS EC2 c5.xlarge with PostgreSQL 17, local PC with Elasticsearch 9.1 in Docker"
+    validations:
+      required: false
+
+  - type: textarea
+    id: sample-code
+    attributes:
+      label: Sample code
+      description: The plugin code, or the producer or consumer that triggers the bug (if applicable).
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant logs from the connectors runtime and the Iggy server.
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Connectors config
+      description: |
+        Your runtime `config.toml`, the connector config files, or custom `IGGY_CONNECTORS_*` environment variables. Remove passwords, tokens and keys first.
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: |
+        Steps to trigger the bug and/or a minimal reproducible project (repo link or inline script).
+      placeholder: |
+        1. Start the server with ...
+        2. Start the connectors runtime with ...
+        3. Send messages using ...
+        4. Observe ...
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I'm willing to submit a pull request to fix this bug
+
+  - type: checkboxes
+    id: good-first-issue
+    attributes:
+      label: Good first issue
+      description: Ticking this self-tags the issue with the `good first issue` label. Maintainers may remove it during triage.
+      options:
+        - label: I think this could be a good first issue for a new contributor

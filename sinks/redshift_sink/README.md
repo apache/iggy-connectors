@@ -20,7 +20,7 @@ key = "redshift"
 enabled = true
 version = 0
 name = "Redshift sink"
-path = "../../target/release/libiggy_connector_redshift_sink"
+path = "target/release/libiggy_connector_redshift_sink"
 verbose = false
 
 [[streams]]

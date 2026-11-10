@@ -1,6 +1,6 @@
 # Sink plugin skeleton
 
-Boilerplate for a new `core/connectors/sinks/<name>_sink/`. Adapt the
+Boilerplate for a new `sinks/<name>_sink/`. Adapt the
 `MySink` / `Client` types to the backend driver you're integrating.
 
 ## Cargo.toml

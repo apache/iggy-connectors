@@ -1,0 +1,17 @@
+.agents
+.claude
+.config
+.dockerignore
+.github
+.gitignore
+.idea
+.vscode
+.zed
+/local_data
+/local_state
+/test_logs
+/scripts/*.sh
+/scripts/port-pr.map
+/scripts/ci/*
+!/scripts/ci/third-party-licenses.sh
+**/target

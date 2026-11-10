@@ -42,8 +42,8 @@ endpoint = "/metrics"
 
 [http.tls] # Optional TLS configuration for HTTP API
 enabled = false
-cert_file = "core/certs/iggy_cert.pem"
-key_file = "core/certs/iggy_key.pem"
+cert_file = "certs/iggy_cert.pem"
+key_file = "certs/iggy_key.pem"
 
 [iggy]
 address = "localhost:8090"
@@ -53,7 +53,7 @@ token = "" # Personal Access Token (PAT) can be used instead of username and pas
 
 [iggy.tls] # Optional TLS configuration for Iggy TCP connection
 enabled = false
-ca_file = "core/certs/iggy_ca_cert.pem"
+ca_file = "certs/iggy_ca_cert.pem"
 domain = "" # Optional domain for TLS connection
 
 [state]

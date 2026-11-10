@@ -25,7 +25,7 @@ keywords = ["iggy", "messaging", "streaming", "clickhouse", "sink"]
 categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
-repository = "https://github.com/apache/iggy"
+repository = "https://github.com/apache/iggy-connectors"
 readme = "../../README.md"
 publish = false
 
@@ -46,6 +46,16 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+ctor = { workspace = true }
+dtor = { workspace = true }
+iggy = { workspace = true }
+iggy_common = { workspace = true }
+iggy_connector_testing = { workspace = true }
+integration = { workspace = true }
+reqwest = { workspace = true, features = ["http2", "json"] }
+serial_test = { workspace = true }
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 toml = { workspace = true }
 
 [lints]

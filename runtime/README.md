@@ -8,7 +8,7 @@ The connector are implemented as Rust libraries, and these are loaded dynamicall
 
 Internally, [dlopen2](https://github.com/OpenByteDev/dlopen2) loads plugin libraries and resolves their C FFI symbols. Plugins execute inside the runtime process.
 
-By default, runtime will look for the configuration file, to decide which connectors to load and how to configure them.
+The configuration file tells the runtime which connectors to load and how to configure them. By default, the runtime reads `runtime/config.toml`, relative to the working directory. Set `IGGY_CONNECTORS_CONFIG_PATH` to read another file. The runtime embeds the content of `runtime/config.toml` at build time as its defaults. If the file exists, the runtime merges it over these defaults. Then it applies the environment variables.
 
 Set the broker credentials and connector configuration directory before starting the runtime. The embedded default has an empty connector directory and cannot start unchanged. Follow the [connector quick start](../README.md#quick-start) for a complete setup.
 
@@ -25,7 +25,7 @@ token = "" # Personal Access Token (PAT) can be used instead of username and pas
 
 [iggy.tls] # Optional TLS configuration for Iggy TCP connection
 enabled = false
-ca_file = "core/certs/iggy_ca_cert.pem"
+ca_file = "certs/iggy_ca_cert.pem"
 domain = "" # Optional domain for TLS connection
 
 [state]
@@ -73,7 +73,7 @@ A poll of one sink that waits for messages thus does not delay the polls or
 offset stores of another sink. The consumers inside one sink share its client.
 They share the progress lane of each partition, which orders their polls and
 offset calls. They also share the limit of 64 deferred requests per client.
-The [SDK README](../../sdk/README.md) describes both.
+The [README of the Iggy Rust client SDK](https://github.com/apache/iggy/blob/master/core/sdk/README.md) describes both.
 
 ## Sink delivery guarantees
 
@@ -210,7 +210,7 @@ The runtime does not delete remote state. Disabling, removing, or restarting a s
 
 ## Exactly-once sources
 
-If a source sets `exactly_once = true`, the runtime writes each batch of the source once. This holds after a lost reply, a NACK, or a crash of the runtime. Each batch goes to one partition as a batch of an idempotent producer. The [SDK README](../../sdk/README.md#idempotent-producers) describes idempotent producers.
+If a source sets `exactly_once = true`, the runtime writes each batch of the source once. This holds after a lost reply, a NACK, or a crash of the runtime. Each batch goes to one partition as a batch of an idempotent producer. The [README of the Iggy Rust client SDK](https://github.com/apache/iggy/blob/master/core/sdk/README.md#idempotent-producers) describes idempotent producers.
 
 ```toml
 exactly_once = true
@@ -369,8 +369,8 @@ endpoint = "/metrics"
 
 [http.tls] # Optional TLS configuration for HTTP API
 enabled = false
-cert_file = "core/certs/iggy_cert.pem"
-key_file = "core/certs/iggy_key.pem"
+cert_file = "certs/iggy_cert.pem"
+key_file = "certs/iggy_key.pem"
 ```
 
 > [!IMPORTANT]
@@ -459,7 +459,7 @@ Currently, it does expose the following endpoints:
 - `GET /sinks/{key}/configs/active`: active configuration details.
 - `PUT /sinks/{key}/configs/active`: activate a specific configuration version for the sink.
 - `GET /sinks/{key}/configs/plugin`: sink plugin config, including the optional `format` query parameter to specify the config format.
-- `POST /sinks/{key}/restart`: stop the sink and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([#3848](https://github.com/apache/iggy/issues/3848)).
+- `POST /sinks/{key}/restart`: stop the sink and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([apache/iggy#3848](https://github.com/apache/iggy/issues/3848)).
 - `GET /sinks/{key}/transforms`: sink transforms to be applied to the fields.
 - `GET /sources`: list of sources.
 - `GET /sources/{key}`: source details.
@@ -470,7 +470,7 @@ Currently, it does expose the following endpoints:
 - `GET /sources/{key}/configs/active`: active configuration details.
 - `PUT /sources/{key}/configs/active`: activate a specific configuration version for the source.
 - `GET /sources/{key}/configs/plugin`: source plugin config, including the optional `format` query parameter to specify the config format.
-- `POST /sources/{key}/restart`: stop the source and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([#3848](https://github.com/apache/iggy/issues/3848)).
+- `POST /sources/{key}/restart`: stop the source and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([apache/iggy#3848](https://github.com/apache/iggy/issues/3848)).
 - `GET /sources/{key}/transforms`: source transforms to be applied to the fields.
 
 `{key}` is the connector key: at most 128 bytes of ASCII letters, digits, `-`,

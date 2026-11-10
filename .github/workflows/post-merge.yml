@@ -1,0 +1,169 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Auto-publish: refreshes apache/iggy-connect:edge when the image inputs
+# change, and publishes an untagged edge version of iggy_connector_sdk.
+# Runs on every push to master.
+
+name: Post-merge
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: post-merge-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check-auto-publish:
+    name: Auto-publish
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    if: ${{ !github.event.repository.fork }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup yq
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
+
+      # Planning is an optimization. A failure falls back to refreshing every
+      # Docker image in the component registry.
+      - name: Plan affected edge images
+        id: rail
+        continue-on-error: true
+        uses: loadingalias/cargo-rail-action@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
+
+      - name: Check all components
+        id: check
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+          PLAN_STATUS: ${{ steps.rail.outcome }}
+        run: |
+          set -euo pipefail
+
+          COMPONENTS_JSON=$(yq -o=json -I=0 '.components' .github/config/publish.yml)
+          ALL_DOCKER_COMPONENTS=$(jq -r \
+            '[to_entries[] | select(.value.registry == "dockerhub") | .key] | join(",")' \
+            <<< "$COMPONENTS_JSON")
+
+          # The plan can only select images that have a catalog row, so a
+          # catalog that has drifted from publish.yml refreshes every image.
+          if [[ "$PLAN_STATUS" != "success" ]]; then
+            echo "::warning::Cargo-Rail plan unavailable; refreshing all edge images"
+            IMAGE_MATRIX=all
+          elif ! scripts/ci/edge-image-catalog.sh --check; then
+            echo "::warning::Edge image catalog does not match publish.yml; refreshing all edge images"
+            IMAGE_MATRIX=all
+          elif IMAGE_MATRIX=$(cargo-rail-action plan matrix "$PLAN_FILE" edge-images); then
+            echo "::notice::Using validated Cargo-Rail edge image plan: ${IMAGE_MATRIX}"
+          else
+            echo "::warning::Cargo-Rail edge image selector failed; refreshing all edge images"
+            IMAGE_MATRIX=all
+          fi
+
+          if [[ "$IMAGE_MATRIX" == "all" ]]; then
+            DOCKER_COMPONENTS="$ALL_DOCKER_COMPONENTS"
+          elif ! DOCKER_COMPONENTS=$(jq -er --argjson configured "$COMPONENTS_JSON" '
+            [.include[].component] as $selected
+            | [$selected[] | select($configured[.].registry != "dockerhub")] as $unknown
+            | if ($unknown | length) == 0
+              then $selected | join(",")
+              else error("Cargo-Rail selected unknown Docker components \($unknown | join(",")) in matrix \(tojson)")
+              end
+          ' <<< "$IMAGE_MATRIX"); then
+            echo "::warning::Cargo-Rail edge image matrix is invalid; refreshing all edge images"
+            DOCKER_COMPONENTS="$ALL_DOCKER_COMPONENTS"
+          fi
+
+          echo "docker_components=$DOCKER_COMPONENTS" >> "$GITHUB_OUTPUT"
+          echo "Docker components to refresh: ${DOCKER_COMPONENTS:-<none>}"
+
+          # The SDK publishes each pre-release version once, and only when
+          # crates.io can resolve the core versions it pins: their core tags
+          # must point to R. A pin to a core release always passes.
+          CRATES_TO_PUBLISH=""
+          crate=rust-connector-sdk
+          VERSION=$(scripts/extract-version.sh "$crate")
+          TAG=$(scripts/extract-version.sh "$crate" --tag)
+          echo "Checking $crate: version=$VERSION, tag=$TAG"
+          if [[ "$(scripts/extract-version.sh "$crate" --is-pre-release)" != true ]]; then
+            echo "Stable version - skipping"
+          elif git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag exists - skipping"
+          else
+            released=$(scripts/ci/core-released-at-r.sh)
+            if [[ "$released" == true ]]; then
+              CRATES_TO_PUBLISH=$crate
+            else
+              echo "::notice::Skipping $crate $VERSION: core has not released the iggy and iggy_common versions that Cargo.toml pins at R"
+            fi
+          fi
+          echo "crates_to_publish=$CRATES_TO_PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "Crates to publish: ${CRATES_TO_PUBLISH:-<none>}"
+
+      # Trusted publishers validate the top-level workflow identity. Dispatching
+      # publish.yml keeps automatic and manual releases on the same identity.
+      - name: Dispatch publisher
+        if: steps.check.outputs.crates_to_publish != '' || steps.check.outputs.docker_components != ''
+        uses: actions/github-script@v9
+        env:
+          COMMIT: ${{ github.sha }}
+          PUBLISH_CRATES: ${{ steps.check.outputs.crates_to_publish }}
+          PUBLISH_DOCKERHUB: ${{ steps.check.outputs.docker_components }}
+        with:
+          script: |
+            const dispatch = await github.request('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'publish.yml',
+              ref: 'master',
+              inputs: {
+                commit: process.env.COMMIT,
+                dry_run: 'false',
+                skip_tag_creation: 'false',
+                publish_crates: process.env.PUBLISH_CRATES,
+                publish_dockerhub: process.env.PUBLISH_DOCKERHUB,
+                create_edge_docker_tag: 'true'
+              },
+              headers: {
+                'X-GitHub-Api-Version': '2026-03-10'
+              }
+            });
+
+            const runId = dispatch.data.workflow_run_id;
+            if (!runId) {
+              throw new Error('Workflow dispatch did not return a run ID');
+            }
+
+            core.info(`Publish run: ${dispatch.data.html_url}`);
+            await core.summary
+              .addLink(`Publish run #${runId}`, dispatch.data.html_url)
+              .write();

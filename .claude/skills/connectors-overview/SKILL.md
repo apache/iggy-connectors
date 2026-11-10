@@ -1,6 +1,6 @@
 ---
 name: connectors-overview
-description: Entry point and index for the Apache Iggy Connectors subsystem (`core/connectors/`). Load this first when working anywhere under `core/connectors/` - runtime, SDK, sinks, sources, or transforms. Routes to the focused per-area skills.
+description: Entry point and index for the Apache Iggy Connectors repository. Load this first when working anywhere in it - runtime, SDK, sinks, sources, transforms, or their tests. Routes to the focused per-area skills.
 ---
 
 # Apache Iggy Connectors - Overview
@@ -125,11 +125,11 @@ let pool = PgPoolOptions::new()
 
 If a config struct genuinely needs `Serialize`, `serde_secret::serialize_redacted` (and `serialize_optional_redacted`) write `[REDACTED]` in place of the value. Reach for `serialize_secret` only when the caller must get the real thing back. The sinks and sources listed below predate that helper and use the exposing one; the annotation is inert today, but it is not the protection it looks like.
 
-Note that none of this protects the credential from the runtime's own control API, which returns plugin configuration verbatim - see #3802. Plugin-side annotations are inert there because the runtime never routes through them.
+Note that none of this protects the credential from the runtime's own control API, which returns plugin configuration verbatim - see apache/iggy#3802. Plugin-side annotations are inert there because the runtime never routes through them.
 
 Plugin-side uses of the exposing helpers: `sinks/{postgres,mongodb,elasticsearch,influxdb,s3,surrealdb}_sink`, `sources/{postgres,elasticsearch,influxdb}_source`.
 
-That list is plugin-side only, not an inventory of every caller in the tree, and the others are not all mistakes: `runtime/src/api/config.rs` puts `serialize_secret` on `HttpConfig::api_key` (inert for the same reason), and several `core/common` wire-payload types (login, create-user, change-password, PAT) use these helpers by design, because there the credential *is* the payload.
+That list is plugin-side only, not an inventory of every caller in the tree, and the others are not all mistakes: `runtime/src/api/config.rs` puts `serialize_secret` on `HttpConfig::api_key` (inert for the same reason), and several `iggy_common` wire-payload types in apache/iggy (login, create-user, change-password, PAT) use these helpers by design, because there the credential *is* the payload.
 
 ### Errors
 
@@ -165,7 +165,7 @@ Implementation: `runtime/src/benchmark.rs` (text-event emitters +
 observe_stage_with_labels}` (pre-built label cache avoids per-batch
 `String` clones. `&str`-based wrappers are `#[cfg(test)]` only). Tests:
 `runtime/src/metrics.rs::tests::given_stage_histogram_*` (unit),
-`core/integration/tests/connectors/runtime/benchmark.rs` (integration:
+`runtime/tests/runtime/benchmark.rs` (integration:
 text emission, env override, disabled-flag, histograms via `/metrics`,
 JSON log format, parser unit tests).
 
@@ -175,14 +175,14 @@ JSON log format, parser unit tests).
 
 ## Exemplars
 
-| Purpose                                                   | Plugin                                                                                  |
-| --------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Simplest sink (read first)                                | `sinks/stdout_sink/`                                                                    |
-| Real-infra sink + integration tests                       | `sinks/postgres_sink/` + `integration/tests/connectors/postgres/postgres_sink.rs`       |
-| Feature-rich sink config (validation, batch modes, retry) | `sinks/http_sink/`                                                                      |
-| Atomic counters on hot path                               | `sinks/mongodb_sink/`                                                                   |
-| Simplest source (4 canonical state tests)                 | `sources/random_source/`                                                                |
-| Real-infra source                                         | `sources/postgres_source/` + `integration/tests/connectors/postgres/postgres_source.rs` |
+| Purpose                                                   | Plugin                                                                 |
+| --------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Simplest sink (read first)                                | `sinks/stdout_sink/`                                                   |
+| Real-infra sink + integration tests                       | `sinks/postgres_sink/` + `sinks/postgres_sink/tests/postgres/`         |
+| Feature-rich sink config (validation, batch modes, retry) | `sinks/http_sink/`                                                     |
+| Atomic counters on hot path                               | `sinks/mongodb_sink/`                                                  |
+| Simplest source (4 canonical state tests)                 | `sources/random_source/`                                               |
+| Real-infra source                                         | `sources/postgres_source/` + `sources/postgres_source/tests/postgres/` |
 
 Read the relevant exemplar end-to-end before writing or modifying a connector.
 
@@ -233,8 +233,9 @@ Each implemented in at least one in-tree plugin or runtime path.
 ## File map
 
 ```text
-core/connectors/
+<repository root>
 ├── README.md
+├── Cargo.toml                   Workspace members, workspace deps, the core pin (R)
 ├── runtime/
 │   ├── src/
 │   │   ├── main.rs              FFI structs (SinkApi, SourceApi), plugin path resolution
@@ -243,7 +244,8 @@ core/connectors/
 │   │   ├── {sink,source,stream,transform,state,context}.rs
 │   │   ├── benchmark.rs, log.rs, metrics.rs
 │   │   └── api/                 HTTP control plane (/sinks, /sources, /stats, /metrics)
-│   └── example_config/          Reference TOML
+│   ├── example_config/          Reference TOML
+│   └── tests/                   runtime/, api/, http_config_provider/ targets + config_env_listing.rs
 ├── sdk/
 │   └── src/
 │       ├── lib.rs               Sink/Source traits, Payload, Schema, Error
@@ -252,18 +254,15 @@ core/connectors/
 │       ├── transforms/          add/delete/update/filter fields, format conversions
 │       └── retry.rs             CircuitBreaker, HttpRetryMiddleware
 ├── sinks/<name>_sink/
-└── sources/<name>_source/
-
-core/integration/tests/connectors/    # Real-infra integration tests
-├── fixtures/                          # testcontainers-modules wrappers per backend
-├── postgres/, elasticsearch/, mongodb/, iceberg/, influxdb/, quickwit/, http/, delta/
-├── runtime/                           # error_isolation, benchmark
-└── api/                               # HTTP API endpoint tests
+│   └── tests/<suite>/           Real-infra integration target: main.rs, fixtures/, TOML configs
+├── sources/<name>_source/
+│   └── tests/<suite>/
+└── testing/src/                 Fixtures shared by sink + source targets (postgres, elasticsearch, influxdb, floci)
 ```
 
 ## Cite by symbol, not line number
 
-Skills cite files by path + symbol (`PostgresContainer::start` in `core/integration/tests/connectors/fixtures/postgres/container.rs`). Line numbers go stale on the first refactor. symbol names survive. Grep the symbol if you need the exact spot.
+Skills cite files by path + symbol (`PostgresContainer::start` in `testing/src/postgres.rs`). Line numbers go stale on the first refactor. symbol names survive. Grep the symbol if you need the exact spot.
 
 ---
 

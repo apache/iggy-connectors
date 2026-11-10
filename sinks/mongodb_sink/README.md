@@ -6,18 +6,15 @@ Consumes messages from Iggy streams and stores them in a MongoDB collection.
 
 Send a JSON message through Iggy and see it land in MongoDB.
 
-**Prerequisites**: Docker running, project built (`cargo build` from repo root).
+**Prerequisites**: Docker running, project built (`cargo build` from repo root). Start an Iggy server in a container named `iggy`, as step 2 of the [quick start](../../README.md#quick-start) shows.
 
 ```bash
 # Start MongoDB
 docker run -d --name mongo-test -p 127.0.0.1:27017:27017 mongo:7
 
-# Start iggy-server (terminal 2)
-IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy ./target/debug/iggy-server --replica-id 0
-
-# Create stream and topic
-./target/debug/iggy -u iggy -p iggy stream create demo_stream
-./target/debug/iggy -u iggy -p iggy topic create demo_stream demo_topic 1 none 1d
+# Create stream and topic with the CLI of the server image
+docker exec iggy iggy -u iggy -p iggy stream create demo_stream
+docker exec iggy iggy -u iggy -p iggy topic create demo_stream demo_topic 1 none 1d
 
 # Setup connector config
 mkdir -p /tmp/mdb-sink-test/connectors
@@ -53,11 +50,11 @@ payload_format = "json"
 auto_create_collection = true
 TOML
 
-# Start connector (terminal 3)
+# Start connector (terminal 2)
 IGGY_CONNECTORS_CONFIG_PATH=/tmp/mdb-sink-test/config.toml ./target/debug/iggy-connectors
 
 # Send a message
-./target/debug/iggy -u iggy -p iggy message send --partition-id 0 demo_stream demo_topic '{"hello":"mongodb"}'
+docker exec iggy iggy -u iggy -p iggy message send --partition-id 0 demo_stream demo_topic '{"hello":"mongodb"}'
 
 # Verify in MongoDB
 docker exec mongo-test mongosh --quiet --eval \
@@ -109,10 +106,11 @@ payload_format = "json"
 
 ## Testing
 
-Requires Docker. Testcontainers starts MongoDB 7 + iggy-server automatically.
+Requires Docker. Testcontainers starts MongoDB 7, and each test starts the `iggy-server` that `./scripts/build-test-server.sh` builds.
 
 ```bash
-cargo nextest run -p integration -E 'test(connectors::mongodb::)'
+cargo build -p iggy-connectors -p iggy_connector_mongodb_sink
+cargo nextest run -p iggy_connector_mongodb_sink --test mongodb
 ```
 
 The integration suite covers payloads, batching, duplicate handling, validation failures,
@@ -126,7 +124,7 @@ write concern and retryable writes against real MongoDB instances. Cases include
 Unit tests (no Docker):
 
 ```bash
-cargo test -p iggy_connector_mongodb_sink
+cargo nextest run -p iggy_connector_mongodb_sink --lib
 ```
 
 ## Delivery Semantics

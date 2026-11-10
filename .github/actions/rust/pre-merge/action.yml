@@ -1,0 +1,367 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: rust-pre-merge
+description: Rust pre-merge testing and linting github iggy actions
+
+inputs:
+  task:
+    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, build-aarch64-gnu, build-aarch64-musl, build-macos-aarch64, clippy-macos-aarch64, test-server, test-build, test)"
+    required: true
+  component:
+    description: "Component name (for context)"
+    required: false
+    default: ""
+  test-scope:
+    description: "Test selection: affected or workspace"
+    required: false
+    default: affected
+  partition:
+    description: "One-based nextest partition index for the test task"
+    required: false
+  partitions:
+    description: "Total nextest partitions for the test task"
+    required: false
+  save-cache:
+    description: "Save build dependencies for subsequent PRs"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Rust
+      uses: ./.github/actions/utils/setup-rust
+      with:
+        install-nextest: ${{ inputs.task == 'test-build' || inputs.task == 'test' }}
+        coverage: ${{ inputs.task == 'test-build' || inputs.task == 'test' }}
+        # These tasks do not compile workspace crates and need no native
+        # libraries. All compiling tasks keep the existing dependency setup.
+        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' }}
+        # Shards download the build artifact, and the test server has a cache
+        # of its own. Metadata-only tasks need no target cache.
+        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'test' || inputs.task == 'test-server') && 'false' || 'true' }}
+        save-cache: ${{ inputs.save-cache }}
+        # The other tasks fit within the runner's available disk space.
+        free-disk-space: ${{ (inputs.task == 'verify-publish' || inputs.task == 'build-aarch64-gnu' || inputs.task == 'build-aarch64-musl' || inputs.task == 'build-macos-aarch64' || inputs.task == 'clippy-macos-aarch64') && 'true' || 'false' }}
+
+    - name: Install cargo-sort
+      if: inputs.task == 'sort'
+      shell: bash
+      env:
+        CARGO_SORT_VERSION: "2.1.4"
+        CARGO_SORT_SHA256: c35c3df1f2e512890ee2ffd6151aa265fbfe06accbea0d9226e0bb14d821845b
+      run: |
+        cargo_sort_archive="${RUNNER_TEMP}/cargo-sort.tar.gz"
+        curl -fsSL --retry 5 --retry-all-errors -o "$cargo_sort_archive" \
+          "https://github.com/DevinR528/cargo-sort/releases/download/v${CARGO_SORT_VERSION}/cargo-sort-x86_64-unknown-linux-gnu.tar.gz"
+        echo "${CARGO_SORT_SHA256}  ${cargo_sort_archive}" | sha256sum -c -
+        tar -xzf "$cargo_sort_archive" -C "$HOME/.cargo/bin" cargo-sort
+        cargo sort --version
+
+    - name: Install cargo-machete
+      if: inputs.task == 'machete'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-machete
+
+    # cargo-http-registry has no prebuilt artifact in taiki-e/install-action,
+    # so it stays a source build. verify-publish is a low-frequency task.
+    - name: Install tools for specific tasks
+      if: inputs.task == 'verify-publish'
+      run: |
+        if ! command -v cargo-http-registry >/dev/null 2>&1; then
+          cargo install cargo-http-registry --locked
+        fi
+      shell: bash
+
+    # Planning is an optimization. A planner or selector failure restores the
+    # full-workspace build and test path below. The Action installs the one
+    # Cargo-Rail release it is qualified with (0.30.1 for v10.1.1).
+    - name: Plan affected Rust work
+      id: rail
+      if: inputs.task == 'test-build' && inputs.test-scope == 'affected'
+      continue-on-error: true
+      uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
+
+    # Individual lint tasks for parallel execution
+    - name: Cargo check
+      if: inputs.task == 'check'
+      run: cargo check --all --all-features
+      shell: bash
+
+    # MSRV gate: compile-check the SDK, the crate this repository publishes,
+    # against its declared `rust-version`. The `+<msrv>` override beats the
+    # rust-toolchain.toml pin. check-only: plugin authors compile the SDK
+    # library (not its tests), so dev-deps needing newer Rust are out of scope.
+    - name: Cargo check on MSRV
+      if: inputs.task == 'check-msrv'
+      run: |
+        MSRV=$(cargo metadata --format-version 1 --no-deps |
+          jq -r '.packages[] | select(.name == "iggy_connector_sdk") | .rust_version // ""')
+        if [[ -z "$MSRV" ]]; then
+          echo "::error::iggy_connector_sdk declares no rust-version"
+          exit 1
+        fi
+        echo "::notice::Checking iggy_connector_sdk against MSRV ${MSRV}"
+        rustup toolchain install "$MSRV" --profile minimal --no-self-update
+        cargo "+$MSRV" check --locked --all-features -p iggy_connector_sdk
+      shell: bash
+
+    - name: Cargo fmt
+      if: inputs.task == 'fmt'
+      run: cargo fmt --all -- --check
+      shell: bash
+
+    - name: Cargo clippy
+      if: inputs.task == 'clippy' || inputs.task == 'clippy-macos-aarch64'
+      run: cargo clippy --all-targets --all-features -- -D warnings
+      shell: bash
+
+    - name: Cargo sort
+      if: inputs.task == 'sort'
+      run: cargo sort --check --no-format --workspace
+      shell: bash
+
+    - name: Cargo machete
+      if: inputs.task == 'machete'
+      run: cargo machete --with-metadata
+      shell: bash
+
+    - name: Doc test
+      if: inputs.task == 'doctest'
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: |
+        cargo test --locked --doc
+        cargo doc --no-deps --all-features --quiet
+      shell: bash
+
+    - name: Verify SDK publish chain to local alt-registry
+      if: inputs.task == 'verify-publish'
+      env:
+        CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      run: ./scripts/verify-sdk-publish.sh
+      shell: bash
+
+    # aarch64 builds (run on ARM64 runners)
+    - name: Build aarch64-gnu
+      if: inputs.task == 'build-aarch64-gnu'
+      run: cargo build --locked
+      shell: bash
+
+    - name: Install musl tools for aarch64-musl
+      if: inputs.task == 'build-aarch64-musl' && runner.os == 'Linux'
+      run: |
+        ./scripts/ci/apt-install.sh musl-tools
+        rustup target add aarch64-unknown-linux-musl
+      shell: bash
+
+    - name: Build aarch64-musl
+      if: inputs.task == 'build-aarch64-musl'
+      run: cargo build --locked --workspace --target aarch64-unknown-linux-musl
+      shell: bash
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
+        PKG_CONFIG_ALL_STATIC: "1"
+
+    - name: Build macOS aarch64
+      if: inputs.task == 'build-macos-aarch64'
+      run: cargo build --locked
+      shell: bash
+
+    # The tests start iggy-server built from apache/iggy at R. Building it
+    # takes long, so the binary is cached by R.
+    - name: Locate test server
+      id: test-server
+      if: inputs.task == 'test-server' || inputs.task == 'test'
+      run: |
+        server_dir=$(./scripts/build-test-server.sh --print-dir)
+        echo "dir=$server_dir" >> "$GITHUB_OUTPUT"
+        echo "key=${server_dir##*/}-${RUNNER_OS}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+      shell: bash
+
+    - name: Restore test server
+      id: test-server-cache
+      if: inputs.task == 'test-server' || inputs.task == 'test'
+      uses: actions/cache/restore@v6.1.0
+      with:
+        path: ${{ steps.test-server.outputs.dir }}
+        key: ${{ steps.test-server.outputs.key }}
+        # The test-server job of the same run saved it.
+        fail-on-cache-miss: ${{ inputs.task == 'test' }}
+
+    - name: Build test server
+      if: inputs.task == 'test-server' && steps.test-server-cache.outputs.cache-hit != 'true'
+      run: ./scripts/build-test-server.sh
+      shell: bash
+
+    - name: Save test server
+      if: inputs.task == 'test-server' && steps.test-server-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6.1.0
+      with:
+        path: ${{ steps.test-server.outputs.dir }}
+        key: ${{ steps.test-server.outputs.key }}
+
+    - name: Build coverage artifacts
+      if: inputs.task == 'test-build'
+      env:
+        PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        PLAN_STATUS: ${{ steps.rail.outcome }}
+        TEST_SELECTION: ${{ inputs.test-scope }}
+      run: |
+        set -euo pipefail
+        ARTIFACT_DIR="$RUNNER_TEMP/rust-test-build"
+        mkdir -p "$ARTIFACT_DIR"
+
+        git rev-parse HEAD > "$ARTIFACT_DIR/revision"
+
+        SELECTOR_DIR="$RUNNER_TEMP/cargo-rail-selectors"
+        mkdir -p "$SELECTOR_DIR"
+        TEST_ARCHIVE_ARGS=()
+        RUNTIME_PACKAGES=()
+        if [[ "$TEST_SELECTION" == workspace ]]; then
+          TEST_SCOPE=workspace
+          RUNTIME_SCOPE=workspace
+        elif [[ "$TEST_SELECTION" != affected ]]; then
+          echo "::error::Invalid test scope: $TEST_SELECTION"
+          exit 1
+        elif [[ "$PLAN_STATUS" == success ]] &&
+          TEST_SCOPE=$(cargo-rail-action plan cargo-scope "$PLAN_FILE" cargo.test) &&
+          RUNTIME_SCOPE=$(cargo-rail-action plan cargo-scope "$PLAN_FILE" runtime-artifacts) &&
+          cargo-rail-action plan target-args "$PLAN_FILE" cargo.test > "$SELECTOR_DIR/test-target-args" &&
+          cargo-rail-action plan package-names "$PLAN_FILE" cargo.test > "$SELECTOR_DIR/test-packages" &&
+          cargo-rail-action plan package-names "$PLAN_FILE" runtime-artifacts > "$SELECTOR_DIR/runtime-packages"; then
+          # NUL-delimited selectors preserve package and argument boundaries.
+          mapfile -d '' -t RUNTIME_PACKAGES < "$SELECTOR_DIR/runtime-packages"
+        else
+          TEST_SCOPE=workspace
+          RUNTIME_SCOPE=workspace
+          echo "::warning::Cargo-Rail plan unavailable or invalid; running the full workspace"
+        fi
+        printf '%s\n' "$TEST_SCOPE" > "$ARTIFACT_DIR/scope"
+        if [[ "$TEST_SCOPE" == skipped ]]; then
+          echo "::notice::Cargo-Rail reports no affected Rust tests"
+          exit 0
+        fi
+
+        if [[ "$TEST_SCOPE" == packages ]]; then
+          # Cargo-Rail narrows targets only through --test NAME pairs; otherwise
+          # every test binary in the selected packages remains eligible.
+          ARCHIVE_FILTER=$(jq -nr \
+            --rawfile packages "$SELECTOR_DIR/test-packages" \
+            --rawfile targets "$SELECTOR_DIR/test-target-args" '
+            ($packages | split("\u0000")[:-1] |
+              map("package(=\(.))") | join(" | ")) as $packages |
+            ($targets | split("\u0000")[:-1] | to_entries |
+              map(select(.key % 2 == 1) | "binary(=\(.value))") |
+              join(" | ")) as $targets |
+            if $targets == "" then $packages
+            else "(\($packages)) & kind(test) & (\($targets))" end')
+          TEST_ARCHIVE_ARGS=(-E "$ARCHIVE_FILTER")
+        fi
+
+        # The runtime binary and the plugins that the selected tests launch.
+        : > "$ARTIFACT_DIR/runtime-files"
+        if [[ "$RUNTIME_SCOPE" == workspace || "$RUNTIME_SCOPE" == packages ]]; then
+          # Match the cache producer's dependency features even for affected-package runs.
+          cargo build --locked --workspace \
+            --message-format=json-render-diagnostics > "$ARTIFACT_DIR/build.jsonl"
+          RUNTIME_PACKAGE_IDS='[]'
+          if [[ "$RUNTIME_SCOPE" == packages ]]; then
+            RUNTIME_PACKAGE_IDS=$(cargo metadata --locked --no-deps --format-version 1 |
+              jq --rawfile packages "$SELECTOR_DIR/runtime-packages" '
+                ($packages | split("\u0000")[:-1]) as $names |
+                [.packages[] | select(.name as $name | $names | index($name)) | .id]')
+          fi
+          jq -r --arg scope "$RUNTIME_SCOPE" --argjson packages "$RUNTIME_PACKAGE_IDS" '
+            select(.reason == "compiler-artifact") |
+            select($scope == "workspace" or (.package_id as $id | $packages | index($id))) |
+            (select(.target.kind | index("bin")) | .executable // empty),
+            (select(.target.crate_types | index("cdylib")) | .filenames[] | select(endswith(".so")))' \
+            "$ARTIFACT_DIR/build.jsonl" | sort -u | \
+            while IFS= read -r artifact; do
+              realpath --relative-to="$GITHUB_WORKSPACE" "$artifact"
+            done > "$ARTIFACT_DIR/runtime-files"
+          rm "$ARTIFACT_DIR/build.jsonl"
+        fi
+        tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" -T "$ARTIFACT_DIR/runtime-files"
+        rm "$ARTIFACT_DIR/runtime-files"
+
+        # Filtering the archive preserves the workspace compilation graph.
+        cargo nextest archive --locked --profile ci --workspace \
+          "${TEST_ARCHIVE_ARGS[@]}" \
+          --archive-file "$ARTIFACT_DIR/nextest.tar.zst"
+      shell: bash
+
+    - name: Run coverage test partition
+      if: inputs.task == 'test'
+      env:
+        # Keep these out of TEST_* and IGGY_*. They reach every test process,
+        # where config env tests panic on unknown TEST_* names and debug
+        # servers refuse to boot on unknown IGGY_* names.
+        PARTITION_INDEX: ${{ inputs.partition }}
+        PARTITION_COUNT: ${{ inputs.partitions }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$PARTITION_INDEX" =~ ^[1-9][0-9]*$ || ! "$PARTITION_COUNT" =~ ^[1-9][0-9]*$ ]] ||
+          (( PARTITION_INDEX > PARTITION_COUNT )); then
+          echo "::error::Invalid test partition: $PARTITION_INDEX/$PARTITION_COUNT"
+          exit 1
+        fi
+        ARTIFACT_DIR="$RUNNER_TEMP/rust-test-build"
+        artifact_revision=$(cat "$ARTIFACT_DIR/revision")
+        checkout_revision=$(git rev-parse HEAD)
+        if [[ "$artifact_revision" != "$checkout_revision" ]]; then
+          echo "::error::Coverage archive revision $artifact_revision does not match checkout $checkout_revision"
+          exit 1
+        fi
+        TEST_SCOPE=$(cat "$ARTIFACT_DIR/scope")
+        if [[ "$TEST_SCOPE" == "skipped" ]]; then
+          echo "::notice::Cargo-Rail reports no affected Rust tests"
+          exit 0
+        fi
+
+        # Doris requires this host setting before its testcontainers fixture starts.
+        sudo sysctl -w vm.max_map_count=2000000 || true
+        NO_TESTS=fail
+        if [[ "$TEST_SCOPE" == "packages" ]]; then
+          # A small package scope can leave a partition without tests.
+          NO_TESTS=warn
+        fi
+        # nextest can archive non-test binaries with dev-dependency features.
+        # Restore the runtime binaries last so every suite executes the same ones.
+        tar --zstd -xf "$ARTIFACT_DIR/nextest.tar.zst"
+        tar --zstd -xf "$ARTIFACT_DIR/runtime.tar.zst"
+        ./scripts/build-test-server.sh
+        echo "Disk space before tests:"
+        df -h /
+        # The after-test report must survive a failing run: a full disk is one
+        # way to fail.
+        nextest_status=0
+        # slice deals the filtered test list round-robin, so neighbouring slow
+        # tests land on different shards. hash placement can stack them on one shard.
+        cargo nextest run \
+          --cargo-metadata target/nextest/cargo-metadata.json \
+          --binaries-metadata target/nextest/binaries-metadata.json \
+          --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+          --no-fail-fast --no-tests="$NO_TESTS" --profile ci \
+          --partition "slice:${PARTITION_INDEX}/${PARTITION_COUNT}" || nextest_status=$?
+        echo "Disk space after tests:"
+        df -h /
+        exit "$nextest_status"
+      shell: bash

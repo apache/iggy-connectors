@@ -1,0 +1,186 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Removes the S-stale label on PR comments and review submissions, via
+# the workflow_run handoff from pr-triage-collect.yml.
+#
+# Why workflow_run instead of issue_comment / pull_request_review here:
+# those events deliver a read-only GITHUB_TOKEN on cross-fork PRs
+# regardless of the workflow's permissions block, so the label DELETE
+# silently fails for the majority of contributor PRs. pr-triage-collect.yml
+# already collects the event payload as an artifact under a read-only
+# token; this workflow runs against base ref via workflow_run, where the
+# GITHUB_TOKEN has write perms, and removes the label.
+#
+# Push-driven unmark stays in stale-prs-unmark.yml because
+# pull_request_target.synchronize gets a write token directly.
+#
+# SECURITY: no actions/checkout, no exec of PR contents. The artifact is
+# not trusted for identity: on the pull_request_review path collect runs the
+# PR head's own copy, so a fork can forge the payload. Only a numeric id is
+# read from it, the PR number is resolved from the API, and the commit the
+# collect run fired on must belong to that PR.
+
+name: Unmark Stale PRs on Activity
+
+on:
+  workflow_run:
+    workflows: ["PR Triage Collect"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  contents: read
+  # Required for actions/download-artifact@v8 to fetch the triage-event
+  # artifact uploaded by the upstream PR Triage Collect run via run-id.
+  actions: read
+
+concurrency:
+  # workflow_run cannot key on PR number until after artifact parse, so it
+  # falls back to the upstream run id. Same constraint as pr-triage-apply.
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  unmark:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-slim
+    timeout-minutes: 2
+    steps:
+      - name: Download triage event artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: triage-event
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: payload/
+
+      - name: Resolve PR number from the API
+        id: resolve
+        env:
+          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # collect runs the PR head's own copy on the pull_request_review
+          # path, so a fork can upload any payload. Take only a numeric id from
+          # the artifact and resolve the PR number from the API, so a forged
+          # value can neither reach a process env var nor point this at another
+          # PR. UPSTREAM_EVENT is set by GitHub from the collect run, not from
+          # the artifact, and issue_comment workflows only run from the default
+          # branch, so a fork's run always arrives as pull_request_review and
+          # takes the checked path.
+          payload=( payload/*.json payload/event.json )
+          f=""
+          for candidate in "${payload[@]}"; do
+            [[ -f "$candidate" ]] && f="$candidate" && break
+          done
+          if [[ -z "$f" ]]; then
+            echo "triage payload not found under payload/" >&2
+            ls -la payload/ >&2 || true
+            exit 1
+          fi
+          require_num() {
+            case "$1" in
+              ''|*[!0-9]*) echo "non-numeric ${2}: '${1}'" >&2; exit 1 ;;
+            esac
+          }
+          # Retry 5xx, 429 and network failures, as withRetry does for the
+          # script path. Anything else fails at once with gh's own message;
+          # a 404 returns 44 so a caller can tell it apart.
+          gh_api() {
+            local err out code="" delay
+            err="$(mktemp)"
+            for delay in 0.5 1.5 4 ""; do
+              if out="$(gh api "$@" 2>"$err")"; then
+                rm -f "$err"
+                printf '%s\n' "$out"
+                return 0
+              fi
+              code="$(grep -oE 'HTTP [0-9]{3}' "$err" | tail -n1 | cut -d' ' -f2 || true)"
+              case "$code" in
+                ''|429|5??) ;;
+                *) break ;;
+              esac
+              [[ -n "$delay" ]] || break
+              echo "gh api $1: transient failure (${code:-network}), retrying in ${delay}s" >&2
+              sleep "$delay"
+            done
+            cat "$err" >&2
+            rm -f "$err"
+            if [[ "$code" == 404 ]]; then return 44; fi
+            return 1
+          }
+          case "$UPSTREAM_EVENT" in
+            issue_comment)
+              cid="$(jq -r '.comment.id // ""' "$f")"
+              require_num "$cid" comment_id
+              pr="$(gh_api "repos/${REPO}/issues/comments/${cid}" \
+                --jq '.issue_url' | grep -oE '[0-9]+$' || true)"
+              ;;
+            pull_request_review)
+              rid="$(jq -r '.review.id // ""' "$f")"
+              cpr="$(jq -r '.pull_request.number // ""' "$f")"
+              require_num "$rid" review_id
+              require_num "$cpr" pr_number
+              # A review id that does not belong to the claimed PR 404s here.
+              gh_api "repos/${REPO}/pulls/${cpr}/reviews/${rid}" >/dev/null
+              # HEAD_SHA is set by GitHub, not the fork. A forged run fires on
+              # the fork's own commit, which is in no other PR's commit list,
+              # so a real review cannot be replayed onto another PR. The
+              # review's commit_id is not compared: GitHub moves it when the
+              # branch is updated.
+              shas="$(gh_api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
+              if ! grep -qxF "$HEAD_SHA" <<<"$shas"; then
+                echo "collect ran on ${HEAD_SHA}, which is not a commit of PR ${cpr}" >&2
+                exit 1
+              fi
+              pr="$cpr"
+              ;;
+            *)
+              echo "unexpected upstream event: ${UPSTREAM_EVENT}" >&2
+              exit 1
+              ;;
+          esac
+          require_num "$pr" resolved_pr
+          # A step output, not $GITHUB_ENV: it is read only through a
+          # steps.*.outputs.* expression and never becomes a process env var in
+          # the next step, so a value cannot smuggle in an env var like BASH_ENV.
+          echo "pr_number=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Remove stale label if present
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        # Pre-check via REST so we only invoke the GraphQL edit when the
+        # label is actually on the PR. Saves an API write on every drive-by
+        # comment that is far more common than a comment on a stale PR.
+        # The edit itself is idempotent (GraphQL removeLabelsFromLabelable
+        # succeeds whether or not the label is set), so the gate is purely
+        # a cost optimization.
+        run: |
+          set -euo pipefail
+          if gh api "repos/$REPO/issues/$PR_NUMBER/labels" \
+               --jq '.[].name' | grep -qx S-stale; then
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label S-stale
+          else
+            echo "PR #$PR_NUMBER has no S-stale label, skipping"
+          fi

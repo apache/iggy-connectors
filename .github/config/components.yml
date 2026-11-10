@@ -1,0 +1,98 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Change detection for pre-merge. A component runs its tasks when one of its
+# paths changes, or when a component that it depends on changes. Which tests
+# run inside the Rust lane is up to cargo-rail and .config/rail.toml.
+components:
+  # Workspace-level changes that affect all Rust components. The root
+  # Cargo.toml also holds R, the apache/iggy commit of the core crates.
+  rust-workspace:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+
+  # CI/CD infrastructure changes that require full regression
+  ci-infrastructure:
+    paths:
+      - ".github/**"
+
+  # crates.io publish chain verification. Runs scripts/verify-sdk-publish.sh,
+  # which spins up cargo-http-registry as a local alt-registry and publishes
+  # the core crates at R and then the SDK.
+  rust-sdk-publish:
+    depends_on:
+      - "rust-workspace"
+      - "ci-infrastructure"
+    paths:
+      - "sdk/Cargo.toml"
+      - "scripts/verify-sdk-publish.sh"
+      - "scripts/ci/lib/core-pin.sh"
+    tasks:
+      - "verify-publish"
+
+  # MSRV gate for the SDK, the only crate of this repository on crates.io.
+  # Source-scoped (not just Cargo.toml) because an MSRV break usually comes
+  # from a crate using an API newer than the floor.
+  rust-sdk-msrv:
+    depends_on:
+      - "rust-workspace"
+      - "ci-infrastructure"
+    paths:
+      - "sdk/**"
+    tasks:
+      - "check-msrv"
+
+  rust:
+    depends_on:
+      - "rust-workspace"
+      - "ci-infrastructure"
+    paths:
+      - "runtime/**"
+      - "sdk/**"
+      - "sinks/**"
+      - "sources/**"
+      - "testing/**"
+      - ".config/**" # nextest and cargo-rail configuration
+      - "scripts/build-test-server.sh"
+      - "scripts/ci/lib/core-pin.sh"
+    tasks:
+      - "check"
+      - "fmt"
+      - "clippy"
+      - "sort"
+      - "doctest"
+      - "machete"
+      - "test"
+      - "build-aarch64-gnu"
+      - "build-aarch64-musl"
+      - "build-macos-aarch64"
+      - "clippy-macos-aarch64"
+
+  # Image build of apache/iggy-connect, without a push
+  docker-connectors:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "runtime/**"
+      - "sdk/**"
+      - ".dockerignore"
+      - ".github/actions/utils/docker-buildx/**"
+    tasks:
+      - "build-image"

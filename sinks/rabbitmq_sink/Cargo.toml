@@ -25,7 +25,7 @@ keywords = ["iggy", "messaging", "streaming", "rabbitmq", "amqp", "sink"]
 categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
-repository = "https://github.com/apache/iggy"
+repository = "https://github.com/apache/iggy-connectors"
 readme = "../../README.md"
 publish = false
 
@@ -48,4 +48,15 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
+ctor = { workspace = true }
+dtor = { workspace = true }
+futures = { workspace = true }
+iggy_connector_sdk = { workspace = true, features = ["api"] }
+iggy_connector_testing = { workspace = true }
+integration = { workspace = true }
 serde_json = { workspace = true }
+serial_test = { workspace = true }
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+uuid = { workspace = true }

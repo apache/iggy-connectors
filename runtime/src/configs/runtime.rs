@@ -665,8 +665,7 @@ impl Default for IggyConfig {
 
 impl ConnectorsRuntimeConfig {
     pub fn config_provider(path: String) -> FileConfigProvider<ConnectorsEnvProvider> {
-        let default_config =
-            Toml::string(include_str!("../../../../connectors/runtime/config.toml"));
+        let default_config = Toml::string(include_str!("../../config.toml"));
         FileConfigProvider::new(
             path,
             ConnectorsEnvProvider::default(),

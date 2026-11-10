@@ -1,6 +1,6 @@
 ---
 name: connector-sink
-description: Author a new Apache Iggy connector sink plugin under core/connectors/sinks/. Sinks consume messages from Apache Iggy streams and push them to an external system (DB, search engine, HTTP endpoint, object store). Load when creating, modifying, or reviewing a sink crate. Use for sink plugin authoring. NOT for runtime internals (see connector-runtime).
+description: Author a new Apache Iggy connector sink plugin under sinks/. Sinks consume messages from Apache Iggy streams and push them to an external system (DB, search engine, HTTP endpoint, object store). Load when creating, modifying, or reviewing a sink crate. Use for sink plugin authoring. NOT for runtime internals (see connector-runtime).
 ---
 
 # Writing an Apache Iggy Connector Sink
@@ -133,7 +133,7 @@ Use literal API field names as labels (`offset=`, `current_offset=`).
 
 Unit tests at EOF of `src/lib.rs`. See [connector-testing](../connector-testing/SKILL.md) for BDD naming + `test_config()` helper.
 
-Real-infra integration tests live under `core/integration/tests/connectors/<backend>/` using `#[iggy_harness]` + a backend fixture that spins up Docker via `testcontainers-modules`. Plugins integrating with external services must have an integration test. Reference: `core/integration/tests/connectors/postgres/postgres_sink.rs` + `fixtures/postgres/`.
+Real-infra integration tests live in the sink's own test target `sinks/<name>_sink/tests/<backend>/` (entry `main.rs`) using `#[iggy_harness]` + a backend fixture that spins up Docker via `testcontainers-modules`. Plugins integrating with external services must have an integration test. Reference: `sinks/postgres_sink/tests/postgres/postgres_sink.rs` + `fixtures/`.
 
 ## Before declaring done
 
@@ -141,13 +141,15 @@ Real-infra integration tests live under `core/integration/tests/connectors/<back
 cargo fmt --all
 cargo sort --no-format --workspace
 cargo clippy -p iggy_connector_<name>_sink --all-targets -- -D warnings
-cargo test -p iggy_connector_<name>_sink
+cargo nextest run -p iggy_connector_<name>_sink --lib
 
-# Integration tests (filter by name; integration crate has no per-area target):
-cargo test -p integration -- connectors::<backend>::<test_name>
+# Integration tests (Docker, ./scripts/build-test-server.sh once per R).
+# The harness launches target/debug/iggy-connectors, which loads the plugin from target/debug/:
+cargo build -p iggy-connectors -p iggy_connector_<name>_sink
+cargo nextest run -p iggy_connector_<name>_sink --test <backend> <test_name>
 ```
 
-Update `core/connectors/sinks/README.md` and add a sample TOML under `core/connectors/runtime/example_config/connectors/`.
+A new sink also needs its directory in `members` of the root `Cargo.toml` (new dependencies go to `[workspace.dependencies]`), a row for its test target in `.config/rail.toml`, a row in the sinks table of the root `README.md`, and a sample TOML under `runtime/example_config/connectors/`.
 
 ---
 

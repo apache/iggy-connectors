@@ -1,0 +1,108 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Version updates: every entry uses a single group covering ALL update
+# types, so each ecosystem entry opens at most one version-update PR
+# per cycle. Security updates bypass these groups and may still open
+# individual PRs.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    labels:
+      - "dependencies"
+      - "rust"
+    cooldown:
+      default-days: 7
+    ignore:
+      # The root Cargo.toml takes these crates from git at one apache/iggy
+      # commit, and the versions of iggy and iggy_common must match that
+      # commit. Dependabot cannot move the rev, and a bump of one entry
+      # alone would break the pin check. scripts/bump-r.sh moves them
+      # together.
+      - dependency-name: "configs"
+      - dependency-name: "configs_derive"
+      - dependency-name: "iggy"
+      - dependency-name: "iggy_common"
+      - dependency-name: "integration"
+      - dependency-name: "system_stats"
+    groups:
+      rust:
+        patterns:
+          - "*"
+      rust-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    labels:
+      - "dependencies"
+      - "github-actions"
+      - "CI/CD"
+    cooldown:
+      default-days: 7
+    ignore:
+      # The composite actions of apache/iggy stay pinned by SHA to a core
+      # commit and move by hand.
+      - dependency-name: "apache/iggy*"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+      github-actions-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "docker"
+    directory: "/runtime"
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    labels:
+      - "dependencies"
+      - "docker"
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        patterns:
+          - "*"
+      docker-security:
+        applies-to: security-updates
+        patterns:
+          - "*"

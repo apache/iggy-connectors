@@ -1,0 +1,146 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Tests the connectors against the tip of core master, so a core change
+# that breaks them shows up before the next move of R. The run moves R in
+# a scratch commit that never leaves the runner, builds the server at that
+# commit and runs the full suite. A failure opens an issue, or comments on
+# the open one.
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: "apache/iggy tag, branch or commit to test against"
+        type: string
+        required: false
+        default: master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CORE_REF: ${{ inputs.core_ref || 'master' }}
+  ISSUE_LABEL: nightly-failure
+
+jobs:
+  test:
+    name: Full suite at core ${{ inputs.core_ref || 'master' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 300
+    outputs:
+      core_rev: ${{ steps.bump.outputs.core_rev }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
+        with:
+          install-nextest: "true"
+          free-disk-space: "true"
+
+      - name: Move R to core ${{ env.CORE_REF }}
+        id: bump
+        run: |
+          set -euo pipefail
+          ./scripts/bump-r.sh "$CORE_REF"
+          source scripts/ci/lib/core-pin.sh
+          rev=$(core_rev Cargo.toml)
+          echo "core_rev=$rev" >> "$GITHUB_OUTPUT"
+          # R already at that commit leaves nothing to commit.
+          if ! git diff --quiet; then
+            git -c user.name="github-actions[bot]" \
+              -c user.email="github-actions[bot]@users.noreply.github.com" \
+              commit --quiet --all --message "chore(deps): move R to core $CORE_REF ($rev)"
+          fi
+
+      - name: Build test server
+        run: ./scripts/build-test-server.sh
+
+      - name: Run full suite
+        run: |
+          # Doris requires this host setting before its testcontainers fixture starts.
+          sudo sysctl -w vm.max_map_count=2000000 || true
+          cargo nextest run --locked --workspace --profile ci --no-fail-fast
+
+      # .cargo/config.toml points IGGY_TEST_LOGS_DIR here.
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-test-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test_logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  report:
+    name: Report failure
+    needs: test
+    if: ${{ !cancelled() && needs.test.result != 'success' }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the nightly issue
+        uses: actions/github-script@v9
+        env:
+          CORE_REV: ${{ needs.test.outputs.core_rev }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const label = process.env.ISSUE_LABEL;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const body = [
+              `The nightly run failed: ${runUrl}`,
+              '',
+              `Core ref: \`${process.env.CORE_REF}\``,
+              `Core commit: \`${process.env.CORE_REV || 'not resolved'}\``,
+            ].join('\n');
+
+            const open = (await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: label, per_page: 100,
+            })).filter(issue => !issue.pull_request);
+            if (open.length > 0) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: open[0].number, body });
+              core.info(`Commented on #${open[0].number}`);
+              return;
+            }
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                owner, repo, name: label, color: 'b60205',
+                description: 'The nightly run against core master fails',
+              });
+            }
+            const { data: issue } = await github.rest.issues.create({
+              owner, repo, title: 'Nightly run against core fails', body, labels: [label],
+            });
+            core.info(`Opened #${issue.number}`);

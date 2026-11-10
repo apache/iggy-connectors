@@ -1,0 +1,185 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Tests launch these artifacts at run time, an edge Cargo cannot record: each
+# integration test target spawns `iggy-connectors` through `Command::cargo_bin`,
+# and the runtime dlopens the plugins that the test configuration names. One
+# row per test target lists the runtime binary and every plugin it loads.
+[plan.work.runtime-artifacts]
+scope = "cargo"
+cargo_prerequisites = [
+    { source_work = "cargo.test", when = [
+        { package = "iggy-connectors", target = { name = "api", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy-connectors", target = { name = "config_env_listing", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy-connectors", target = { name = "http_config_provider", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_random_source", target = { name = "iggy_connector_random_source", kind = "cdylib" } },
+        { package = "iggy_connector_stdout_sink", target = { name = "iggy_connector_stdout_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy-connectors", target = { name = "runtime", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_random_source", target = { name = "iggy_connector_random_source", kind = "cdylib" } },
+        { package = "iggy_connector_stdout_sink", target = { name = "iggy_connector_stdout_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_clickhouse_sink", target = { name = "clickhouse", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_clickhouse_sink", target = { name = "iggy_connector_clickhouse_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_delta_sink", target = { name = "delta", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_delta_sink", target = { name = "iggy_connector_delta_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_doris_sink", target = { name = "doris", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_doris_sink", target = { name = "iggy_connector_doris_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_elasticsearch_sink", target = { name = "elasticsearch", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_elasticsearch_sink", target = { name = "iggy_connector_elasticsearch_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_elasticsearch_source", target = { name = "elasticsearch", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_elasticsearch_source", target = { name = "iggy_connector_elasticsearch_source", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_http_sink", target = { name = "http", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_http_sink", target = { name = "iggy_connector_http_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_http_source", target = { name = "http", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_http_source", target = { name = "iggy_connector_http_source", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_iceberg_sink", target = { name = "iceberg", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_iceberg_sink", target = { name = "iggy_connector_iceberg_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_influxdb_sink", target = { name = "influxdb", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_influxdb_sink", target = { name = "iggy_connector_influxdb_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_influxdb_source", target = { name = "influxdb", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_influxdb_source", target = { name = "iggy_connector_influxdb_source", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_meilisearch_sink", target = { name = "meilisearch", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_meilisearch_sink", target = { name = "iggy_connector_meilisearch_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_mongodb_sink", target = { name = "mongodb", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_mongodb_sink", target = { name = "iggy_connector_mongodb_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_mqtt_source", target = { name = "mqtt", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_mqtt_source", target = { name = "iggy_connector_mqtt_source", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_postgres_sink", target = { name = "postgres", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_postgres_sink", target = { name = "iggy_connector_postgres_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_postgres_source", target = { name = "postgres", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_postgres_source", target = { name = "iggy_connector_postgres_source", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_quickwit_sink", target = { name = "quickwit", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_quickwit_sink", target = { name = "iggy_connector_quickwit_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_rabbitmq_sink", target = { name = "rabbitmq", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_rabbitmq_sink", target = { name = "iggy_connector_rabbitmq_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_random_source", target = { name = "random", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_random_source", target = { name = "iggy_connector_random_source", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_redshift_sink", target = { name = "redshift", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_redshift_sink", target = { name = "iggy_connector_redshift_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_s3_sink", target = { name = "s3", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_s3_sink", target = { name = "iggy_connector_s3_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_stdout_sink", target = { name = "stdout", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_stdout_sink", target = { name = "iggy_connector_stdout_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
+        { package = "iggy_connector_surrealdb_sink", target = { name = "surrealdb", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_surrealdb_sink", target = { name = "iggy_connector_surrealdb_sink", kind = "cdylib" } },
+    ] },
+]
+
+[plan.work.edge-images]
+scope = "variants"
+variant_catalog = ".github/config/edge-image-variants.json"

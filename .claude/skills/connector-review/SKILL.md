@@ -11,9 +11,9 @@ disable-model-invocation: true
 # Apache Iggy Connector Review
 
 `<TARGET>` is the PR number, branch, or ref range supplied after the skill name. With no target, review `HEAD`
-from its merge base with `origin/master`. Scope: anything
-under `core/connectors/` plus connector integration tests under `core/integration/tests/connectors/`. Other changed
-paths, such as harness files and `Cargo.toml`, are in scope where connector code depends on them.
+from its merge base with `origin/master`. Scope: anything under `runtime/`, `sdk/`, `sinks/`, `sources/` and
+`testing/`, including the `tests/` target of each package. Other changed paths, such as `Cargo.toml` with the pin to
+the core commit, CI files and scripts, are in scope where connector code depends on them.
 
 Read [execution instructions](../team-review/references/execution.md) before starting. Use the section for your client to
 translate the tool calls below. Include those instructions in worker prompts. Keep this skill's Charter, roles, rounds, and report.
@@ -117,9 +117,8 @@ Do not `cat` any of the files you just wrote. `wc -l <DIR>/diff.patch` is the on
 
 ## Step 2: Round 1, connector experts (one message, parallel)
 
-Read `<DIR>/files.txt` only to select roles. For a plugin-only diff with no path under
-`core/connectors/runtime/src/` or `core/connectors/sdk/src/`, spawn `plugin`, `contracts`, and `testing`. Otherwise
-spawn `plugin`, `runtime`, `sdk`, and `testing`.
+Read `<DIR>/files.txt` only to select roles. For a plugin-only diff with no path under `runtime/src/` or `sdk/src/`,
+spawn `plugin`, `contracts`, and `testing`. Otherwise spawn `plugin`, `runtime`, `sdk`, and `testing`.
 
 Spawn all selected `Agent` calls in one message: `subagent_type: general-purpose`, `name: <role>-<TOPIC>` (bare role
 names collide with concurrent sessions: one shared agent namespace), no `model` (inherits). Prompt = role block +

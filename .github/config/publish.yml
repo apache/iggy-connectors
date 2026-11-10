@@ -1,0 +1,40 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+components:
+
+  # ── Rust crates (crates.io) ────────────────────────────────────────────────
+  rust-connector-sdk:
+    tag_pattern: "^connectors-sdk-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
+    registry: crates
+    package: iggy_connector_sdk
+    version_file: "sdk/Cargo.toml"
+    version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
+
+  # ── DockerHub images ───────────────────────────────────────────────────────
+  # Post-merge refreshes each image's :edge tag only when its row in
+  # .github/config/edge-image-variants.json selects it. Every dockerhub
+  # component needs a row that lists its dockerfile. The common checks run
+  # scripts/ci/edge-image-catalog.sh --check to enforce that.
+  rust-connectors:
+    tag_pattern: "^connectors-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
+    registry: dockerhub
+    image: apache/iggy-connect
+    dockerfile: runtime/Dockerfile
+    platforms: ["linux/amd64", "linux/arm64"]
+    version_file: "runtime/Cargo.toml"
+    version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'

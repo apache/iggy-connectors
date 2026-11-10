@@ -1,6 +1,6 @@
 ---
 name: connector-transform
-description: Add a new transform under `core/connectors/sdk/src/transforms/`. Transforms mutate, filter, or convert messages between source/encode and decode/sink. Use when adding field-level transforms (add/delete/update/filter), format conversions, envelope unwrapping, or similar config-driven message manipulations for Apache Iggy connectors. Use for transform authoring. NOT for runtime internals or sink/source loops.
+description: Add a new transform under `sdk/src/transforms/`. Transforms mutate, filter, or convert messages between source/encode and decode/sink. Use when adding field-level transforms (add/delete/update/filter), format conversions, envelope unwrapping, or similar config-driven message manipulations for Apache Iggy connectors. Use for transform authoring. NOT for runtime internals or sink/source loops.
 ---
 
 # Adding a New Apache Iggy Connector Transform
@@ -277,10 +277,10 @@ Returning `Err` from `transform()` stops the message and is logged. For non-fata
 cargo fmt --all
 cargo sort --no-format --workspace
 cargo clippy -p iggy_connector_sdk --all-targets --all-features -- -D warnings
-cargo test -p iggy_connector_sdk --all-features
+cargo nextest run -p iggy_connector_sdk --all-features
 ```
 
-Verify by adding the transform to `core/connectors/runtime/example_config/connectors/` and running the runtime - the transform should apply to each message.
+Verify by adding the transform to `runtime/example_config/connectors/` and running the runtime - the transform should apply to each message.
 
 If the transform changes payload shape sufficiently to break downstream sinks (e.g., renaming primary keys), call it out in the PR description.
 

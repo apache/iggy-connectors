@@ -226,7 +226,7 @@ one source connector instance per route. The runtime loads every connector TOML
 from its configured `config_dir`. For the standard example layout, create these
 files locally:
 
-`core/connectors/runtime/example_config/connectors/mqtt_site_a.toml`:
+`runtime/example_config/connectors/mqtt_site_a.toml`:
 
 ```toml
 type = "source"
@@ -260,7 +260,7 @@ batch_timeout = "10ms"
 verbose_logging = false
 ```
 
-`core/connectors/runtime/example_config/connectors/mqtt_site_b.toml`:
+`runtime/example_config/connectors/mqtt_site_b.toml`:
 
 ```toml
 type = "source"

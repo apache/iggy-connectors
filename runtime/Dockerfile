@@ -30,8 +30,6 @@ FROM --platform=$BUILDPLATFORM chef AS builder
 ARG PROFILE=release
 ARG TARGETPLATFORM
 ARG LIBC=glibc
-ARG IGGY_CI_BUILD
-ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
 RUN apk add --no-cache bash curl tar zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static && \
     cargo install cargo-zigbuild --version '=0.23.2' --locked && \
@@ -100,7 +98,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     TARGET="$(uname -m)-unknown-linux-musl" && \
     curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
       | tar -xz -C /usr/local/bin --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about" && \
-    ./scripts/ci/third-party-licenses.sh --generate --manifest core/connectors/runtime/Cargo.toml --output /app/LICENSE-binary
+    ./scripts/ci/third-party-licenses.sh --generate --manifest runtime/Cargo.toml --output /app/LICENSE-binary
 
 #
 # Final runtime - Debian trixie Slim

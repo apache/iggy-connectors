@@ -1,6 +1,10 @@
 # Apache Iggy Connectors - SDK
 
-SDK provides the commonly used structs and traits such as `Sink` and `Source`, along with the `sink_connector!` and `source_connector!` macros to be used when developing connectors.
+`iggy_connector_sdk` is the SDK for the sink and source plugins of the [Apache Iggy](https://iggy.apache.org) connectors runtime. A sink consumes messages from an Iggy stream and writes them to an external system. A source reads data from an external system and produces messages to an Iggy stream. Each plugin is a Rust `cdylib` library that the runtime loads at startup.
+
+The SDK provides the `Sink` and `Source` traits and the `sink_connector!` and `source_connector!` macros. It also provides the decoders, encoders and transforms that the runtime applies to messages.
+
+The runtime, this SDK and the plugins are in the [apache/iggy-connectors](https://github.com/apache/iggy-connectors) repository. The [sink guide](https://github.com/apache/iggy-connectors/blob/master/sinks/README.md) and the [source guide](https://github.com/apache/iggy-connectors/blob/master/sources/README.md) show a complete plugin, and the [connectors documentation](https://iggy.apache.org/docs/connectors/introduction) describes the runtime.
 
 The macros automatically export the connector's version (from `CARGO_PKG_VERSION`) via FFI, allowing the runtime to report per-connector version information in the `/stats` endpoint.
 
@@ -33,7 +37,7 @@ An ACK follows Iggy's quorum confirmation. The topic's `durability` policy decid
 
 A source with `exactly_once = true` removes the duplicates of the second and third rows. Before each send, the runtime stores the producer id, epoch and first sequence of the batch in the source's state. After a NACK or a crash, the plugin produces the batch again from its saved state.
 
-If that batch has the same message count, the runtime sends it with the stored values. The partition then answers with the offset of the first write and writes nothing. The plugin must produce the same messages from the same state, because the partition keeps the first copy. The [runtime README](../runtime/README.md#exactly-once-sources) describes the configuration and the limits.
+If that batch has the same message count, the runtime sends it with the stored values. The partition then answers with the offset of the first write and writes nothing. The plugin must produce the same messages from the same state, because the partition keeps the first copy. The [runtime README](https://github.com/apache/iggy-connectors/blob/master/runtime/README.md#exactly-once-sources) describes the configuration and the limits.
 
 Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after five consecutive NACKs by default.
 
@@ -114,10 +118,10 @@ The SDK includes support for Protocol Buffers (protobuf) format with both encodi
 
 ### Configuration Example
 
-This example uses the Random source and Stdout sink from the matching checkout. Start a server using the **[getting-started guide](https://iggy.apache.org/docs/introduction/getting-started)**, then build the plugins, runtime, and CLI from the repository root:
+This example uses the Random source and the Stdout sink of the [apache/iggy-connectors](https://github.com/apache/iggy-connectors) repository. Start an Iggy server in Docker, as the [quick start](https://github.com/apache/iggy-connectors/blob/master/README.md#quick-start) shows. Then build the plugins and the runtime from the root of the repository:
 
 ```bash
-cargo build --release -p iggy_connector_random_source -p iggy_connector_stdout_sink -p iggy-connectors -p iggy-cli
+cargo build --release -p iggy_connector_random_source -p iggy_connector_stdout_sink -p iggy-connectors
 mkdir -p connectors
 ```
 
@@ -193,11 +197,11 @@ type_url_prefix = "type.googleapis.com"
 strict_mode = false
 ```
 
-Create the stream and topic, then start the runtime from the repository root:
+Create the stream and the topic in the server container. Then start the runtime from the root of the repository:
 
 ```bash
-./target/release/iggy --username iggy --password iggy stream create protobuf_stream
-./target/release/iggy --username iggy --password iggy topic create protobuf_stream protobuf_topic 1 none 1d
+docker exec iggy iggy -u iggy -p iggy stream create protobuf_stream
+docker exec iggy iggy -u iggy -p iggy topic create protobuf_stream protobuf_topic 1 none 1d
 IGGY_CONNECTORS_CONFIG_PATH=connectors.toml ./target/release/iggy-connectors
 ```
 
@@ -254,13 +258,13 @@ field = "data"
 
 ### Programmatic Usage
 
-From the matching repository root, create an example crate and schema directory:
+From the root of the apache/iggy-connectors repository, create an example crate and schema directory:
 
 ```bash
 mkdir -p connector-sdk-example/src schemas
 ```
 
-Save this as `connector-sdk-example/Cargo.toml`. The path dependency uses the SDK from the same checkout as the runtime:
+Save this as `connector-sdk-example/Cargo.toml`. The path dependency uses the SDK in the `sdk/` directory of the repository:
 
 ```toml
 [package]
@@ -269,7 +273,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iggy_connector_sdk = { path = "../core/connectors/sdk" }
+iggy_connector_sdk = { path = "../sdk" }
 simd-json = { version = "0.18.1", features = ["serde_impl"] }
 
 [workspace]

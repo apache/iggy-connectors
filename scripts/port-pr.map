@@ -1,0 +1,132 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Path rules for scripts/port-pr.sh, from apache/iggy paths to paths in this
+# repository. One rule per line: <old prefix> <new prefix>. The longest
+# matching prefix wins. The script leaves a core path that no rule matches
+# out of the patch. The new prefix - leaves the path out too, and the script
+# lists it to port by hand.
+
+core/connectors/README.md README.md
+core/connectors/runtime/ runtime/
+core/connectors/sdk/ sdk/
+core/connectors/sinks/ sinks/
+core/connectors/sources/ sources/
+
+core/integration/tests/connectors/api/ runtime/tests/api/
+core/integration/tests/connectors/api/mod.rs runtime/tests/api/main.rs
+core/integration/tests/connectors/http_config_provider/ runtime/tests/http_config_provider/
+core/integration/tests/connectors/http_config_provider/mod.rs runtime/tests/http_config_provider/main.rs
+core/integration/tests/connectors/runtime/ runtime/tests/runtime/
+core/integration/tests/connectors/runtime/mod.rs runtime/tests/runtime/main.rs
+
+core/integration/tests/connectors/clickhouse/ sinks/clickhouse_sink/tests/clickhouse/
+core/integration/tests/connectors/clickhouse/mod.rs sinks/clickhouse_sink/tests/clickhouse/main.rs
+core/integration/tests/connectors/delta/ sinks/delta_sink/tests/delta/
+core/integration/tests/connectors/delta/mod.rs sinks/delta_sink/tests/delta/main.rs
+core/integration/tests/connectors/doris/ sinks/doris_sink/tests/doris/
+core/integration/tests/connectors/doris/mod.rs sinks/doris_sink/tests/doris/main.rs
+core/integration/tests/connectors/iceberg/ sinks/iceberg_sink/tests/iceberg/
+core/integration/tests/connectors/iceberg/mod.rs sinks/iceberg_sink/tests/iceberg/main.rs
+core/integration/tests/connectors/meilisearch/ sinks/meilisearch_sink/tests/meilisearch/
+core/integration/tests/connectors/meilisearch/mod.rs sinks/meilisearch_sink/tests/meilisearch/main.rs
+core/integration/tests/connectors/mongodb/ sinks/mongodb_sink/tests/mongodb/
+core/integration/tests/connectors/mongodb/mod.rs sinks/mongodb_sink/tests/mongodb/main.rs
+core/integration/tests/connectors/quickwit/ sinks/quickwit_sink/tests/quickwit/
+core/integration/tests/connectors/quickwit/mod.rs sinks/quickwit_sink/tests/quickwit/main.rs
+core/integration/tests/connectors/rabbitmq/ sinks/rabbitmq_sink/tests/rabbitmq/
+core/integration/tests/connectors/rabbitmq/mod.rs sinks/rabbitmq_sink/tests/rabbitmq/main.rs
+core/integration/tests/connectors/redshift/ sinks/redshift_sink/tests/redshift/
+core/integration/tests/connectors/redshift/mod.rs sinks/redshift_sink/tests/redshift/main.rs
+core/integration/tests/connectors/s3/ sinks/s3_sink/tests/s3/
+core/integration/tests/connectors/s3/mod.rs sinks/s3_sink/tests/s3/main.rs
+core/integration/tests/connectors/stdout/ sinks/stdout_sink/tests/stdout/
+core/integration/tests/connectors/stdout/mod.rs sinks/stdout_sink/tests/stdout/main.rs
+core/integration/tests/connectors/surrealdb/ sinks/surrealdb_sink/tests/surrealdb/
+core/integration/tests/connectors/surrealdb/mod.rs sinks/surrealdb_sink/tests/surrealdb/main.rs
+core/integration/tests/connectors/mqtt/ sources/mqtt_source/tests/mqtt/
+core/integration/tests/connectors/mqtt/mod.rs sources/mqtt_source/tests/mqtt/main.rs
+core/integration/tests/connectors/random/ sources/random_source/tests/random/
+core/integration/tests/connectors/random/mod.rs sources/random_source/tests/random/main.rs
+
+# Suites with a sink target and a source target. A file name that holds
+# "source" goes to the source target, any other name to the sink target.
+core/integration/tests/connectors/elasticsearch/ sinks/elasticsearch_sink/tests/elasticsearch/
+core/integration/tests/connectors/elasticsearch/elasticsearch_source sources/elasticsearch_source/tests/elasticsearch/elasticsearch_source
+core/integration/tests/connectors/elasticsearch/source sources/elasticsearch_source/tests/elasticsearch/source
+core/integration/tests/connectors/http/ sinks/http_sink/tests/http/
+core/integration/tests/connectors/http/http_source sources/http_source/tests/http/http_source
+core/integration/tests/connectors/http/source sources/http_source/tests/http/source
+core/integration/tests/connectors/influxdb/ sinks/influxdb_sink/tests/influxdb/
+core/integration/tests/connectors/influxdb/influxdb_source sources/influxdb_source/tests/influxdb/influxdb_source
+core/integration/tests/connectors/influxdb/source sources/influxdb_source/tests/influxdb/source
+core/integration/tests/connectors/postgres/ sinks/postgres_sink/tests/postgres/
+core/integration/tests/connectors/postgres/postgres_source sources/postgres_source/tests/postgres/postgres_source
+core/integration/tests/connectors/postgres/source sources/postgres_source/tests/postgres/source
+core/integration/tests/connectors/postgres/cdc_restart_connectors/ sources/postgres_source/tests/postgres/cdc_restart_connectors/
+
+# Shared fixtures and helpers
+core/integration/tests/connectors/random_source_liveness.rs testing/src/random_source_liveness.rs
+core/integration/tests/connectors/fixtures/floci.rs testing/src/floci.rs
+core/integration/tests/connectors/fixtures/wiremock.rs runtime/tests/http_config_provider/fixtures.rs
+core/integration/tests/connectors/fixtures/clickhouse/ sinks/clickhouse_sink/tests/clickhouse/fixtures/
+core/integration/tests/connectors/fixtures/delta/ sinks/delta_sink/tests/delta/fixtures/
+core/integration/tests/connectors/fixtures/doris/ sinks/doris_sink/tests/doris/fixtures/
+core/integration/tests/connectors/fixtures/iceberg/ sinks/iceberg_sink/tests/iceberg/fixtures/
+core/integration/tests/connectors/fixtures/meilisearch/ sinks/meilisearch_sink/tests/meilisearch/fixtures/
+core/integration/tests/connectors/fixtures/mongodb/ sinks/mongodb_sink/tests/mongodb/fixtures/
+core/integration/tests/connectors/fixtures/mqtt/ sources/mqtt_source/tests/mqtt/fixtures/
+core/integration/tests/connectors/fixtures/quickwit/ sinks/quickwit_sink/tests/quickwit/fixtures/
+core/integration/tests/connectors/fixtures/rabbitmq/ sinks/rabbitmq_sink/tests/rabbitmq/fixtures/
+core/integration/tests/connectors/fixtures/redshift/ sinks/redshift_sink/tests/redshift/fixtures/
+core/integration/tests/connectors/fixtures/s3/ sinks/s3_sink/tests/s3/fixtures/
+core/integration/tests/connectors/fixtures/surrealdb/ sinks/surrealdb_sink/tests/surrealdb/fixtures/
+# The fixtures of a suite with a sink target and a source target follow the
+# same file name rule. The backend container module is shared in testing/src.
+core/integration/tests/connectors/fixtures/elasticsearch/ sinks/elasticsearch_sink/tests/elasticsearch/fixtures/
+core/integration/tests/connectors/fixtures/elasticsearch/source sources/elasticsearch_source/tests/elasticsearch/fixtures/source
+core/integration/tests/connectors/fixtures/http/ sinks/http_sink/tests/http/fixtures/
+core/integration/tests/connectors/fixtures/http/source sources/http_source/tests/http/fixtures/source
+core/integration/tests/connectors/fixtures/influxdb/ sinks/influxdb_sink/tests/influxdb/fixtures/
+core/integration/tests/connectors/fixtures/influxdb/source sources/influxdb_source/tests/influxdb/fixtures/source
+core/integration/tests/connectors/fixtures/postgres/ sinks/postgres_sink/tests/postgres/fixtures/
+core/integration/tests/connectors/fixtures/postgres/source sources/postgres_source/tests/postgres/fixtures/source
+core/integration/tests/connectors/fixtures/postgres/cdc.rs sources/postgres_source/tests/postgres/fixtures/cdc.rs
+core/integration/tests/connectors/fixtures/elasticsearch/container.rs testing/src/elasticsearch.rs
+core/integration/tests/connectors/fixtures/influxdb/container.rs testing/src/influxdb.rs
+core/integration/tests/connectors/fixtures/influxdb/container_v3.rs testing/src/influxdb_v3.rs
+core/integration/tests/connectors/fixtures/postgres/container.rs testing/src/postgres.rs
+# Files for manual InfluxDB runs, which no test uses
+core/integration/tests/connectors/influxdb/docker-compose.yml sinks/influxdb_sink/tests/influxdb/manual/docker-compose.yml
+core/integration/tests/connectors/influxdb_sink.toml sinks/influxdb_sink/tests/influxdb/manual/influxdb_sink.toml
+core/integration/tests/connectors/influxdb_source.toml sinks/influxdb_sink/tests/influxdb/manual/influxdb_source.toml
+# Core files that this repository split into several files. Port them by hand.
+core/integration/tests/connectors/mod.rs -
+core/integration/tests/connectors/fixtures/mod.rs -
+core/integration/tests/connectors/elasticsearch/mod.rs -
+core/integration/tests/connectors/fixtures/elasticsearch/mod.rs -
+core/integration/tests/connectors/http/mod.rs -
+core/integration/tests/connectors/fixtures/http/mod.rs -
+core/integration/tests/connectors/influxdb/mod.rs -
+core/integration/tests/connectors/fixtures/influxdb/mod.rs -
+core/integration/tests/connectors/postgres/mod.rs -
+core/integration/tests/connectors/fixtures/postgres/mod.rs -
+# Connector skills keep their paths
+.claude/skills/connector- .claude/skills/connector-
+.claude/skills/connectors-overview/ .claude/skills/connectors-overview/
+.agents/skills/connector- .agents/skills/connector-
+.agents/skills/connectors-overview .agents/skills/connectors-overview

@@ -20,7 +20,7 @@
 # InfluxDB Source Connector — Direct Runtime Dependencies
 
 This file lists every direct (non-dev) dependency declared in
-`core/connectors/sources/influxdb_source/Cargo.toml`, together with
+`sources/influxdb_source/Cargo.toml`, together with
 its workspace-pinned version, license, and the specific role it plays
 in this connector. Transitive dependencies are not listed here; refer
 to `cargo tree -p iggy_connector_influxdb_source` for the full graph.

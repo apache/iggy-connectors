@@ -1,6 +1,6 @@
 ---
 name: connector-testing
-description: Write tests for Apache Iggy connectors - sinks, sources, transforms, SDK, runtime. Covers BDD unit-test naming, the canonical source state round-trip tests, and the real-infra integration test layout under `core/integration/tests/connectors/` with `testcontainers-modules` + `#[iggy_harness]`. Load when writing or reviewing tests in `core/connectors/` or `core/integration/tests/connectors/`. Use for connector test authoring. NOT for runtime internals or non-connector test patterns.
+description: Write tests for Apache Iggy connectors - sinks, sources, transforms, SDK, runtime. Covers BDD unit-test naming, the canonical source state round-trip tests, and the real-infra integration test targets under `<package>/tests/<suite>/` with `testcontainers-modules` + `#[iggy_harness]`. Load when writing or reviewing tests anywhere in this repository (`src/` unit tests, `tests/` targets, `testing/`). Use for connector test authoring. NOT for runtime internals or non-connector test patterns.
 ---
 
 # Testing Apache Iggy Connectors
@@ -21,16 +21,16 @@ description: Write tests for Apache Iggy connectors - sinks, sources, transforms
 ## STOP and ask the user before
 
 - Mocking the database or backend in an integration test - we hit real infra via `testcontainers-modules` (mocks miss migration bugs).
-- Adding a unit test that requires Docker - that belongs under `core/integration/tests/connectors/<backend>/`, not in `<plugin>/src/lib.rs`.
+- Adding a unit test that requires Docker - that belongs in the package's test target `<plugin>/tests/<backend>/`, not in `<plugin>/src/lib.rs`.
 - Skipping the four canonical source state tests - they're mandatory for every source plugin.
 - Naming a test `test_foo` / `does_bar` - we use BDD `given_X_when_Y_should_Z`.
 
 There are **two distinct test layers**. Use both - they catch different bugs.
 
-| Layer                 | Location                                                                   | What it covers                                                                                 | When required                                        |
-| --------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| **Unit tests**        | `#[cfg(test)] mod tests` at EOF of `<plugin>/src/lib.rs`                   | Config parsing, defaults, fallbacks, payload conversion, query/document building, state ser/de | Every plugin                                         |
-| **Integration tests** | `core/integration/tests/connectors/<name>/` (uses real backend via Docker) | End-to-end: runtime + plugin + real Postgres/ES/Iceberg/Mongo/etc. + Iggy server               | Every plugin that integrates with an external system |
+| Layer                 | Location                                                 | What it covers                                                                                 | When required                                        |
+| --------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| **Unit tests**        | `#[cfg(test)] mod tests` at EOF of `<plugin>/src/lib.rs` | Config parsing, defaults, fallbacks, payload conversion, query/document building, state ser/de | Every plugin                                         |
+| **Integration tests** | `<plugin>/tests/<suite>/` (uses real backend via Docker) | End-to-end: runtime + plugin + real Postgres/ES/Iceberg/Mongo/etc. + Iggy server               | Every plugin that integrates with an external system |
 
 ## Unit tests
 
@@ -203,44 +203,56 @@ Four branches must be covered (see `connector-transform`):
 - The Iggy server.
 - The runtime.
 
-If you need a fake backend, use `wiremock` (a real local HTTP server) - see `core/integration/tests/connectors/http/`.
+If you need a fake backend, use `wiremock` (a real local HTTP server) - see `sinks/http_sink/tests/http/`.
 
 ## Integration tests (real infra via Docker)
 
-The canonical pattern lives in `core/integration/tests/connectors/`. Plugins that integrate with external services (Postgres, Elasticsearch, Iceberg, MongoDB, InfluxDB, Quickwit, HTTP/wiremock) have a paired fixture + test file there.
+Each plugin that integrates with an external service (Postgres, Elasticsearch, Iceberg, MongoDB, InfluxDB, Quickwit, HTTP/wiremock) owns its integration tests: one test target per backend suite in `tests/<suite>/` of its own package, with a paired fixture + test file there. A backend with both a sink and a source has a target of the same name in both packages. Fixtures that more than one package needs live in `testing/` (crate `iggy_connector_testing`).
 
 ### Layout
 
 ```text
-core/integration/tests/connectors/
-├── mod.rs                        Common helpers (TestMessage, create_test_messages)
-├── fixtures/                     One subdir per backend
-│   ├── postgres/
-│   │   ├── container.rs          PostgresContainer (testcontainers wrapper), env-var consts
-│   │   ├── sink.rs               PostgresSinkFixture, PostgresSinkByteaFixture, PostgresSinkJsonFixture
-│   │   ├── source.rs             PostgresSourceJsonFixture, PostgresSourceJsonbFixture, ...
-│   │   └── mod.rs                re-exports
-│   ├── elasticsearch/  iceberg/  mongodb/  influxdb/  quickwit/  http/  delta/
-│   └── wiremock.rs               HTTP mocking for http_sink tests
-├── postgres/
-│   ├── postgres_sink.rs          The actual #[iggy_harness] tests
-│   ├── postgres_source.rs
-│   ├── restart.rs                Restart + state-survival tests
-│   ├── sink.toml                 Runtime config used by sink tests
-│   ├── source.toml               Runtime config used by source tests
-│   └── mod.rs                    Shared constants (TEST_MESSAGE_COUNT, POLL_ATTEMPTS, ...)
-├── delta/ elasticsearch/ iceberg/ mongodb/ influxdb/ random/ quickwit/ http/ stdout/
-├── http_config_provider/             HTTP config provider end-to-end
-├── runtime/                      Runtime-only tests (error isolation, missing plugin, ...)
-└── api/                          HTTP control plane tests
+sinks/postgres_sink/tests/postgres/      Test target `postgres` of iggy_connector_postgres_sink
+├── main.rs                   mod declarations, install_log_capture!(), shared constants (TEST_MESSAGE_COUNT, POLL_ATTEMPTS, ...)
+├── fixtures/
+│   ├── sink.rs               PostgresSinkFixture, PostgresSinkByteaFixture, PostgresSinkJsonFixture
+│   └── mod.rs                re-exports, plus PostgresOps from iggy_connector_testing
+├── postgres_sink.rs          The actual #[iggy_harness] tests
+├── restart.rs                Sink restart tests through the runtime HTTP API
+└── sink.toml                 Runtime config used by the tests
+
+sources/postgres_source/tests/postgres/  Test target `postgres` of iggy_connector_postgres_source
+├── main.rs
+├── fixtures/
+│   ├── source.rs             PostgresSourceJsonFixture, PostgresSourceJsonbFixture, ...
+│   ├── cdc.rs                PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture
+│   └── mod.rs                re-exports, plus PostgresOps and PostgresSourceOps from iggy_connector_testing
+├── postgres_source.rs  postgres_source_cdc.rs
+├── source.toml  source_cdc_restart.toml
+└── cdc_restart_connectors/   Connector directory of source_cdc_restart.toml
+
+testing/src/                  iggy_connector_testing
+├── lib.rs                    TestMessage, create_test_messages, TEST_CONTAINER_PREFIX, unique_container_name
+├── postgres.rs               PostgresContainer (testcontainers wrapper), PostgresOps, PostgresSourceOps, env-var consts
+├── random_source_liveness.rs assert_produces_messages
+└── elasticsearch.rs  influxdb.rs  influxdb_v3.rs  floci.rs
+
+runtime/tests/
+├── runtime/                  Runtime-only tests (error isolation, missing plugin, ...)
+├── api/                      HTTP control plane tests
+├── http_config_provider/     HTTP config provider end-to-end, WireMock fixture in fixtures.rs
+└── config_env_listing.rs     Env-var listing of the runtime binary
 ```
+
+A container that only one package uses lives in that target's `fixtures/container.rs` (for example `sinks/http_sink/tests/http/fixtures/container.rs`).
 
 ### Container naming + cleanup
 
 Every test container MUST be named with the `iggy-test-` prefix so a single
-`docker ps -aqf 'name=^iggy-test-'` sweep reaps them (`just clean-test-containers`,
-alias `ctc`; the `test`/`nextest` recipes also reap on exit). New fixtures get
-this for free by naming through `fixtures::unique_container_name("<svc>")`, which
+sweep reaps them: `docker ps -aqf 'name=^iggy-test-' | xargs -r docker rm -f`.
+Reuse fixtures keep their container running, and a crashed run can orphan any
+fixture's container, so run the sweep after a test session. New fixtures get
+this for free by naming through `iggy_connector_testing::unique_container_name("<svc>")`, which
 appends a uuid for parallel-safe ephemeral containers. Reuse fixtures use a fixed
 `iggy-test-<svc>` literal instead, because the stable name is what lets later
 nextest processes attach to the same container via `ReuseDirective::Always`. Do
@@ -254,14 +266,14 @@ more than the reuse.
 
 ### The `#[iggy_harness]` proc macro
 
-Each integration test is annotated with this macro from the `integration` crate. It boots an in-process Iggy server (and optionally the connectors runtime) for the duration of the test, runs the seeds, then injects a `&TestHarness` and your fixture.
+Each integration test is annotated with this macro from the `integration` crate of apache/iggy at R. It launches the prebuilt `target/debug/iggy-server` (from `./scripts/build-test-server.sh`) and optionally `target/debug/iggy-connectors` for the duration of the test, runs the seeds, then injects a `&TestHarness` and your fixture. It never builds them: run `cargo build` first, or a stale binary runs.
 
 ```rust
 use integration::harness::seeds;
 use integration::iggy_harness;
 
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),
+    server(connectors_runtime(config_path = "tests/postgres/sink.toml")),
     seed = seeds::connector_stream
 )]
 async fn json_messages_sink_stores_as_bytea(
@@ -278,16 +290,20 @@ async fn json_messages_sink_stores_as_bytea(
 Key pieces:
 
 - `server(connectors_runtime(config_path = ...))` boots the connectors runtime against the given TOML.
+  The path is relative to the package directory: cargo and nextest run each test binary there, and the runtime inherits that working directory.
+  Most of these TOMLs set `config_dir = "."`, so the runtime loads the plugin's own `config.toml` from the package root (it skips `Cargo.toml`).
+  The fixture then sets the plugin path to the bare file name, for example `ENV_SINK_PATH` = `libiggy_connector_postgres_sink`, and the runtime finds it next to its own binary in `target/debug/`.
+  A test that needs other connector files keeps them in a directory under `tests/<suite>/`, for example `tests/postgres/cdc_restart_connectors/` in `sources/postgres_source/`.
 - `seed = seeds::connector_stream` runs the named seed to create the test stream/topic.
 - `fixture: PostgresSinkFixture` - the test harness calls `PostgresSinkFixture::setup()` (which spins up the testcontainer) and injects the result.
-- `harness: &TestHarness` (defined in `core/integration/src/harness/orchestrator/harness.rs`) exposes `.root_client().await`, `.connectors_runtime().expect("...").http_url()`, etc. - `connectors_runtime()` returns `Option`, so `.expect()` first.
+- `harness: &TestHarness` (defined in `core/integration/src/harness/orchestrator/harness.rs` of apache/iggy) exposes `.root_client().await`, `.connectors_runtime().expect("...").http_url()`, etc. - `connectors_runtime()` returns `Option`, so `.expect()` first.
 
 ### Fixture pattern (`TestFixture` trait)
 
 Each fixture implements `integration::harness::TestFixture`. Pattern:
 
 ```rust
-// core/integration/tests/connectors/fixtures/<backend>/container.rs
+// testing/src/<backend>.rs when several packages use it, else tests/<suite>/fixtures/container.rs
 
 use testcontainers_modules::{
     <backend_module>,
@@ -315,7 +331,7 @@ The fixture itself wraps the container and implements `TestFixture::setup()` to 
 
 ### Env-var injection via `ConfigEnv`
 
-The runtime's config structs derive `ConfigEnv` (`configs_derive::ConfigEnv`, applied in `runtime/src/configs/connectors.rs` to `SinkConfig`, `SourceConfig`, `StreamConsumerConfig`, `StreamProducerConfig`). Fields are addressable by env var with a path-built prefix. Three concrete forms observed in `core/integration/tests/connectors/fixtures/postgres/container.rs`:
+The runtime's config structs derive `ConfigEnv` (`configs_derive::ConfigEnv`, applied in `runtime/src/configs/connectors.rs` to `SinkConfig`, `SourceConfig`, `StreamConsumerConfig`, `StreamProducerConfig`). Fields are addressable by env var with a path-built prefix. Three concrete forms observed in `testing/src/postgres.rs`:
 
 ```rust
 // Plugin-config fields (your sink/source's own config struct):
@@ -356,11 +372,12 @@ Pattern: `<subject>_<action>_<observation>`. Reads like a sentence describing wh
 
 ### Polling vs sleeping
 
-Integration tests poll until an expected condition - never `sleep(big_duration)`. Constants `POLL_ATTEMPTS` and `POLL_INTERVAL_MS` defined per-backend `mod.rs`. Fixture helpers like `PostgresSinkFixture::fetch_rows_as` and `PostgresSinkFixture::wait_for_table` encapsulate the pattern.
+Integration tests poll until an expected condition - never `sleep(big_duration)`. Constants `POLL_ATTEMPTS` and `POLL_INTERVAL_MS` defined in each test target's `main.rs`. Fixture helpers like `PostgresSinkFixture::fetch_rows_as` and `PostgresSinkFixture::wait_for_table` encapsulate the pattern.
 
 ### When to add an integration test
 
-- New sink/source plugin → at minimum one happy-path test per supported `Schema` and per supported plugin mode. Concrete coverage in `core/integration/tests/connectors/postgres/`: 3 sink tests (`json_messages_sink_stores_as_bytea`, `binary_messages_sink_stores_as_bytea`, `json_messages_sink_stores_as_jsonb`) backed by 3 sink fixtures, plus 5 source fixtures (`Json`, `Jsonb`, `Bytea`, `Delete`, `Mark`) and a dedicated `restart.rs` for state-survival.
+- New sink/source plugin → at minimum one happy-path test per supported `Schema` and per supported plugin mode. Concrete coverage in the `postgres` targets of `sinks/postgres_sink/` and `sources/postgres_source/`:
+  3 sink tests (`json_messages_sink_stores_as_bytea`, `binary_messages_sink_stores_as_bytea`, `json_messages_sink_stores_as_jsonb`) backed by 3 sink fixtures, plus 5 source fixtures (`Json`, `Jsonb`, `Bytea`, `Delete`, `Mark`), `state_persists_across_connector_restart` for state survival, and a dedicated `restart.rs` for sink restarts.
 - Bug fix in a plugin → regression test reproducing the bug.
 - Behavior that crosses the FFI boundary (state restart, transform chain, schema decode) → integration test, not unit test.
 
@@ -372,8 +389,8 @@ Integration tests poll until an expected condition - never `sleep(big_duration)`
 
 ## SDK + runtime tests
 
-- `core/connectors/sdk/tests/` - cross-module SDK concerns. In tree: `protobuf_integration.rs`, `flatbuffer_integration.rs` (round-trip schema decoders/encoders).
-- Runtime tests live under `core/integration/tests/connectors/runtime/` and `core/integration/tests/connectors/api/`. They exercise the runtime alone (no plugin-specific backend) - error isolation, missing plugin, invalid config, HTTP API contract.
+- `sdk/tests/` - cross-module SDK concerns. In tree: `protobuf_integration.rs`, `flatbuffer_integration.rs` (round-trip schema decoders/encoders), `plugin_logging.rs`.
+- Runtime tests live under `runtime/tests/runtime/`, `runtime/tests/api/` and `runtime/tests/http_config_provider/`. They exercise the runtime alone (no plugin-specific backend, only `random_source` and `stdout_sink`) - error isolation, missing plugin, invalid config, HTTP API contract.
 
 ## CI / verification flow
 
@@ -382,17 +399,21 @@ Before pushing:
 ```text
 cargo fmt --all
 cargo sort --no-format --workspace
-cargo clippy -p <crate> --all-targets -- -D warnings
-cargo test -p <crate>
+cargo clippy -p <package> --all-targets -- -D warnings
+cargo nextest run -p <package> --lib        # --bins for the runtime
 ```
 
-For integration tests, the relevant package is `integration`. There is **no `--test connectors` target** - the `integration` crate has no `[[test]]` entries and `tests/` is structured as a single binary entry through `tests/mod.rs` with `connectors/`, `server/`, `cli/`, etc. as nested modules. Run via name filter:
+Integration tests run per test target. Build what the harness launches first, then filter by target and test name:
 
 ```text
-cargo test -p integration -- connectors::postgres::postgres_sink
-cargo test -p integration -- connectors::postgres::                   # all postgres tests
-cargo test -p integration -- connectors::                              # all connector tests
+./scripts/build-test-server.sh                                          # once per R
+cargo build -p iggy-connectors -p iggy_connector_postgres_sink
+cargo nextest run -p iggy_connector_postgres_sink --test postgres postgres_sink::   # one module
+cargo nextest run -p iggy_connector_postgres_sink --test postgres                   # the whole suite
+cargo nextest run --workspace                                                        # all tests, as CI
 ```
+
+A test that apache/iggy named `connectors::<suite>::<rest>` is `<rest>` in the test target `<suite>` of the package that owns it.
 
 Integration tests assume Docker is available locally and pull images from a public registry on first run.
 
@@ -410,18 +431,18 @@ Integration tests assume Docker is available locally and pull images from a publ
 
 ## Examples worth copying
 
-| Concern                             | Where                                                                |
-| ----------------------------------- | -------------------------------------------------------------------- |
-| Source state round-trip             | `sources/random_source/src/lib.rs::tests`                            |
-| Config + query-building unit tests  | `sinks/postgres_sink/src/lib.rs::tests`                              |
-| Real-infra sink integration tests   | `core/integration/tests/connectors/postgres/postgres_sink.rs`        |
-| Real-infra source integration tests | `core/integration/tests/connectors/postgres/postgres_source.rs`      |
-| Restart + state survival            | `core/integration/tests/connectors/postgres/restart.rs`              |
-| Wiremock-driven HTTP sink test      | `core/integration/tests/connectors/http/http_sink.rs`                |
-| Testcontainer wrapper               | `core/integration/tests/connectors/fixtures/postgres/container.rs`   |
-| Fixture impl `TestFixture`          | `core/integration/tests/connectors/fixtures/postgres/sink.rs`        |
-| Runtime-only error-isolation        | `core/integration/tests/connectors/runtime/error_isolation.rs`       |
-| Transform tests                     | `sdk/src/transforms/add_fields.rs::tests`, `filter_fields.rs::tests` |
+| Concern                             | Where                                                                                                          |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Source state round-trip             | `sources/random_source/src/lib.rs::tests`                                                                      |
+| Config + query-building unit tests  | `sinks/postgres_sink/src/lib.rs::tests`                                                                        |
+| Real-infra sink integration tests   | `sinks/postgres_sink/tests/postgres/postgres_sink.rs`                                                          |
+| Real-infra source integration tests | `sources/postgres_source/tests/postgres/postgres_source.rs`                                                    |
+| Restart + state survival            | `sinks/postgres_sink/tests/postgres/restart.rs`, `postgres_source.rs::state_persists_across_connector_restart` |
+| Wiremock-driven HTTP sink test      | `sinks/http_sink/tests/http/http_sink.rs`                                                                      |
+| Testcontainer wrapper               | `testing/src/postgres.rs`                                                                                      |
+| Fixture impl `TestFixture`          | `sinks/postgres_sink/tests/postgres/fixtures/sink.rs`                                                          |
+| Runtime-only error-isolation        | `runtime/tests/runtime/error_isolation.rs`                                                                     |
+| Transform tests                     | `sdk/src/transforms/add_fields.rs::tests`, `filter_fields.rs::tests`                                           |
 
 ---
 

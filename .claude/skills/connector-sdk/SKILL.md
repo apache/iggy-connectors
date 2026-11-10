@@ -1,11 +1,11 @@
 ---
 name: connector-sdk
-description: Extend or modify the Apache Iggy Connectors SDK (`core/connectors/sdk/`). Use when adding a new `Schema` variant, a new `StreamDecoder`/`StreamEncoder`, a new `Error` variant, modifying the `Sink`/`Source`/`Transform` trait surface, the FFI macros, or the `retry`/`api`/`convert` modules. NOT for writing plugins - use `connector-sink` or `connector-source` for those.
+description: Extend or modify the Apache Iggy Connectors SDK (`sdk/`). Use when adding a new `Schema` variant, a new `StreamDecoder`/`StreamEncoder`, a new `Error` variant, modifying the `Sink`/`Source`/`Transform` trait surface, the FFI macros, or the `retry`/`api`/`convert` modules. NOT for writing plugins - use `connector-sink` or `connector-source` for those.
 ---
 
 # Extending the Apache Iggy Connectors SDK
 
-The SDK (`core/connectors/sdk/`) is the **stable contract** between the
+The SDK (`sdk/`) is the **stable contract** between the
 runtime and every plugin. Changes ripple to every sink/source in-tree
 and every third-party plugin. Treat the public surface as a versioned API.
 
@@ -121,7 +121,7 @@ The `Error` enum (in `lib.rs`) is `Clone + PartialEq + Eq + Hash`. New variants 
 
 **Breaking changes.** Required process:
 
-1. Document migration in the SDK changelog (and `connectors/sdk/README.md`).
+1. Document migration in the SDK changelog (and `sdk/README.md`).
 2. Update every in-tree plugin in the same PR. CI builds them all.
 3. Bump SDK minor version.
 4. Note in PR description: dynamic plugins compiled against the old SDK version will fail to load with mismatched FFI symbols.
@@ -177,12 +177,10 @@ Plugin authors call this on every consumed message. The implementation in `lib.r
 cargo fmt --all
 cargo sort --no-format --workspace
 cargo clippy -p iggy_connector_sdk --all-targets --all-features -- -D warnings
-cargo test -p iggy_connector_sdk --all-features
+cargo nextest run -p iggy_connector_sdk --all-features
 
-# Rebuild all plugins to catch breaking-change leaks:
-cargo build -p iggy_connector_stdout_sink -p iggy_connector_random_source
-# If FFI signatures changed, also build the runtime:
-cargo build -p iggy-connectors
+# Rebuild the runtime and all plugins to catch breaking-change leaks:
+cargo build
 ```
 
 ---

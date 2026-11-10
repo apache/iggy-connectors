@@ -100,7 +100,7 @@ Exits immediately before any startup."#
 
 static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);
 const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
-const DEFAULT_CONFIG_PATH: &str = "core/connectors/runtime/config.toml";
+const DEFAULT_CONFIG_PATH: &str = "runtime/config.toml";
 
 #[derive(WrapperApi, Debug)]
 pub(crate) struct SourceApi {

@@ -1,0 +1,218 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[workspace]
+members = [
+    "runtime",
+    "sdk",
+    "sinks/bigquery_sink",
+    "sinks/clickhouse_sink",
+    "sinks/delta_sink",
+    "sinks/doris_sink",
+    "sinks/elasticsearch_sink",
+    "sinks/http_sink",
+    "sinks/iceberg_sink",
+    "sinks/influxdb_sink",
+    "sinks/meilisearch_sink",
+    "sinks/mongodb_sink",
+    "sinks/postgres_sink",
+    "sinks/quickwit_sink",
+    "sinks/rabbitmq_sink",
+    "sinks/redshift_sink",
+    "sinks/s3_sink",
+    "sinks/stdout_sink",
+    "sinks/surrealdb_sink",
+    "sources/elasticsearch_source",
+    "sources/http_source",
+    "sources/influxdb_source",
+    "sources/mqtt_source",
+    "sources/postgres_source",
+    "sources/random_source",
+    "testing",
+]
+resolver = "3"
+
+[workspace.dependencies]
+ahash = { version = "0.8.12", features = ["serde"] }
+anyhow = "1.0.104"
+apache-avro = "0.22.0"
+arc-swap = "1.9.3"
+arrow = "58.4.1"
+arrow-array = "58.4.1"
+arrow-json = "58.4.1"
+arrow-schema = "58.4.1"
+assert_cmd = "2.2.2"
+async-trait = "0.1.92"
+axum = { version = "0.8.9", features = ["macros"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+base64 = "0.23.1"
+bigdecimal = "0.4.11"
+blake3 = "1.8.7"
+byte-unit = { version = "5.2.6", default-features = false, features = ["serde", "byte", "std"] }
+bytes = "1.12.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+configs = { git = "https://github.com/apache/iggy", rev = "bd679c39c61b6ab4fcb11410fd738ab9dcdb047b" }
+configs_derive = { git = "https://github.com/apache/iggy", rev = "bd679c39c61b6ab4fcb11410fd738ab9dcdb047b" }
+crossfire = "3.1.22"
+csv = "1.4.0"
+ctor = "1.0.13"
+dashmap = "6.2.1"
+deltalake = { version = "1.1.2", features = ["azure", "gcs", "s3"] }
+derive_more = { version = "2.1.1", features = ["full"] }
+dirs = "7.0.0"
+dlopen2 = "0.9.0"
+dotenvy = "0.15.7"
+dtor = "1.0.6"
+elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
+figlet-rs = "1.0.0"
+figment = { version = "0.10.19", features = ["toml", "env"] }
+flatbuffers = "25.12.19"
+flume = "0.12.0"
+futures = "0.3.34"
+gcloud-bigquery = { version = "1.8.0", default-features = false, features = [
+    "auth",
+    "jwt-rust-crypto",
+    "rustls-tls",
+] }
+gcloud-gax = "1.4.1"
+gcloud-googleapis = { version = "1.3.0", features = ["bigquery"] }
+hex = "0.4.3"
+http = "1.5.0"
+humantime = "2.4.0"
+iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
+iceberg-storage-opendal = "0.10.1"
+iggy = { git = "https://github.com/apache/iggy", rev = "bd679c39c61b6ab4fcb11410fd738ab9dcdb047b", version = "0.12.0" }
+iggy_common = { git = "https://github.com/apache/iggy", rev = "bd679c39c61b6ab4fcb11410fd738ab9dcdb047b", version = "0.12.0" }
+iggy_connector_sdk = { path = "sdk", version = "0.6.0" }
+iggy_connector_testing = { path = "testing" }
+integration = { git = "https://github.com/apache/iggy", rev = "bd679c39c61b6ab4fcb11410fd738ab9dcdb047b", default-features = false }
+lapin = "4.12.3"
+# Pinned exactly: `metadata::stm::stream`'s keyed stats evictions lean on
+# left-right draining the previous batch's `absorb_second` before the current
+# batch's `absorb_first`, which is an implementation detail of 0.11.8's
+# `write.rs`, not a documented contract.
+meilisearch-sdk = { version = "0.33.0", default-features = false, features = [
+    "reqwest",
+    "tls",
+    "jwt_rust_crypto",
+] }
+mimalloc = "0.1"
+mongodb = { version = "3.9.1", features = ["rustls-tls"] }
+opentelemetry = { version = "0.33.1", features = ["trace", "logs"] }
+opentelemetry-appender-tracing = { version = "0.33.1", features = ["log"] }
+opentelemetry-otlp = { version = "0.33.1", features = [
+    "logs",
+    "trace",
+    "grpc-tonic",
+    "http",
+    "http-proto",
+    "reqwest-client",
+] }
+opentelemetry-semantic-conventions = "0.33.1"
+opentelemetry_sdk = { version = "0.33.1", features = [
+    "logs",
+    "trace",
+    "experimental_async_runtime",
+    "experimental_logs_batch_log_processor_with_async_runtime",
+    "experimental_trace_batch_span_processor_with_async_runtime",
+] }
+parquet = "58.4.1"
+pgwire = "0.42.1"
+postcard = { version = "1.1.3", features = ["alloc"] }
+prometheus-client = "0.25.2"
+prost = "0.14.4"
+prost-types = "0.14.4"
+protox = "0.10.0"
+protox-parse = "0.10.0"
+rand = "0.10.3"
+regex = "1.13.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+reqwest-middleware = { version = "0.5.2", features = ["json", "query"] }
+reqwest-retry = "0.9.1"
+reqwest-tracing = "0.7.1"
+ring = "0.17.14"
+rmp-serde = "1.3.1"
+rumqttc-v4 = { package = "rumqttc-v4-next", version = "0.34.0", features = ["url"] }
+rumqttc-v5 = { package = "rumqttc-v5-next", version = "0.34.0", features = ["url"] }
+rust-s3 = { version = "0.38.0", default-features = false, features = ["tokio-rustls-tls", "tags"] }
+rustls = { version = "0.23.46", features = ["ring"] }
+rustls-native-certs = "0.8.5"
+rustls-pemfile = "2.2.0"
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.154"
+serde_with = { version = "3.24.0", features = ["base64", "macros"] }
+serde_yaml_ng = "0.10.0"
+serial_test = "4.0.1"
+simd-json = { version = "0.19.0", features = ["serde_impl"] }
+sqlparser = { version = "0.63.0", features = ["visitor"] }
+sqlx = { version = "0.9.0", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "bigdecimal",
+    # "mysql": Doris exposes a MySQL-wire frontend; the Doris sink's
+    # integration-test fixture talks to it over this driver. Cargo unifies
+    # features across the workspace, so it is declared once here.
+    "mysql",
+    "chrono",
+    "uuid",
+    "json",
+] }
+strum = { version = "0.28.0", features = ["derive"] }
+strum_macros = "0.28.0"
+subtle = "2.6.1"
+sysinfo = "0.40.1"
+system_stats = { git = "https://github.com/apache/iggy", rev = "bd679c39c61b6ab4fcb11410fd738ab9dcdb047b" }
+tempfile = "3.27.0"
+testcontainers = { version = "0.27.3", features = ["reusable-containers"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "http_wait"] }
+thiserror = "2.0.21"
+token-source = "1.0.0"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-postgres = "0.7.18"
+tokio-stream = { version = "0.1.19", features = ["net"] }
+toml = "1.1.8"
+tonic = { version = "0.14.9", default-features = false, features = ["codegen", "router", "server"] }
+tonic-prost = "0.14.9"
+tower-http = { version = "0.7.1", features = ["add-extension", "cors", "trace"] }
+tracing = "0.1.44"
+tracing-log = "0.2.0"
+tracing-opentelemetry = "0.34.0"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "fmt",
+    "env-filter",
+    "ansi",
+] }
+url = "2.5.8"
+uuid = { version = "1.29.0", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
+wiremock = "0.6"
+
+[workspace.metadata.cargo-machete]
+ignored = ["ctor", "dtor", "serial_test"]
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.dev.package.iggy_common]
+opt-level = 3

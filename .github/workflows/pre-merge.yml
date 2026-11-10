@@ -1,0 +1,248 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# PR gate: detects changed components and runs the common checks, the Rust
+# checks, the Rust tests and the image build only for affected parts.
+# All jobs must pass before merge.
+
+name: Pre-merge
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Common checks - always run
+  common:
+    name: Common checks
+    needs: detect
+    uses: ./.github/workflows/_common.yml
+    with:
+      validate-third-party-licenses: ${{ needs.detect.outputs.third_party_licenses == 'true' }}
+    permissions:
+      contents: read
+      pull-requests: read
+
+  # Detect changes and build matrices
+  detect:
+    name: Detect changes
+    uses: ./.github/workflows/_detect.yml
+
+  test-server:
+    name: Test server
+    needs: detect
+    if: needs.detect.outputs.rust_tests == 'true'
+    uses: ./.github/workflows/_build_ci_artifacts.yml
+    with:
+      task: test-server
+      timeout-minutes: 60
+
+  rust-test-build:
+    name: Rust test artifacts
+    needs: detect
+    if: needs.detect.outputs.rust_tests == 'true'
+    uses: ./.github/workflows/_build_ci_artifacts.yml
+    with:
+      task: test-build
+      timeout-minutes: 60
+
+  # Rust components
+  test-rust:
+    name: Rust
+    needs: detect
+    if: needs.detect.outputs.rust_plan != ''
+    uses: ./.github/workflows/_rust.yml
+    with:
+      plan: ${{ needs.detect.outputs.rust_plan }}
+
+  test-rust-runtime:
+    name: Rust tests
+    needs: [detect, test-server, rust-test-build]
+    if: ${{ !cancelled() && !failure() && needs.detect.outputs.rust_tests == 'true' }}
+    uses: ./.github/workflows/_rust_tests.yml
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # Builds each platform natively, without a push. It waits for the common
+  # checks to keep the workflow at 20 concurrent jobs or fewer, the ASF limit.
+  docker:
+    name: Docker / ${{ matrix.platform }}
+    needs: [detect, common]
+    if: ${{ !cancelled() && needs.detect.outputs.docker == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-26.04
+          - platform: linux/arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Build apache/iggy-connect
+        uses: ./.github/actions/utils/docker-buildx
+        with:
+          task: build
+          component: rust-connectors
+          platform: ${{ matrix.platform }}
+          dry_run: "true"
+
+  # Final status check
+  finalize_pr:
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      actions: read # job durations for the summary
+    needs: [common, detect, test-server, rust-test-build, test-rust, test-rust-runtime, docker]
+    if: ${{ !cancelled() }}
+    steps:
+      # The durations only fill the summary table. A GitHub API error here
+      # must not skip "Check status", which decides the required check.
+      - name: Get job execution times
+        id: times
+        continue-on-error: true
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+              per_page: 100
+            });
+
+            const formatDuration = ms => {
+              const seconds = Math.floor(ms / 1000);
+              return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+            };
+            const groups = {
+              rust: 'Rust', rust_tests: 'Rust tests', docker: 'Docker',
+              common: 'Common checks', detect: 'Detect changes', test_server: 'Test server',
+              rust_test_build: 'Rust test artifacts',
+            };
+            for (const [key, group] of Object.entries(groups)) {
+              const completed = jobs.filter(job =>
+                (job.name === group || job.name.startsWith(`${group} /`)) &&
+                job.conclusion !== 'skipped' && job.started_at && job.completed_at);
+              const duration = completed.length ? formatDuration(
+                Math.max(...completed.map(job => new Date(job.completed_at).getTime())) -
+                Math.min(...completed.map(job => new Date(job.started_at).getTime()))
+              ) : '-';
+              core.setOutput(`${key}_time`, duration);
+            }
+
+            // Calculate total time - find the earliest job start time
+            let earliestStart = null;
+            let latestEnd = null;
+            for (const job of jobs) {
+              if (job.started_at) {
+                const start = new Date(job.started_at);
+                if (!earliestStart || start < earliestStart) {
+                  earliestStart = start;
+                }
+              }
+              if (job.completed_at) {
+                const end = new Date(job.completed_at);
+                if (!latestEnd || end > latestEnd) {
+                  latestEnd = end;
+                }
+              }
+            }
+
+            if (earliestStart && latestEnd) {
+              const totalDuration = latestEnd - earliestStart;
+              core.setOutput('total_time', formatDuration(totalDuration));
+            } else if (earliestStart) {
+              const totalDuration = Date.now() - earliestStart;
+              core.setOutput('total_time', formatDuration(totalDuration) + ' (running)');
+            } else {
+              core.setOutput('total_time', '-');
+            }
+
+      - name: Check status
+        run: |
+          set -euxo pipefail
+          echo "## CI Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Helper function to format status with appropriate emoji
+          format_status() {
+            case "$1" in
+              "success")
+                echo "✅ success"
+                ;;
+              "failure")
+                echo "❌ failure"
+                ;;
+              "cancelled")
+                echo "🚫 cancelled"
+                ;;
+              "skipped")
+                echo "⏭️ skipped"
+                ;;
+              *)
+                echo "⏸️ $1"
+                ;;
+            esac
+          }
+
+          echo "### Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Component | Status | Duration |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|--------|----------|" >> "$GITHUB_STEP_SUMMARY"
+
+          detect_status=$(format_status "${{ needs.detect.result }}")
+          common_status=$(format_status "${{ needs.common.result }}")
+          test_server_status=$(format_status "${{ needs.test-server.result }}")
+          rust_test_build_status=$(format_status "${{ needs.rust-test-build.result }}")
+          rust_status=$(format_status "${{ needs.test-rust.result }}")
+          rust_tests_status=$(format_status "${{ needs.test-rust-runtime.result }}")
+          docker_status=$(format_status "${{ needs.docker.result }}")
+
+          echo "| 🔍 Detection | $detect_status | ${{ steps.times.outputs.detect_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 📋 Common Checks | $common_status | ${{ steps.times.outputs.common_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Test server | $test_server_status | ${{ steps.times.outputs.test_server_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Rust test artifacts | $rust_test_build_status | ${{ steps.times.outputs.rust_test_build_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🦀 Rust | $rust_status | ${{ steps.times.outputs.rust_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🦀 Rust tests | $rust_tests_status | ${{ steps.times.outputs.rust_tests_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🐳 Docker | $docker_status | ${{ steps.times.outputs.docker_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Total workflow time:** ${{ steps.times.outputs.total_time }}" >> "$GITHUB_STEP_SUMMARY"
+
+          # Check for failures
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ **CI Failed** - Please check the logs for details." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠️ **CI Cancelled** - The workflow was cancelled." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ **CI Passed** - All checks completed successfully!" >> "$GITHUB_STEP_SUMMARY"
+          fi

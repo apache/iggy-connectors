@@ -206,14 +206,13 @@ The fake cannot check what only BigQuery knows: that it accepts the Arrow encodi
     )"
     ```
 
-2. Build the binaries and the plugin, and write a runtime config that loads only this connector:
+2. Build the runtime and the plugin from the root of this repository. Then write a runtime config that loads only this connector:
 
     ```bash
-    cargo build --bin iggy-server --bin iggy --bin iggy-connectors
-    cargo build -p iggy_connector_bigquery_sink
+    cargo build -p iggy-connectors -p iggy_connector_bigquery_sink
     mkdir -p /tmp/bq-sink-test/connectors
     sed 's#^config_dir = .*#config_dir = "/tmp/bq-sink-test/connectors"#' \
-      core/connectors/runtime/example_config/config.toml > /tmp/bq-sink-test/config.toml
+      runtime/example_config/config.toml > /tmp/bq-sink-test/config.toml
     cat > /tmp/bq-sink-test/connectors/bigquery.toml <<EOF
     type = "sink"
     key = "bigquery"
@@ -237,20 +236,19 @@ The fake cannot check what only BigQuery knows: that it accepts the Arrow encodi
     EOF
     ```
 
-3. Start the server, create the stream, then start the runtime:
+3. Start an Iggy server in Docker, as step 2 of the [quick start](../../README.md#quick-start) shows. Then create the stream and start the runtime:
 
     ```bash
-    IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy ./target/debug/iggy-server   # terminal 1
-    ./target/debug/iggy -u iggy -p iggy stream create demo_stream   # terminal 2
-    ./target/debug/iggy -u iggy -p iggy topic create demo_stream demo_topic 1 none
+    docker exec iggy iggy -u iggy -p iggy stream create demo_stream
+    docker exec iggy iggy -u iggy -p iggy topic create demo_stream demo_topic 1 none
     IGGY_CONNECTORS_CONFIG_PATH=/tmp/bq-sink-test/config.toml ./target/debug/iggy-connectors
     ```
 
-4. Produce a few messages, including one bad row (terminal 3):
+4. In a second terminal, produce a few messages, including one bad row:
 
     ```bash
-    ./target/debug/iggy -u iggy -p iggy message send demo_stream demo_topic '{"user_id": 1, "event": "signup", "amount": "9.99", "attrs": {"plan": "pro"}}'
-    ./target/debug/iggy -u iggy -p iggy message send demo_stream demo_topic '{"event": "no user id"}'
+    docker exec iggy iggy -u iggy -p iggy message send demo_stream demo_topic '{"user_id": 1, "event": "signup", "amount": "9.99", "attrs": {"plan": "pro"}}'
+    docker exec iggy iggy -u iggy -p iggy message send demo_stream demo_topic '{"event": "no user id"}'
     ```
 
 5. Check the rows, and look for the `dropped message` warning for the second message in the runtime log:

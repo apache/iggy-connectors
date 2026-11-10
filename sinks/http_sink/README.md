@@ -6,17 +6,14 @@ Consumes messages from Iggy streams and delivers them to any HTTP endpoint — w
 
 Send a JSON message through Iggy and see it arrive at an HTTP endpoint.
 
-**Prerequisites**: Docker running, project built (`cargo build` from repo root).
+**Prerequisites**: Docker running, project built (`cargo build` from repo root). Start an Iggy server in a container named `iggy`, as step 2 of the [quick start](../../README.md#quick-start) shows.
 
 ```bash
-# Start iggy-server (terminal 1)
-IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy ./target/debug/iggy-server
+# Create stream and topic with the CLI of the server image
+docker exec iggy iggy -u iggy -p iggy stream create demo_stream
+docker exec iggy iggy -u iggy -p iggy topic create demo_stream demo_topic 1 none
 
-# Create stream and topic
-./target/debug/iggy -u iggy -p iggy stream create demo_stream
-./target/debug/iggy -u iggy -p iggy topic create demo_stream demo_topic 1
-
-# Start a simple HTTP receiver (terminal 2)
+# Start a simple HTTP receiver (terminal 1)
 python3 -c "
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
@@ -60,11 +57,11 @@ url = "http://localhost:9090/ingest"
 batch_mode = "individual"
 TOML
 
-# Start connector (terminal 3)
+# Start connector (terminal 2)
 IGGY_CONNECTORS_CONFIG_PATH=/tmp/http-sink-test/config.toml ./target/debug/iggy-connectors
 
 # Send a message
-./target/debug/iggy -u iggy -p iggy message send demo_stream demo_topic '{"hello":"http"}'
+docker exec iggy iggy -u iggy -p iggy message send demo_stream demo_topic '{"hello":"http"}'
 ```
 
 Example receiver output (message IDs and timestamps vary):
@@ -794,13 +791,14 @@ max_payload_size_bytes = 52428800
 Unit tests (no external dependencies):
 
 ```bash
-cargo test -p iggy_connector_http_sink
+cargo nextest run -p iggy_connector_http_sink --lib
 ```
 
-Integration tests (requires Docker for WireMock container):
+Integration tests (requires Docker for WireMock container, and a test server from `./scripts/build-test-server.sh`):
 
 ```bash
-cargo test -p integration -- connectors::http::http_sink::
+cargo build -p iggy-connectors -p iggy_connector_http_sink
+cargo nextest run -p iggy_connector_http_sink --test http
 ```
 
 ## Delivery Semantics

@@ -1,0 +1,48 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Validate the bundled third-party licenses of the apache/iggy-connect image,
+# the only convenience binary of this repository, as ASF release policy
+# requires. Shared by the pre-merge gate (.github/workflows/_common.yml) and
+# the release gate (.github/workflows/publish.yml).
+
+name: validate-third-party-licenses
+description: Validate the bundled third-party licenses of the apache/iggy-connect image against the ASF accept list.
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Rust
+      uses: ./.github/actions/utils/setup-rust
+      with:
+        read-cache: "false"
+
+    - name: Install cargo-about
+      shell: bash
+      run: |
+        TARGET="$(uname -m)-unknown-linux-musl"
+        tarball="$(mktemp)"
+        # Staged to a file because curl --retry cannot rewind a pipe.
+        curl -sSfL --retry 5 --retry-all-errors -o "$tarball" \
+          "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz"
+        tar -xzf "$tarball" -C "$HOME/.cargo/bin" --strip-components=1 \
+          "cargo-about-0.9.0-${TARGET}/cargo-about"
+        rm -f "$tarball"
+
+    - name: Validate iggy-connect bundle
+      shell: bash
+      run: ./scripts/ci/third-party-licenses.sh --validate --manifest runtime/Cargo.toml

@@ -1,6 +1,6 @@
 ---
 name: connector-runtime
-description: Modify the Apache Iggy Connectors runtime (`core/connectors/runtime/`) - the host process that loads plugins, manages lifecycle, and bridges Apache Iggy streams to plugins via FFI. Use when changing plugin loading, the FFI dispatch, the sink/source manager, state storage, config providers, the HTTP control API, metrics, or transforms wiring. NOT for plugin code.
+description: Modify the Apache Iggy Connectors runtime (`runtime/`) - the host process that loads plugins, manages lifecycle, and bridges Apache Iggy streams to plugins via FFI. Use when changing plugin loading, the FFI dispatch, the sink/source manager, state storage, config providers, the HTTP control API, metrics, or transforms wiring. NOT for plugin code.
 ---
 
 # Modifying the Apache Iggy Connectors Runtime
@@ -189,7 +189,7 @@ New per-batch logging follows the same pattern. Default to `debug!`, upgrade to 
 
 ### Env-var overrides via `ConfigEnv` derive
 
-`SinkConfig`, `SourceConfig`, and inner structs derive `ConfigEnv` (`configs_derive::ConfigEnv`). Generates env-var addressability as `IGGY_CONNECTORS_<TYPE>_<KEY>_<FIELD>` for primitive fields. Used heavily by integration tests to inject testcontainer ports - see `core/integration/tests/connectors/fixtures/postgres/container.rs` for env-var constants. Mark new compound fields `#[config_env(skip)]`, leaf primitives `#[config_env(leaf)]`.
+`SinkConfig`, `SourceConfig`, and inner structs derive `ConfigEnv` (`configs_derive::ConfigEnv`). Generates env-var addressability as `IGGY_CONNECTORS_<TYPE>_<KEY>_<FIELD>` for primitive fields. Used heavily by integration tests to inject testcontainer ports - see `testing/src/postgres.rs` for env-var constants. Mark new compound fields `#[config_env(skip)]`, leaf primitives `#[config_env(leaf)]`.
 
 ### Versioning
 
@@ -224,7 +224,7 @@ All families labeled by `connector_key` + `connector_type` (histogram adds `stag
 - **Histograms**: `iggy_connector_stage_duration_seconds{stage}` (snake_case stage labels - `prepare`, `ffi`, `decode`, `iggy_send`, `state_save`, `total`). Buckets `STAGE_BUCKETS_SECONDS`. Always populated regardless of any flag. One sample per batch for every stage; `ffi` is summed over the batch's runs. Scraped at `/metrics` when `[http.metrics] enabled = true`.
 - **Gauges**: `iggy_connectors_{sources,sinks}_{total,running}`.
 
-`/stats` JSON surface mirrors counters per-connector via `ConnectorStats` (`sdk/api.rs`): `messages_filtered`, `errors`, kind-specific counters.
+`/stats` JSON surface mirrors counters per-connector via `ConnectorStats` (`sdk/src/api.rs`): `messages_filtered`, `errors`, kind-specific counters.
 
 When adding a metric:
 
@@ -270,16 +270,16 @@ Filter case bumps `messages_filtered` via `inc_messages_filtered_with_labels`. A
 cargo fmt --all
 cargo sort --no-format --workspace
 cargo clippy -p iggy-connectors --all-targets -- -D warnings
-cargo test -p iggy-connectors
+cargo nextest run -p iggy-connectors --bins
 
-# Sanity-build in-tree plugins:
-cargo build -p iggy_connector_stdout_sink -p iggy_connector_random_source
+# The runtime test targets launch target/debug/iggy-connectors and load these plugins:
+cargo build -p iggy-connectors -p iggy_connector_stdout_sink -p iggy_connector_random_source
 
-# Runtime-focused integration tests:
-cargo test -p integration -- connectors::runtime::
+# Unit + runtime integration tests (Docker, plus ./scripts/build-test-server.sh once per R):
+cargo nextest run -p iggy-connectors
 
 # Smoke-test with example config:
-IGGY_CONNECTORS_CONFIG_PATH=core/connectors/runtime/example_config/config.toml \
+IGGY_CONNECTORS_CONFIG_PATH=runtime/example_config/config.toml \
   cargo run --bin iggy-connectors
 ```
 

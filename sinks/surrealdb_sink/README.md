@@ -14,7 +14,7 @@ the same identities, but do not ensure that a failed batch will be delivered.
 
 ## Configuration
 
-From the matching Iggy checkout root, build the plugin:
+From the root of this repository, build the plugin:
 
 ```bash
 cargo build --release -p iggy_connector_surrealdb_sink
@@ -22,7 +22,7 @@ cargo build --release -p iggy_connector_surrealdb_sink
 
 Use the [sink guide](https://iggy.apache.org/docs/connectors/sinks/sink/) for the
 broker credentials and main runtime configuration. Save this connector entry in
-its connector directory and start the runtime from the checkout root. The
+its connector directory and start the runtime from the root of this repository. The
 [SurrealDB walkthrough](https://iggy.apache.org/docs/connectors/sinks/surrealdb/)
 includes local backend, Iggy CLI and SQL query commands.
 

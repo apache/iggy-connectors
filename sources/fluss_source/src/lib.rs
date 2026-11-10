@@ -43,6 +43,7 @@ source_connector!(FlussSource);
 const CONNECTOR_NAME: &str = "Apache Fluss source";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_PAUSE_AFTER_FAILED_POLL: Duration = Duration::from_secs(1);
 const LOG_TABLE_TYPE: &str = "log";
 const JSON_PAYLOAD_FORMAT: &str = "json";
 const METADATA_BUCKET: &str = "_fluss_bucket";
@@ -256,6 +257,17 @@ impl FlussSource {
             replay: Mutex::new(None),
             rewind_required: AtomicBool::new(false),
             start_offsets_unsaved: AtomicBool::new(false),
+        }
+    }
+
+    /// After a failed poll `poll()` waits at least [`MIN_PAUSE_AFTER_FAILED_POLL`]. The SDK
+    /// polls again as soon as `poll()` returns an error, so with a zero `poll_interval` an error
+    /// that repeats, such as an offset out of range, would be retried at network speed.
+    fn pause_before_poll(&self) -> Duration {
+        if self.rewind_required.load(Ordering::Acquire) {
+            self.poll_interval.max(MIN_PAUSE_AFTER_FAILED_POLL)
+        } else {
+            self.poll_interval
         }
     }
 
@@ -703,7 +715,7 @@ impl Source for FlussSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        sleep(self.poll_interval).await;
+        sleep(self.pause_before_poll()).await;
 
         let replayed = self.replay.lock().await.take();
         let records = match replayed {
@@ -1486,6 +1498,29 @@ mod tests {
             assert_eq!(committed.bucket_offsets.get(&0), Some(&13));
             assert_eq!(committed.messages_produced, 13);
         });
+    }
+
+    #[test]
+    fn given_failed_poll_when_poll_interval_is_zero_should_pause_before_the_next() {
+        let mut config = test_config();
+        config.poll_interval = Some("0s".to_owned());
+        let source = FlussSource::new(1, config, None);
+        assert_eq!(source.pause_before_poll(), Duration::ZERO);
+
+        source.rewind_required.store(true, Ordering::Release);
+
+        assert_eq!(source.pause_before_poll(), MIN_PAUSE_AFTER_FAILED_POLL);
+    }
+
+    #[test]
+    fn given_failed_poll_when_poll_interval_is_longer_should_keep_it() {
+        let mut config = test_config();
+        config.poll_interval = Some("5s".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        source.rewind_required.store(true, Ordering::Release);
+
+        assert_eq!(source.pause_before_poll(), Duration::from_secs(5));
     }
 
     fn field(name: &str) -> DataField {

@@ -176,7 +176,9 @@ impl Serialize for JsonField<'_> {
                 let decimal = row
                     .get_decimal(position, inner.precision() as usize, inner.scale() as usize)
                     .map_err(read_error)?;
-                serializer.collect_str(&decimal.to_big_decimal())
+                // `BigDecimal`'s `Display` writes a value with more than five zeros after the
+                // point, such as 0.00000012, as `1.2E-7`.
+                serializer.serialize_str(&decimal.to_big_decimal().to_plain_string())
             }
             DataType::Date(_) => {
                 let days = row.get_date(position).map_err(read_error)?.get_inner();
@@ -343,6 +345,28 @@ mod tests {
             .expect_err("A date chrono cannot hold should fail");
 
         assert!(error.to_string().contains("'shipped_on'"), "{error}");
+    }
+
+    #[test]
+    fn given_small_decimal_when_mapped_should_write_it_without_an_exponent() {
+        let fields = vec![
+            field("positive", DataTypes::decimal(10, 8)),
+            field("negative", DataTypes::decimal(10, 8)),
+        ];
+        let mut row = GenericRow::new(2);
+        row.set_field(
+            0,
+            Decimal::from_unscaled_long(12, 10, 8).expect("Failed to build decimal"),
+        );
+        row.set_field(
+            1,
+            Decimal::from_unscaled_long(-12, 10, 8).expect("Failed to build decimal"),
+        );
+
+        let object = to_json(&row, &fields);
+
+        assert_eq!(object["positive"], Value::from("0.00000012"));
+        assert_eq!(object["negative"], Value::from("-0.00000012"));
     }
 
     #[test]

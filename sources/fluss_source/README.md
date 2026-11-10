@@ -61,7 +61,7 @@ Bring up a local cluster with the [official Docker compose recipe](https://fluss
 | `TINYINT`, `SMALLINT`, `INT`, `BIGINT` | number |
 | `FLOAT`, `DOUBLE` | number, `null` when not finite |
 | `CHAR`, `STRING` | string |
-| `DECIMAL` | string, to keep the full precision |
+| `DECIMAL` | string without an exponent, to keep the full precision, `0.00000012` |
 | `DATE` | string, `2024-02-29` |
 | `TIME` | string, `12:34:56.789` |
 | `TIMESTAMP` | string without a timezone, `2023-11-14 22:13:20.123456` |

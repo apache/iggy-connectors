@@ -45,7 +45,6 @@ dashmap = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 opensearch = { workspace = true }
-rmp-serde = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -61,6 +60,7 @@ integration = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
+rmp-serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait"] }

@@ -66,7 +66,7 @@ fn base_config(url: &str) -> OpenSearchSourceConfig {
         polling_interval: Some("1ms".to_string()),
         batch_size: Some(10),
         timestamp_field: Some("timestamp".to_string()),
-        verbose_logging: false,
+        verbose_logging: None,
         max_retries: Some(1),
         retry_delay: Some("1ms".to_string()),
         retry_max_delay: Some("10ms".to_string()),

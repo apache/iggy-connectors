@@ -51,7 +51,7 @@ query = { match_all = {} }
 | `url` | required | OpenSearch base URL. |
 | `index` | required | Index name or pattern. `open()` fails for a name that does not exist. A pattern that matches nothing yet is accepted, and the connector waits for matching indices to appear. |
 | `timestamp_field` | required | Field used for sort order. It must be sortable in the index mapping. |
-| `username` / `password` | none | HTTP basic authentication, used only when both are set. |
+| `username` / `password` | none | HTTP basic authentication. Set both or neither: `open()` fails with `InvalidConfigValue` when only one is set. |
 | `query` | `match_all` | Query DSL object, applied on every poll. |
 | `polling_interval` | `10s` | Wait before each poll, so the first poll also waits. |
 | `tiebreaker_field` | `_id` | Unique `keyword` field with doc values that order document with the same timestamp and, when set, identifies them in message ids and in the state. The `opensearch.document_id` header always carries `_id`. |
@@ -90,6 +90,11 @@ event id) to avoid that. `open()` reads its mapping and fails with
 `InvalidConfigValue` when the field is missing from a matched index, is not a
 `keyword`, or has `doc_values` disabled. It cannot check that the values are
 unique, and documents that share a value can still be skipped.
+
+A pattern can match indices that appear after `open()`, and `open()` checks only the
+indices that exist then. Map the tie-breaker field as `keyword` with doc values in
+every future index too. A later index that lacks the mapping makes the search report
+a failed shard, so every poll fails until the mapping is fixed.
 
 `_id` is only unique within a shard. An index that uses custom routing can hold two
 documents with the same `_id` on different shards, and they then tie on every sort
@@ -205,6 +210,12 @@ again. A successful search resets it.
   with a `timestamp_field` strictly older than the watermark is not read until
   the state is reset. Only documents at the newest published timestamp are
   rescanned.
+- The rescan of the newest timestamp happens when a scan starts. While a scan
+  spans several full pages, as in a large backlog, it resumes after the last
+  document read. A document that becomes searchable in that window at the newest
+  published timestamp, with a tie-breaker value below the last one read, is
+  skipped once later pages move the watermark on. Documents that become
+  searchable late are found only when the connector is caught up.
 - Each scan re-reads the documents at the newest published timestamp and skips
   them, so a timestamp shared by many documents costs extra reads on every scan.
 - Only the whole `_source` is published, as JSON. There is no field projection.

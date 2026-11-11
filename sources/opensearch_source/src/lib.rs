@@ -97,6 +97,22 @@ struct State {
     scan_cursor: Option<Vec<Value>>,
 }
 
+impl State {
+    fn record_poll(
+        &mut self,
+        produced_count: usize,
+        last_poll_timestamp: Option<DateTime<Utc>>,
+        scan_cursor: Option<Vec<Value>>,
+    ) {
+        self.total_documents_published += produced_count;
+        self.poll_count += 1;
+        self.scan_cursor = scan_cursor;
+        if let Some(timestamp) = last_poll_timestamp {
+            self.last_poll_timestamp = Some(timestamp);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct HitKey {
     index: String,
@@ -120,8 +136,7 @@ pub struct OpenSearchSourceConfig {
     pub tiebreaker_field: Option<String>,
     /// Limit per HTTP request, from connecting to the last byte of the response body.
     pub request_timeout: Option<String>,
-    #[serde(default)]
-    pub verbose_logging: bool,
+    pub verbose_logging: Option<bool>,
     /// Total poll-phase attempt count (not retry count); 1 = no retries, 3 = 2 retries.
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
@@ -179,7 +194,7 @@ impl OpenSearchSource {
             parse_duration(config.polling_interval.as_deref(), DEFAULT_POLLING_INTERVAL);
         let request_timeout =
             parse_duration(config.request_timeout.as_deref(), DEFAULT_REQUEST_TIMEOUT);
-        let verbose = config.verbose_logging;
+        let verbose = config.verbose_logging.unwrap_or(false);
         let (restored_state, state_restore_error) =
             restore_state(id, state, &config_fingerprint(&config));
 
@@ -555,34 +570,32 @@ impl OpenSearchSource {
         &self,
         outcome: SearchOutcome,
     ) -> Result<(Vec<ProducedMessage>, Option<ConnectorState>), Error> {
-        let mut state = self.state.lock().await.clone();
-        state.total_documents_published += outcome.messages.len();
-        state.poll_count += 1;
-        let cursor_moved = outcome.last_sort.is_some();
-        if outcome.last_sort.is_some() {
-            state.last_sort = outcome.last_sort;
-            state.watermark_hits = outcome.watermark_hits;
-        }
-        state.scan_cursor = outcome.scan_cursor;
-        if let Some(timestamp) = outcome.last_poll_timestamp {
-            state.last_poll_timestamp = Some(timestamp);
-        }
-
-        let produced_count = outcome.messages.len();
-        let total_documents_published = state.total_documents_published;
-        let messages = outcome.messages;
+        let SearchOutcome {
+            messages,
+            last_sort,
+            watermark_hits,
+            scan_cursor,
+            last_poll_timestamp,
+        } = outcome;
+        let produced_count = messages.len();
         // A moved cursor waits for the batch result so a Nack can undo it, including a page
         // whose hits were all skipped for lacking `_source`. A poll that saw no hits has no
-        // cursor to protect, so its counters commit directly.
-        let persisted_state = if cursor_moved {
-            let persisted = self.serialize_state(&state).ok_or_else(|| {
+        // cursor to protect, so its counters commit directly and need no copy of the state.
+        let (persisted_state, total_documents_published) = if last_sort.is_some() {
+            let mut candidate = self.state.lock().await.clone();
+            candidate.record_poll(produced_count, last_poll_timestamp, scan_cursor);
+            candidate.last_sort = last_sort;
+            candidate.watermark_hits = watermark_hits;
+            let persisted = self.serialize_state(&candidate).ok_or_else(|| {
                 Error::Serialization("failed to serialize source state".to_string())
             })?;
-            *self.pending_state.lock().await = Some(state);
-            Some(persisted)
+            let total = candidate.total_documents_published;
+            *self.pending_state.lock().await = Some(candidate);
+            (Some(persisted), total)
         } else {
-            *self.state.lock().await = state;
-            None
+            let mut state = self.state.lock().await;
+            state.record_poll(produced_count, last_poll_timestamp, scan_cursor);
+            (None, state.total_documents_published)
         };
 
         if self.verbose {
@@ -801,6 +814,12 @@ fn validate_open_config(config: &OpenSearchSourceConfig) -> Result<(), Error> {
     if config.timestamp_field.as_deref().is_none_or(str::is_empty) {
         return Err(Error::InvalidConfigValue(
             "timestamp_field is required for incremental OpenSearch polling".to_string(),
+        ));
+    }
+
+    if config.username.is_some() != config.password.is_some() {
+        return Err(Error::InvalidConfigValue(
+            "username and password must be set together".to_string(),
         ));
     }
 
@@ -1045,7 +1064,7 @@ mod tests {
             polling_interval: Some("100ms".to_string()),
             batch_size: Some(10),
             timestamp_field: Some("timestamp".to_string()),
-            verbose_logging: false,
+            verbose_logging: None,
             max_retries: None,
             retry_delay: None,
             retry_max_delay: None,
@@ -1230,6 +1249,35 @@ mod tests {
         config.timestamp_field = None;
         let error = validate_open_config(&config).expect_err("missing timestamp_field");
         assert!(matches!(error, Error::InvalidConfigValue(_)));
+    }
+
+    #[test]
+    fn given_username_without_password_when_validate_should_fail() {
+        let mut config = test_config();
+        config.username = Some("user".to_string());
+
+        let error = validate_open_config(&config).expect_err("username alone");
+
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
+    }
+
+    #[test]
+    fn given_password_without_username_when_validate_should_fail() {
+        let mut config = test_config();
+        config.password = Some(SecretString::from("secret"));
+
+        let error = validate_open_config(&config).expect_err("password alone");
+
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
+    }
+
+    #[test]
+    fn given_username_and_password_when_validate_should_succeed() {
+        let mut config = test_config();
+        config.username = Some("user".to_string());
+        config.password = Some(SecretString::from("secret"));
+
+        validate_open_config(&config).expect("credentials set together");
     }
 
     #[test]

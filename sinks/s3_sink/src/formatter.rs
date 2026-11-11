@@ -19,7 +19,8 @@ use crate::OutputFormat;
 use crate::buffer::FileBuffer;
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, TopicMetadata, owned_value_into_serde_json,
+    ConsumedMessage, Error, HeaderName, MessagesMetadata, Payload, TopicMetadata,
+    owned_value_into_serde_json,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -128,7 +129,7 @@ fn serialize_headers(
 
     let mut obj = Map::new();
     for (key, value) in headers {
-        let key_str = key.as_str().unwrap_or("").to_string();
+        let key_str = HeaderName(key).to_string();
         let json_value = match value.kind() {
             HeaderKind::String => {
                 Value::String(String::from_utf8_lossy(&value.value()).into_owned())
@@ -227,6 +228,7 @@ pub(crate) fn finalize_buffer(buffer: &mut FileBuffer, format: OutputFormat) -> 
 mod tests {
     use super::*;
     use iggy_connector_sdk::Schema;
+    use iggy_connector_testing::headers::{header_case_map, header_cases};
     use std::collections::BTreeMap;
 
     fn make_json_payload(json_str: &str) -> Payload {
@@ -317,6 +319,35 @@ mod tests {
 
         assert!(value["headers"].is_object());
         assert_eq!(value["headers"]["content-type"], "application/json");
+    }
+
+    #[test]
+    fn json_lines_with_shared_header_cases_names_them_by_header_name() {
+        let cases = header_cases();
+        let mut msg = make_message(5, make_json_payload(r#"{"data":1}"#));
+        msg.headers = Some(header_case_map());
+
+        let bytes = format_message(
+            msg,
+            &make_topic_metadata(),
+            &make_messages_metadata(),
+            false,
+            true,
+            OutputFormat::JsonLines,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+
+        let headers = value["headers"].as_object().expect("headers are an object");
+        assert_eq!(headers.len(), cases.len());
+        for case in &cases {
+            assert_eq!(
+                headers.get(&case.expected_name),
+                Some(&Value::String(case.label.to_string())),
+                "case {}",
+                case.label
+            );
+        }
     }
 
     #[test]

@@ -49,7 +49,7 @@ use arrow::json::ReaderBuilder;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bigdecimal::{BigDecimal, Zero};
-use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, Payload, TopicMetadata};
+use iggy_connector_sdk::{ConsumedMessage, HeaderName, MessagesMetadata, Payload, TopicMetadata};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 use simd_json::{OwnedValue, StaticNode};
 
@@ -237,14 +237,17 @@ fn estimated_metadata_size(ctx: &RunContext<'_>, message: &ConsumedMessage) -> u
     })
 }
 
+/// A lower bound on the length of `headers_json`: the name and the value text
+/// of each header, without JSON quoting. A raw value counts its byte length,
+/// which its base64 text always exceeds.
 fn estimated_headers_size(message: &ConsumedMessage) -> usize {
     message.headers.as_ref().map_or(0, |headers| {
         headers.iter().fold(0usize, |size, (key, value)| {
             let value_size = value
                 .as_raw()
                 .map_or_else(|_| value.to_string_value().len(), |raw| raw.len());
-            size.saturating_add(key.to_string_value().len())
-                .saturating_add(value_size.saturating_mul(2))
+            size.saturating_add(HeaderName(key).to_string().len())
+                .saturating_add(value_size)
         })
     })
 }
@@ -1179,7 +1182,7 @@ fn headers_json(message: &ConsumedMessage, required: bool) -> Option<String> {
             }),
             Err(_) => serde_json::Value::String(value.to_string_value()),
         };
-        object.insert(key.to_string_value(), encoded);
+        object.insert(HeaderName(key).to_string(), encoded);
     }
     Some(serde_json::Value::Object(object).to_string())
 }
@@ -1405,6 +1408,7 @@ mod tests {
     };
     use iggy_common::{HeaderKey, HeaderValue};
     use iggy_connector_sdk::Schema as PayloadSchema;
+    use iggy_connector_testing::headers::{header_case_map, header_cases};
     use prost::Message;
 
     use super::*;
@@ -2125,5 +2129,50 @@ mod tests {
         let empty = message(2, Payload::Text("x".into()));
         assert_eq!(headers_json(&empty, false), None);
         assert_eq!(headers_json(&empty, true).as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn given_shared_header_cases_should_name_headers_by_header_name() {
+        let cases = header_cases();
+        let mut msg = message(1, Payload::Text("x".into()));
+        msg.headers = Some(header_case_map());
+
+        let text = headers_json(&msg, false).unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), cases.len());
+        for case in &cases {
+            assert_eq!(
+                object.get(&case.expected_name),
+                Some(&serde_json::json!(case.label)),
+                "case {}",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn given_headers_should_estimate_no_more_than_the_encoded_length() {
+        let raw_value = HeaderValue::try_from(&[0xffu8; 255][..]).unwrap();
+        let mut headers = header_case_map();
+        headers.insert(HeaderKey::from_str("blob").unwrap(), raw_value);
+        headers.insert(
+            HeaderKey::from_str("quoted").unwrap(),
+            HeaderValue::from_str("a \"quoted\" value").unwrap(),
+        );
+        for (key, value) in headers {
+            let mut msg = message(1, Payload::Text("x".into()));
+            msg.headers = Some(BTreeMap::from([(key.clone(), value)]));
+
+            let encoded = headers_json(&msg, false).unwrap();
+
+            assert!(
+                estimated_headers_size(&msg) <= encoded.len(),
+                "{key:?}: estimate {} exceeds encoded {}",
+                estimated_headers_size(&msg),
+                encoded.len()
+            );
+        }
     }
 }

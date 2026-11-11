@@ -21,11 +21,13 @@ use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
+use iggy_common::{HeaderKey, HeaderValue};
 use iggy_connector_sdk::api::ConnectorRuntimeStats;
 use iggy_connector_testing::create_test_messages;
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
@@ -292,4 +294,88 @@ async fn rejected_document_reports_runtime_error(
         !logs.contains("Successfully indexed"),
         "a rejected bulk write must not be logged as successful: {logs}"
     );
+}
+
+fn message_with_header(id: u128, key: &str, value: &str) -> IggyMessage {
+    let headers = BTreeMap::from([(
+        HeaderKey::try_from(key).expect("valid header key"),
+        HeaderValue::try_from(value).expect("valid header value"),
+    )]);
+    IggyMessage::builder()
+        .id(id)
+        .payload(Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"id": id as u64})).expect("serialize payload"),
+        ))
+        .user_headers(headers)
+        .build()
+        .expect("build message with header")
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/elasticsearch/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn elasticsearch_sink_stores_user_headers(
+    harness: &TestHarness,
+    fixture: ElasticsearchSinkFixture,
+) {
+    let client = harness.root_client().await.expect("root client");
+    let stream_id: Identifier = seeds::names::STREAM.try_into().expect("stream ID");
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().expect("topic ID");
+    let mut messages = vec![message_with_header(1, "a", "b")];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send message with header");
+
+    fixture
+        .wait_for_documents(1)
+        .await
+        .expect("wait for the document");
+    let search_result = fixture.search_documents().await.expect("search documents");
+
+    assert_eq!(
+        search_result.hits.hits[0].source["_iggy_headers"],
+        serde_json::json!({"a": {"data": "b", "data_encoding": "utf8"}})
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/elasticsearch/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn elasticsearch_sink_indexes_date_like_then_text_header_values(
+    harness: &TestHarness,
+    fixture: ElasticsearchSinkFixture,
+) {
+    let client = harness.root_client().await.expect("root client");
+    let stream_id: Identifier = seeds::names::STREAM.try_into().expect("stream ID");
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().expect("topic ID");
+    // Without the keyword template, the first value maps the field as a date
+    // and Elasticsearch rejects the second document.
+    let mut messages = vec![
+        message_with_header(1, "when", "2024-01-01"),
+        message_with_header(2, "when", "not a date"),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send messages with headers");
+
+    fixture
+        .wait_for_documents(2)
+        .await
+        .expect("both documents must index");
 }

@@ -235,7 +235,7 @@ Each implemented in at least one in-tree plugin or runtime path.
 ```text
 <repository root>
 ├── README.md
-├── Cargo.toml                   Workspace members, workspace deps, the core pin (R)
+├── Cargo.toml                   Workspace members, workspace deps, the core pin
 ├── runtime/
 │   ├── src/
 │   │   ├── main.rs              FFI structs (SinkApi, SourceApi), plugin path resolution

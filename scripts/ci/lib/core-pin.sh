@@ -17,20 +17,20 @@
 # under the License.
 
 # The root Cargo.toml pins every apache/iggy git dependency to one core
-# commit, R. These helpers read that pin from the manifest text, so they
-# work on a lone copy of the file and need no network. Each core dependency
-# is a one-line inline table that starts with its git key:
+# commit, the core pin. These helpers read that pin from the manifest text,
+# so they work on a lone copy of the file and need no network. Each core
+# dependency is a one-line inline table that starts with its git key:
 #
-#   iggy = { git = "https://github.com/apache/iggy", rev = "<R>", version = "<v>" }
+#   iggy = { git = "https://github.com/apache/iggy", rev = "<core-pin>", version = "<v>" }
 #
-# scripts/ci/check-r-pin.sh compares the result with the resolved graph.
+# scripts/ci/check-core-pin.sh compares the result with the resolved graph.
 
 CORE_GIT_URL="https://github.com/apache/iggy"
 CORE_DEPENDENCY_RE='^([A-Za-z0-9_-]+) = \{ *git = "https://github\.com/apache/iggy"[ ,}]'
 CORE_REV_RE='[{ ,]rev = "([^"]*)"'
 CORE_VERSION_RE='[{ ,]version = "([^"]*)"'
 # The published SDK depends on these core crates through crates.io, so the
-# workspace pins their version next to R. Each entry is
+# workspace pins their version next to the core pin. Each entry is
 # "<crate>:<directory in apache/iggy>:<tag prefix of its core release>",
 # with the tag prefix from tag_pattern in core's .github/config/publish.yml.
 # shellcheck disable=SC2034 # read by the scripts that source this file
@@ -60,8 +60,9 @@ core_dependencies() {
   done < "$manifest"
 }
 
-# Prints R. Fails unless every core dependency of manifest $1 uses the same
-# full commit hash, because a second rev builds a second copy of core.
+# Prints the core pin. Fails unless every core dependency of manifest $1
+# uses the same full commit hash, because a second rev builds a second copy
+# of core.
 core_rev() {
   local manifest=$1 revs
   revs=$(core_dependencies "$manifest" | cut -d' ' -f2 | sort -u)

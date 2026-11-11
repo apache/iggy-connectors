@@ -40,6 +40,7 @@ members = [
     "sources/http_source",
     "sources/influxdb_source",
     "sources/mqtt_source",
+    "sources/opensearch_source",
     "sources/postgres_source",
     "sources/random_source",
     "testing",
@@ -114,6 +115,7 @@ meilisearch-sdk = { version = "0.33.0", default-features = false, features = [
 ] }
 mimalloc = "0.1"
 mongodb = { version = "3.9.1", features = ["rustls-tls"] }
+opensearch = { version = "2.4.0", features = ["rustls-tls"], default-features = false }
 opentelemetry = { version = "0.33.1", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.33.1", features = ["log"] }
 opentelemetry-otlp = { version = "0.33.1", features = [

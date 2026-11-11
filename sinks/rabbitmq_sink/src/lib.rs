@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use iggy::prelude::HeaderKind;
 use iggy_connector_sdk::retry::retry_backoff;
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, HeaderName, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
 use lapin::{
     BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, ExchangeKind,
@@ -29,7 +29,7 @@ use lapin::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -63,6 +63,11 @@ pub struct RabbitMQSink {
     max_retry_delay: Duration,
     messages_published: AtomicU64,
     publish_errors: AtomicU64,
+    /// User headers skipped because their name exceeds the AMQP short-string
+    /// limit. `build_headers` runs once per publish attempt, so a retried
+    /// message counts again.
+    skipped_header_names: AtomicU64,
+    header_name_warned: AtomicBool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,6 +180,8 @@ impl RabbitMQSink {
             max_retry_delay: Duration::from_secs(config.max_retry_delay_secs.unwrap_or(5)),
             messages_published: AtomicU64::new(0),
             publish_errors: AtomicU64::new(0),
+            skipped_header_names: AtomicU64::new(0),
+            header_name_warned: AtomicBool::new(false),
         }
     }
 
@@ -392,7 +399,12 @@ impl RabbitMQSink {
             && !user_headers.is_empty()
         {
             for (key, value) in user_headers {
-                let name = ShortString::from(key.to_string_value());
+                let name = HeaderName(key).to_string();
+                let name_len = name.len();
+                let Ok(name) = ShortString::try_new(name) else {
+                    self.skip_long_header_name(message.offset, name_len);
+                    continue;
+                };
                 let amqp_value = match value.kind() {
                     HeaderKind::String => AMQPValue::LongString(value.to_string_value().into()),
                     _ => AMQPValue::ByteArray(ByteArray::from(value.as_bytes())),
@@ -419,6 +431,21 @@ impl RabbitMQSink {
             );
         }
         headers
+    }
+
+    fn skip_long_header_name(&self, offset: u64, name_len: usize) {
+        self.skipped_header_names.fetch_add(1, Ordering::Relaxed);
+        if self.header_name_warned.swap(true, Ordering::Relaxed) {
+            debug!(
+                "RabbitMQ sink ID: {} skips a user header at offset: {offset}, name length: {name_len} bytes",
+                self.id
+            );
+        } else {
+            warn!(
+                "RabbitMQ sink ID: {} skips a user header at offset: {offset}, because its name of {name_len} bytes exceeds the AMQP limit of 255. Later skips log at debug level, and the close summary counts them once per publish attempt.",
+                self.id
+            );
+        }
     }
 
     async fn reconnect(&self) -> Result<(), Error> {
@@ -515,9 +542,10 @@ impl Sink for RabbitMQSink {
     async fn close(&mut self) -> Result<(), Error> {
         let published = self.messages_published.load(Ordering::Relaxed);
         let errors = self.publish_errors.load(Ordering::Relaxed);
+        let skipped_header_names = self.skipped_header_names.load(Ordering::Relaxed);
         info!(
-            "RabbitMQ sink ID: {} processed {} messages with {} errors",
-            self.id, published, errors
+            "RabbitMQ sink ID: {} processed {} messages with {} errors, skipped_header_names: {} (per publish attempt)",
+            self.id, published, errors, skipped_header_names
         );
 
         if let Some(state) = self.state.get_mut().take() {
@@ -553,6 +581,7 @@ mod tests {
     use super::*;
     use iggy::prelude::{HeaderKey, HeaderValue};
     use iggy_connector_sdk::{Payload, Schema};
+    use iggy_connector_testing::headers::{LONG_RAW_KEY_CASE, header_case_map, header_cases};
     use std::str::FromStr;
 
     fn test_config() -> RabbitMQSinkConfig {
@@ -640,6 +669,66 @@ mod tests {
         assert!(matches!(
             inner.get(&ShortString::from("trace-id")),
             Some(AMQPValue::ByteArray(b)) if b.as_slice() == [0xDE, 0xAD, 0xBE, 0xEF]
+        ));
+    }
+
+    fn header_test_metadata() -> (TopicMetadata, MessagesMetadata) {
+        (
+            TopicMetadata {
+                stream: "test_stream".into(),
+                topic: "test_topic".into(),
+            },
+            MessagesMetadata {
+                partition_id: 0,
+                current_offset: 0,
+                schema: Schema::Json,
+            },
+        )
+    }
+
+    #[test]
+    fn given_shared_header_cases_when_build_headers_should_name_them_and_skip_long_names() {
+        let mut message = test_message(0);
+        message.headers = Some(header_case_map());
+        let mut config = test_config();
+        config.include_metadata = Some(false);
+        let sink = test_sink(config);
+        let (topic, metadata) = header_test_metadata();
+
+        let headers = sink.build_headers(&topic, &metadata, &message);
+
+        let inner = headers.inner();
+        let cases = header_cases();
+        assert_eq!(inner.len(), cases.len() - 1);
+        for case in cases.iter().filter(|case| case.label != LONG_RAW_KEY_CASE) {
+            let name = ShortString::try_new(case.expected_name.clone()).unwrap();
+            assert!(
+                matches!(
+                    inner.get(&name),
+                    Some(AMQPValue::LongString(value)) if value.as_bytes() == case.label.as_bytes()
+                ),
+                "case {}",
+                case.label
+            );
+        }
+        assert_eq!(sink.skipped_header_names.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn given_user_header_named_like_metadata_when_build_headers_should_keep_metadata() {
+        let mut message = test_message(0);
+        message.headers = Some(std::collections::BTreeMap::from([(
+            HeaderKey::from_str("iggy_stream").unwrap(),
+            HeaderValue::from_str("user value").unwrap(),
+        )]));
+        let sink = test_sink(test_config());
+        let (topic, metadata) = header_test_metadata();
+
+        let headers = sink.build_headers(&topic, &metadata, &message);
+
+        assert!(matches!(
+            headers.inner().get(&ShortString::from("iggy_stream")),
+            Some(AMQPValue::LongString(value)) if value.as_bytes() == b"test_stream"
         ));
     }
 

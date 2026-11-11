@@ -236,6 +236,8 @@ When `include_metadata = true` (default), payloads are wrapped:
 - **JSON/Text payloads**: JSON values are reserialized; text becomes a JSON string.
 - **Timestamps**: `iggy_timestamp` and optional `iggy_origin_timestamp` use Unix epoch microseconds.
 - **Optional metadata**: `include_checksum` and `include_origin_timestamp` default to false. Nonempty message headers are included as `iggy_headers`.
+- **Header names**: A string key keeps its own name. A string key that starts with `~` becomes `~string:<key>`, a string key that is not valid UTF-8 becomes `~string_b64:<base64url>`, and a key of any other kind becomes `~<kind>:<value>`, for example `~int32:1` or `~raw:AQI`. Earlier versions named a non-string key by its string form, so that `1` and `"1"` collided and raw keys used Rust Debug text.
+- **Header values**: A raw value is `{"data": "<base64>", "iggy_header_encoding": "base64"}`. Every other value is a string. A string value that is not valid UTF-8 is written with replacement characters.
 
 Set `include_metadata = false` to omit the envelope; payload formatting still follows the selected batch mode.
 

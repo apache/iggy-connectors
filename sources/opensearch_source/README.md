@@ -54,7 +54,7 @@ query = { match_all = {} }
 | `username` / `password` | none | HTTP basic authentication, used only when both are set. |
 | `query` | `match_all` | Query DSL object, applied on every poll. |
 | `polling_interval` | `10s` | Wait before each poll, so the first poll also waits. |
-| `tiebreaker_field` | `_id` | Unique `keyword` field with doc values that orders documents with the same timestamp and, when set, identifies them in message ids and in the state. The `opensearch.document_id` header always carries `_id`. |
+| `tiebreaker_field` | `_id` | Unique `keyword` field with doc values that order document with the same timestamp and, when set, identifies them in message ids and in the state. The `opensearch.document_id` header always carries `_id`. |
 | `batch_size` | `100` | Documents per search, `1` to `10000` (the OpenSearch default `max_result_window`). |
 | `request_timeout` | `30s` | Limit per HTTP request, from connecting to the last byte of the response. A timeout counts as a failed attempt and is retried. |
 | `max_retries` | `3` | Total HTTP attempts per search, not the number of retries. |

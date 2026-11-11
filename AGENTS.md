@@ -263,7 +263,7 @@ Created by the runtime or tests. Gitignored. Safe to delete to reset:
 
 ## Commits, PRs, releases
 
-- Conventional commits with scope: `feat(connectors): ...`. Subject <= 72 chars. Allowed types/scopes enforced by `.github/workflows/pr-title.yml`.
+- Conventional commits with scope: `feat(sink): ...`. Subject <= 72 chars. Allowed types/scopes enforced by `.github/workflows/pr-title.yml`.
 - Body: why before what. No bullet lists of files changed.
 - If a change has co-authors, add a `Co-authored-by` trailer for each.
 - The runtime ships only as the image `apache/iggy-connect`, tagged `connectors-X.Y.Z`. The SDK goes to crates.io, tagged `connectors-sdk-X.Y.Z`. Sinks and sources are `publish = false`.

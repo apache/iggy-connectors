@@ -203,13 +203,13 @@ to every change.
 
 Format: `type(scope): subject`
 
-**Good examples from this repo:**
+**Good examples:**
 
 ```none
-fix(connectors): tighten Iceberg sink redelivery skip and error mapping
-feat(connectors): deliver sink messages at least once
-fix(connectors): honor Retry-After on every retried status
-feat(connectors): add MQTT source connector
+fix(sink): tighten Iceberg sink redelivery skip and error mapping
+feat(runtime): deliver sink messages at least once
+fix(sdk): honor Retry-After on every retried status
+feat(source): add MQTT source connector
 ```
 
 Keep subject under 72 chars. Put the details in the body. The allowed types and scopes are in

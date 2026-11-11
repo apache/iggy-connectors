@@ -52,11 +52,10 @@ jobs:
             repo
             deps
           # sink, source, runtime, sdk and testing name the sinks/, sources/,
-          # runtime/, sdk/ and testing/ directories. connectors fits any
-          # connector change. The other scopes are the same as in apache/iggy.
+          # runtime/, sdk/ and testing/ directories. The other scopes are the
+          # same as in apache/iggy.
           scopes: |
             ci
-            connectors
             deps
             deps-dev
             docs

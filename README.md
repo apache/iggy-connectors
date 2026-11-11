@@ -2,7 +2,7 @@
 
 Connectors move data between [Apache Iggy](https://github.com/apache/iggy) streams and external systems. A source reads data from an external system and produces messages to an Iggy stream. A sink consumes messages from an Iggy stream and writes them to an external system. Each connector is a Rust plugin, and the connectors runtime loads the plugins and runs them.
 
-This repository holds the runtime, the plugin SDK, 17 sinks and 6 sources. The connectors started in apache/iggy and moved here with their git history. The Iggy server, the client SDKs, the CLI and the Web UI stay in apache/iggy.
+This repository holds the runtime, the plugin SDK, 18 sinks and 6 sources. The connectors started in apache/iggy and moved here with their git history. The Iggy server, the client SDKs, the CLI and the Web UI stay in apache/iggy.
 
 [Documentation](https://iggy.apache.org/docs/connectors/introduction) | [Apache Iggy](https://github.com/apache/iggy) | [Discussions](https://github.com/apache/iggy-connectors/discussions) | [Discord](https://discord.gg/apache-iggy) | [Docker image](https://hub.docker.com/r/apache/iggy-connect)
 
@@ -197,6 +197,7 @@ A `Sink` implementation uses the `sink_connector!` macro, which exposes the FFI 
 | [RabbitMQ](sinks/rabbitmq_sink/README.md)           | RabbitMQ exchanges, through AMQP 0.9.1                                  |
 | [Amazon Redshift](sinks/redshift_sink/README.md)    | Redshift tables, with Parquet files in S3 as the staging area           |
 | [Amazon S3](sinks/s3_sink/README.md)                | Amazon S3 and S3-compatible stores (MinIO, R2, B2, DigitalOcean Spaces) |
+| [ScopeDB](sinks/scopedb_sink/README.md)             | ScopeDB tables, with mapped columns or raw payloads                     |
 | [Stdout](sinks/stdout_sink/README.md)               | the standard output, for debugging and development                      |
 | [SurrealDB](sinks/surrealdb_sink/README.md)         | SurrealDB, with deterministic record IDs for an idempotent replay       |
 

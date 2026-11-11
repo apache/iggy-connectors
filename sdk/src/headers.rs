@@ -138,8 +138,12 @@ impl Serialize for JsonHeaderValue<'_> {
     }
 }
 
-/// The `data` text of one header value.
-struct HeaderData<'a>(&'a HeaderValue);
+/// The `data` text of one header value, as [`JsonHeaderValue`] writes it.
+///
+/// A sink that writes header values in its own shape uses this for the text,
+/// and [`JsonHeaderValue::data_encoding`] to tell base64 from plain text.
+#[derive(Debug, Clone, Copy)]
+pub struct HeaderData<'a>(pub &'a HeaderValue);
 
 impl Display for HeaderData<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

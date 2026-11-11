@@ -115,14 +115,14 @@ jobs:
 
       - name: Wait for iggy_common to be available
         if: inputs.dry_run == false
-        uses: apache/iggy/.github/actions/utils/wait-for-crate@167dcd1fe088aa945928c7a9f55b31255170cb97
+        uses: apache/iggy/.github/actions/utils/wait-for-crate@fe822af6bef32a2630f70688756618d2b3d060e5
         with:
           package: iggy_common
           version: ${{ steps.versions.outputs.iggy_common }}
 
       - name: Wait for iggy to be available
         if: inputs.dry_run == false
-        uses: apache/iggy/.github/actions/utils/wait-for-crate@167dcd1fe088aa945928c7a9f55b31255170cb97
+        uses: apache/iggy/.github/actions/utils/wait-for-crate@fe822af6bef32a2630f70688756618d2b3d060e5
         with:
           package: iggy
           version: ${{ steps.versions.outputs.iggy }}
@@ -151,14 +151,14 @@ jobs:
       # The tag goes out only after crates.io serves the new version.
       - name: Wait for iggy_connector_sdk to be available
         if: inputs.dry_run == false
-        uses: apache/iggy/.github/actions/utils/wait-for-crate@167dcd1fe088aa945928c7a9f55b31255170cb97
+        uses: apache/iggy/.github/actions/utils/wait-for-crate@fe822af6bef32a2630f70688756618d2b3d060e5
         with:
           package: iggy_connector_sdk
           version: ${{ steps.versions.outputs.sdk }}
 
       - name: Tag iggy_connector_sdk
         if: inputs.dry_run == false && inputs.skip_tag_creation == false
-        uses: apache/iggy/.github/actions/utils/create-git-tag@167dcd1fe088aa945928c7a9f55b31255170cb97
+        uses: apache/iggy/.github/actions/utils/create-git-tag@fe822af6bef32a2630f70688756618d2b3d060e5
         with:
           tag: ${{ steps.versions.outputs.sdk_tag }}
           commit: ${{ steps.resolve.outputs.commit }}

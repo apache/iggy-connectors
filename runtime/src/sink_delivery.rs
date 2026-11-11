@@ -1396,13 +1396,8 @@ mod tests {
     async fn given_a_partition_with_a_new_history_when_read_should_stop_instead_of_skipping() {
         let plugin_id = plugin(&[], &[]);
         let mut log = FakeLog::json(&[(0, 3)]);
-        log.errors.push_back(ReadError {
-            partition_id: Some(0),
-            error: IggyError::HistoryUnavailable,
-            skip: None,
-            offset: None,
-            record: None,
-        });
+        log.errors
+            .push_back(ReadError::new(Some(0), IggyError::HistoryUnavailable));
 
         let result = deliver_all(plugin_id, &mut log, test_delivery()).await;
 

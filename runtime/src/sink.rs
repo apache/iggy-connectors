@@ -1917,12 +1917,10 @@ mod tests {
         let plugin_id = next_plugin_id();
         let metrics = Arc::new(Metrics::init());
         let skip = PollingStrategy::offset(UNDECODED_OFFSET + 1);
-        let stopped = |partition_id, error, skip| ReadError {
-            partition_id: Some(partition_id),
-            error,
-            skip,
-            offset: None,
-            record: None,
+        let stopped = |partition_id, error, skip| {
+            let mut read_error = ReadError::new(Some(partition_id), error);
+            read_error.skip = skip;
+            read_error
         };
         let mut messages = FakeMessages::new(futures::stream::iter([
             Err(stopped(
@@ -1978,7 +1976,6 @@ mod tests {
         let topic = Identifier::named("test_topic").expect("valid topic name");
         let refusals = [
             IggyError::Unauthorized,
-            IggyError::ConsumerGroupPartitionNotOwned(1, 2),
             IggyError::FeatureUnavailable,
             IggyError::InvalidCommand,
             IggyError::PartitionNotFound(3, stream.clone(), topic.clone()),
@@ -1990,13 +1987,7 @@ mod tests {
         let count = refusals.len();
         let stops = (1..)
             .zip(refusals)
-            .map(|(partition_id, error)| ReadError {
-                partition_id: Some(partition_id),
-                error,
-                skip: None,
-                offset: None,
-                record: None,
-            })
+            .map(|(partition_id, error)| ReadError::new(Some(partition_id), error))
             .map(Err::<iggy::prelude::ReceivedMessage, _>);
         let mut messages = FakeMessages::new(futures::stream::iter(stops));
 
@@ -2018,33 +2009,19 @@ mod tests {
         let plugin_id = next_plugin_id();
         let metrics = Arc::new(Metrics::init());
         let mut messages = FakeMessages::new(futures::stream::iter([
-            Err(ReadError {
-                partition_id: None,
-                error: IggyError::Disconnected,
-                skip: None,
-                offset: None,
-                record: None,
-            }),
-            Err(ReadError {
-                partition_id: Some(1),
-                error: IggyError::TransientNotAccepted,
-                skip: None,
-                offset: None,
-                record: None,
-            }),
-            Err(ReadError {
-                partition_id: None,
-                error: IggyError::Unauthorized,
-                skip: None,
-                offset: None,
-                record: None,
-            }),
+            Err(ReadError::new(None, IggyError::Disconnected)),
+            Err(ReadError::new(Some(1), IggyError::TransientNotAccepted)),
+            Err(ReadError::new(None, IggyError::Unauthorized)),
+            Err(ReadError::new(
+                Some(2),
+                IggyError::ConsumerGroupPartitionNotOwned(1, 2),
+            )),
         ]));
 
         consume_reads(plugin_id, &mut messages, &metrics).await;
 
         assert_eq!(messages.calls, []);
-        assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 3);
+        assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 4);
     }
 
     #[tokio::test]
@@ -2053,13 +2030,10 @@ mod tests {
         let plugin_id = next_plugin_id();
         let mut messages = FakeMessages {
             abandon: Err(IggyError::FeatureUnavailable),
-            ..FakeMessages::new(futures::stream::iter([Err(ReadError {
-                partition_id: Some(1),
-                error: IggyError::FetchProgressUncertain(OPERATION),
-                skip: None,
-                offset: None,
-                record: None,
-            })]))
+            ..FakeMessages::new(futures::stream::iter([Err(ReadError::new(
+                Some(1),
+                IggyError::FetchProgressUncertain(OPERATION),
+            ))]))
         };
 
         consume_reads(plugin_id, &mut messages, &Arc::new(Metrics::init())).await;
@@ -2078,12 +2052,11 @@ mod tests {
     async fn given_a_lost_fetch_of_two_partitions_when_resuming_should_warn_once_per_partition() {
         const OPERATION: u64 = 7;
         let plugin_id = next_plugin_id();
-        let lost = |partition_id| ReadError {
-            partition_id: Some(partition_id),
-            error: IggyError::FetchProgressUncertain(OPERATION),
-            skip: None,
-            offset: None,
-            record: None,
+        let lost = |partition_id| {
+            ReadError::new(
+                Some(partition_id),
+                IggyError::FetchProgressUncertain(OPERATION),
+            )
         };
         let mut messages = FakeMessages::new(futures::stream::iter([Err(lost(1)), Err(lost(2))]));
         let warnings = Arc::new(AtomicUsize::new(0));

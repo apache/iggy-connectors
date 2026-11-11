@@ -2,7 +2,7 @@
 
 Connectors move data between [Apache Iggy](https://github.com/apache/iggy) streams and external systems. A source reads data from an external system and produces messages to an Iggy stream. A sink consumes messages from an Iggy stream and writes them to an external system. Each connector is a Rust plugin, and the connectors runtime loads the plugins and runs them.
 
-This repository holds the runtime, the plugin SDK, 17 sinks and 6 sources. The connectors started in apache/iggy and moved here with their git history. The Iggy server, the client SDKs, the CLI and the Web UI stay in apache/iggy.
+This repository holds the runtime, the plugin SDK, the sinks and the sources. The connectors started in apache/iggy and moved here with their git history. The Iggy server, the client SDKs, the CLI and the Web UI stay in apache/iggy.
 
 [Documentation](https://iggy.apache.org/docs/connectors/introduction) | [Apache Iggy](https://github.com/apache/iggy) | [Discussions](https://github.com/apache/iggy-connectors/discussions) | [Discord](https://discord.gg/apache-iggy) | [Docker image](https://hub.docker.com/r/apache/iggy-connect)
 

@@ -159,7 +159,9 @@ impl TestFixture for OpenSearchSourceTransientErrorFixture {
     }
 }
 
-/// Wiremock-backed fixture: every search returns `500` with a low circuit-breaker threshold.
+/// Wiremock-backed fixture: every search returns `500`, and a low circuit-breaker threshold
+/// makes the breaker open while the source must stay `Running`. The pause itself is covered by
+/// the unit test `given_circuit_breaker_open_when_poll_should_return_empty_without_error`.
 pub struct OpenSearchSourceCircuitBreakerFixture {
     mock_server: MockServer,
 }

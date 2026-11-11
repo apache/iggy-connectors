@@ -579,8 +579,9 @@ impl OpenSearchSource {
         } = outcome;
         let produced_count = messages.len();
         // A moved cursor waits for the batch result so a Nack can undo it, including a page
-        // whose hits were all skipped for lacking `_source`. A poll that saw no hits has no
-        // cursor to protect, so its counters commit directly and need no copy of the state.
+        // whose hits were all skipped for lacking `_source`. A poll that found nothing new to
+        // publish or skip has no cursor to protect, so its counters commit directly and need no
+        // copy of the state.
         let (persisted_state, total_documents_published) = if last_sort.is_some() {
             let mut candidate = self.state.lock().await.clone();
             candidate.record_poll(produced_count, last_poll_timestamp, scan_cursor);

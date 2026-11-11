@@ -30,6 +30,8 @@ schema = "json"
 batch_length = 1000
 linger_time = "5ms"
 
+# Resilience fixtures override max_retries, max_open_retries and the circuit breaker
+# settings with environment variables, which take precedence over this file.
 [plugin_config]
 url = "http://localhost:9200"
 index = "resilience_test"

@@ -4,10 +4,10 @@ Polls documents from an OpenSearch index and publishes each one to an Iggy
 topic as a JSON message. The connector is read-only: it never writes to
 OpenSearch.
 
-Progress is tracked by a watermark: the sort position of the newest published
-document, ordered by `(timestamp_field, tiebreaker_field, _index)`. The
-connectors runtime saves it, so a restart resumes from the last acknowledged
-batch. See [How polling works](#how-polling-works) for what that means for
+Progress is tracked by a watermark: the timestamp of the newest published
+document, saved together with that document's full sort tuple
+`(timestamp_field, tiebreaker_field, _index)`. The connectors runtime saves it,
+so a restart resumes from the last acknowledged batch. See [How polling works](#how-polling-works) for what that means for
 documents that appear late.
 
 ## Configuration
@@ -54,13 +54,13 @@ query = { match_all = {} }
 | `username` / `password` | none | HTTP basic authentication. Set both or neither: `open()` fails with `InvalidConfigValue` when only one is set. |
 | `query` | `match_all` | Query DSL object, applied on every poll. |
 | `polling_interval` | `10s` | Wait before each poll, so the first poll also waits. |
-| `tiebreaker_field` | `_id` | Unique `keyword` field with doc values that order document with the same timestamp and, when set, identifies them in message ids and in the state. The `opensearch.document_id` header always carries `_id`. |
+| `tiebreaker_field` | `_id` | Unique `keyword` field with doc values that orders documents with the same timestamp and, when set, identifies them in message ids and in the state. The `opensearch.document_id` header carries `_id`, not this value, within the header size limit below. |
 | `batch_size` | `100` | Documents per search, `1` to `10000` (the OpenSearch default `max_result_window`). |
 | `request_timeout` | `30s` | Limit per HTTP request, from connecting to the last byte of the response. A timeout counts as a failed attempt and is retried. |
 | `max_retries` | `3` | Total HTTP attempts per search, not the number of retries. |
-| `retry_delay` | `1s` | Base delay for exponential backoff. |
+| `retry_delay` | `1s` | Base delay for exponential backoff, in `open()` as well as in polls. |
 | `retry_max_delay` | `30s` | Backoff cap. |
-| `max_open_retries` | `5` | Total attempts for the index check in `open()`. |
+| `max_open_retries` | `5` | Total attempts for each check in `open()`: the index check and, when `tiebreaker_field` is set, the mapping check. |
 | `open_retry_max_delay` | `30s` | Backoff cap during `open()`. |
 | `circuit_breaker_threshold` | `5` | Consecutive failed polls before the breaker opens. |
 | `circuit_breaker_cool_down` | `60s` | How long polls are skipped while the breaker is open. |
@@ -81,7 +81,8 @@ the newest published timestamp (the watermark) and skips the hits it already
 published there. A document that becomes searchable after the scan passed it
 (another shard refreshed later, or a bulk request still being indexed) is
 therefore found when it has the same timestamp as the newest published document,
-even if its tie-breaker value sorts before the ones already read.
+even if its tie-breaker value sorts before the ones already read. The Limits
+section describes the one case this does not cover.
 
 `_id` has no doc values, so OpenSearch sorts on it through heap-backed fielddata,
 and a cluster with `indices.id_field_data.enabled=false` rejects the sort. Set
@@ -123,14 +124,16 @@ For every hit:
 - `origin_timestamp` is left unset, so Iggy records the ingestion time. The
   document timestamp only feeds `last_poll_timestamp` in the state, and only when
   `timestamp_field` (a dotted path is followed through nested objects) holds an
-  RFC 3339 string or an integer (above `1e12` means milliseconds, otherwise
-  seconds).
+  RFC 3339 string or an integer (a magnitude above `1e12` means milliseconds,
+  otherwise seconds).
 
 Two cases do not produce a message. A hit without `_source` (for example an
-index mapped with `"_source": false`) is skipped with a warning and counted as
-published, so later scans do not warn about it again. A hit without a sort tuple
-or tie-breaker value (`_id` by default) fails the poll with `SchemaMismatch` and the state stays put, since
-that means the results cannot be paginated or told apart.
+index mapped with `"_source": false`) is skipped with a warning. It is recorded
+at the watermark like a published hit, so later scans do not warn about it
+again, but it does not add to the document counter. A hit without a sort tuple
+or tie-breaker value (`_id` by default) fails the poll with `SchemaMismatch` and
+the watermark stays put, since that means the results cannot be paginated or
+told apart.
 
 ## Delivery and state
 
@@ -139,9 +142,8 @@ state. The runtime sends the batch, saves the state and reports the result:
 the connector adopts the candidate on `Ack` and drops it on `Nack`, so a
 rejected batch is fetched again. The SDK stops the source after five
 consecutive `Nack`s and reports it as `Error`; restart the connector to resume.
-If the batch reached Iggy but the state save
-failed, the batch is replayed as well. Consumers should dedupe on the message
-`id`.
+If the batch reached Iggy but the state save failed, the batch is replayed as
+well. Consumers should dedupe on the message `id`.
 
 A page where every new hit lacks `_source` publishes nothing, but the watermark
 still moves, so it goes through the same `Ack` and `Nack` handling and is saved
@@ -149,22 +151,26 @@ by the runtime. A poll that finds nothing new (no hits, or only hits published
 before) leaves the watermark alone and is counted directly.
 
 The state holds the sort tuple of the newest published hit (its first element is
-the watermark), the `(index, tie-breaker value)` of every published hit at that watermark,
-`last_poll_timestamp` (informational only), document and poll counters, the error count, and a fingerprint of `index`,
-`timestamp_field` and `query`. The list of hits at the watermark is capped at
-10,000. If more documents than that share the newest timestamp, the poll fails
-with `SchemaMismatch` and the state stays put; use a `timestamp_field` with a
+the watermark), the `(index, tie-breaker value)` of every published hit at that
+watermark, `last_poll_timestamp` (informational only), document and poll
+counters, the error count, and a fingerprint of `index`, `timestamp_field` and
+`query`. The list of hits at the watermark is capped at 10,000. If more
+documents than that share the newest timestamp, the poll fails with
+`SchemaMismatch` and the watermark stays put; use a `timestamp_field` with a
 finer resolution. After a restart the first scan starts from the watermark, so
 the hits at that timestamp are read again and skipped. A corrupt saved state
 makes `open()` fail with `InitError` instead of silently restarting from the
-first document. So does a state saved under another `index`, `timestamp_field` or
-`query`, because its watermark would skip documents. Delete the state file to
-start from the beginning.
+first document. So does a state that holds a watermark and was saved under
+another `index`, `timestamp_field` or `query`, because that watermark would skip
+documents. A state saved without a fingerprint is accepted. To start from the
+beginning, delete the saved state: with the default file storage, the
+`source_<key>.state` file in the runtime `[state] path` directory.
 
 With no saved state the connector starts at the beginning of the index and
-republishes everything. If you lose the runtime state file, keep `state_path` on
-durable storage, rely on the message `id` downstream, or bound the rescan with a
-time-window `query`.
+republishes everything. If you lose the runtime state, keep the runtime
+`[state] path` directory on durable storage (or use the `http` state storage),
+rely on the message `id` downstream, or bound the rescan with a time-window
+`query`.
 
 ## Failures and retries
 
@@ -178,7 +184,8 @@ partial page could omit documents that sort before its last hit, and the
 watermark would pass them for good.
 
 After the retry budget is spent the poll fails. Network errors and `429`/`5xx`
-failures count toward the circuit breaker; permanent errors do not, because
+failures, and responses that report a timeout or failed shards, count toward
+the circuit breaker; permanent errors do not, because
 pausing polls cannot fix a bad query or mapping and the error should stay
 visible. While the breaker is open, `poll()` logs a warning, sleeps
 `polling_interval` and returns an empty batch without touching the state. After
@@ -187,8 +194,8 @@ again. A successful search resets it.
 
 | Error | Raised when |
 | --- | --- |
-| `InitError` | Corrupt saved state, missing index or unreachable cluster in `open()`. |
-| `InvalidConfigValue` | Invalid `url`, missing `timestamp_field`, `batch_size` outside `1..=10000`, a `query` that is not an object, an empty `tiebreaker_field`, or a `tiebreaker_field` that is not a keyword with doc values in every matched index. |
+| `InitError` | In `open()`: a corrupt saved state or one saved for another `index`, `timestamp_field` or `query`, a failed index check (missing index, other status, unreachable cluster), an unreadable `tiebreaker_field` mapping, or a client that cannot be built. |
+| `InvalidConfigValue` | Invalid `url`, missing `timestamp_field`, only one of `username` and `password`, `batch_size` outside `1..=10000`, a `query` that is not an object, an empty `tiebreaker_field`, or a `tiebreaker_field` that is not a keyword with doc values in every matched index. |
 | `Connection` | Network failure during a search. |
 | `HttpRequestFailed` | `429` or `5xx` after the retries are used up, or a search that timed out or failed on some shards. |
 | `PermanentHttpError` | Other `4xx`, or a search response that cannot be parsed. |
@@ -226,7 +233,7 @@ again. A successful search resets it.
 | Symptom | Check |
 | --- | --- |
 | `open()` fails on a missing index | Index name, URL and credentials. |
-| `open()` fails with `state restore failed` | Repair or delete the runtime state file. A state saved for another `index`, `timestamp_field` or `query` also fails this way: delete the state file to start from the beginning. |
+| `open()` fails with `state restore failed` | Repair or delete the saved state. A state saved for another `index`, `timestamp_field` or `query` also fails this way: delete it to start from the beginning. |
 | Nothing new after a restart | `timestamp_field` mapping must match the indexed documents. |
 | Duplicate messages | Expected after a `Nack` or a failed state save. Dedupe on the message `id`. |
 | Repeated warnings about `_source` | The index disables `_source`, so those hits are skipped. |

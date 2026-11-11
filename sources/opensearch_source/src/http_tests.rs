@@ -195,7 +195,7 @@ async fn given_empty_search_when_poll_should_count_empty_poll_and_stage_nothing(
 }
 
 #[tokio::test]
-async fn given_search_after_cursor_when_second_poll_should_request_next_page() {
+async fn given_page_shorter_than_batch_when_polling_again_should_restart_at_the_watermark() {
     let request_count = Arc::new(AtomicUsize::new(0));
     let captured_bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let count = request_count.clone();
@@ -236,7 +236,10 @@ async fn given_search_after_cursor_when_second_poll_should_request_next_page() {
     let bodies = captured_bodies.lock().await;
     assert_eq!(bodies.len(), 2);
     assert!(bodies[0].get("search_after").is_none());
-    assert!(bodies[1].get("search_after").is_some());
+    assert_eq!(
+        bodies[1]["search_after"],
+        json!(["2024-01-01T00:00:00Z", "", ""])
+    );
 
     let (fetched, _, _) = source.test_metrics().await;
     assert_eq!(fetched, 2);

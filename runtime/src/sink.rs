@@ -645,6 +645,11 @@ impl SinkTask {
 /// about half a minute at the default interval, plus one warning and one error count here. The
 /// sink starts at `Next`, so `Next` is where it reads on. The reader retries any other error by
 /// itself.
+///
+/// The report of a lost range comes before the batch after that range, and a seek drops that
+/// batch. A seek to the `skip` of the report stores the offset before the batch, so the sink
+/// reads it again. That seek writes an offset, which fails for a partition that the reader
+/// stopped for refusals or a new history. The sink then resumes it at `Next` and loses the batch.
 async fn handle_read_error(
     messages: &mut impl SinkMessages,
     error: ReadError,
@@ -656,6 +661,17 @@ async fn handle_read_error(
         .await
     {
         Some(StoppedRead::Abandoned(partition_id) | StoppedRead::Refused(partition_id)) => {
+            (partition_id, PollingStrategy::next())
+        }
+        Some(StoppedRead::Lost { partition_id, skip }) => {
+            if let Some(skip) = skip {
+                match messages.seek(partition_id, skip).await {
+                    Ok(()) => return,
+                    Err(seek_error) => warn!(
+                        "Failed to read on after the lost offsets of partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic}: {seek_error}. It resumes after its stored offset."
+                    ),
+                }
+            }
             (partition_id, PollingStrategy::next())
         }
         Some(StoppedRead::Undecodable { partition_id, skip }) => {
@@ -685,6 +701,12 @@ async fn handle_read_error(
 pub(crate) enum StoppedRead {
     /// A read with an unknown outcome blocked the partition, and its operation was abandoned.
     Abandoned(u32),
+    /// The reader could not read again the messages that a lost read committed, and `skip`
+    /// reads on after them. The report does not say whether the reader stopped the partition.
+    Lost {
+        partition_id: u32,
+        skip: Option<PollingStrategy>,
+    },
     /// The reader stopped at a message that does not decode, and `skip` reads on after it.
     Undecodable {
         partition_id: u32,
@@ -706,6 +728,20 @@ pub(crate) async fn stopped_read(
     topic_metadata: &TopicMetadata,
 ) -> Option<StoppedRead> {
     let TopicMetadata { stream, topic } = topic_metadata;
+    // This report also carries `FetchProgressUncertain`, but the reader already abandoned its
+    // operation.
+    if let (Some(partition_id), Some(lost)) = (error.partition_id, &error.lost) {
+        warn!(
+            "Partition: {partition_id} of sink connector with ID: {plugin_id} from stream: {stream}, topic: {topic} lost offsets: {} to {}, which a lost read committed and the reader could not read again. {}",
+            lost.start(),
+            lost.end(),
+            error.error
+        );
+        return Some(StoppedRead::Lost {
+            partition_id,
+            skip: error.skip,
+        });
+    }
     match (error.partition_id, &error.error, error.skip) {
         (
             Some(partition_id),
@@ -1318,6 +1354,7 @@ mod tests {
     use iggy_connector_sdk::transforms::{ProtoConvert, ProtoConvertConfig};
     use iggy_connector_sdk::{Error, Payload};
     use prost::Message as _;
+    use std::ops::RangeInclusive;
     use std::sync::LazyLock;
     use std::sync::atomic::{AtomicU32, AtomicUsize};
     use tracing::{Level, Subscriber};
@@ -1643,6 +1680,7 @@ mod tests {
     struct FakeMessages<S> {
         reads: S,
         abandon: Result<(), IggyError>,
+        seek: Result<(), IggyError>,
         calls: Vec<Recovery>,
     }
 
@@ -1651,6 +1689,7 @@ mod tests {
             Self {
                 reads,
                 abandon: Ok(()),
+                seek: Ok(()),
                 calls: Vec::new(),
             }
         }
@@ -1702,7 +1741,7 @@ mod tests {
             start: PollingStrategy,
         ) -> Result<(), IggyError> {
             self.calls.push(Recovery::Seek(partition_id, start));
-            Ok(())
+            self.seek.clone()
         }
 
         fn offsets(&self) -> NoOffsets {
@@ -2080,6 +2119,69 @@ mod tests {
             2,
             "the second abandon finds the operation freed by the first, which is no failure"
         );
+    }
+
+    const LOST_OFFSETS: RangeInclusive<u64> = 5..=6;
+
+    /// The report of [`LOST_OFFSETS`] of `partition_id`, which a lost read committed.
+    fn lost_range(partition_id: u32, skip: Option<PollingStrategy>) -> ReadError {
+        const OPERATION: u64 = 7;
+        let mut read_error = ReadError::new(
+            Some(partition_id),
+            IggyError::FetchProgressUncertain(OPERATION),
+        );
+        read_error.lost = Some(LOST_OFFSETS);
+        read_error.skip = skip;
+        read_error
+    }
+
+    #[tokio::test]
+    async fn given_a_lost_range_when_consumed_should_seek_its_skip_without_an_abandon() {
+        let plugin_id = next_plugin_id();
+        let metrics = Arc::new(Metrics::init());
+        let skip = PollingStrategy::offset(LOST_OFFSETS.end() + 1);
+        let mut messages =
+            FakeMessages::new(futures::stream::iter([Err(lost_range(1, Some(skip)))]));
+
+        consume_reads(plugin_id, &mut messages, &metrics).await;
+
+        assert_eq!(
+            messages.calls,
+            [Recovery::Seek(1, skip)],
+            "the reader abandoned the operation, and the seek reads the batch after the range again"
+        );
+        assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_lost_range_when_the_seek_to_its_skip_fails_should_resume_at_next() {
+        let plugin_id = next_plugin_id();
+        let skip = PollingStrategy::offset(LOST_OFFSETS.end() + 1);
+        let mut messages = FakeMessages {
+            seek: Err(IggyError::Unauthorized),
+            ..FakeMessages::new(futures::stream::iter([Err(lost_range(1, Some(skip)))]))
+        };
+
+        consume_reads(plugin_id, &mut messages, &Arc::new(Metrics::init())).await;
+
+        assert_eq!(
+            messages.calls,
+            [
+                Recovery::Seek(1, skip),
+                Recovery::Seek(1, PollingStrategy::next())
+            ],
+            "a seek to `Next` stores nothing, so it resumes a partition that the reader stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_lost_range_without_a_skip_when_consumed_should_resume_at_next() {
+        let plugin_id = next_plugin_id();
+        let mut messages = FakeMessages::new(futures::stream::iter([Err(lost_range(1, None))]));
+
+        consume_reads(plugin_id, &mut messages, &Arc::new(Metrics::init())).await;
+
+        assert_eq!(messages.calls, [Recovery::Seek(1, PollingStrategy::next())]);
     }
 
     #[tokio::test]

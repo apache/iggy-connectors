@@ -191,7 +191,7 @@ Integration tests live in the source's own test target `sources/<name>_source/te
 
 ```bash
 cargo fmt --all
-cargo sort --no-format --workspace
+cargo sort --no-format --grouped --workspace
 cargo clippy -p iggy_connector_<name>_source --all-targets -- -D warnings
 cargo nextest run -p iggy_connector_<name>_source --lib
 

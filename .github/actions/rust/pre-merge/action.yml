@@ -134,7 +134,7 @@ runs:
 
     - name: Cargo sort
       if: inputs.task == 'sort'
-      run: cargo sort --check --no-format --workspace
+      run: cargo sort --check --no-format --grouped --workspace
       shell: bash
 
     - name: Cargo machete

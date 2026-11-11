@@ -139,7 +139,7 @@ Real-infra integration tests live in the sink's own test target `sinks/<name>_si
 
 ```bash
 cargo fmt --all
-cargo sort --no-format --workspace
+cargo sort --no-format --grouped --workspace
 cargo clippy -p iggy_connector_<name>_sink --all-targets -- -D warnings
 cargo nextest run -p iggy_connector_<name>_sink --lib
 

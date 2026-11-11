@@ -148,7 +148,7 @@ Run these from the root of the repository:
 
 ```bash
 cargo fmt --all
-cargo sort --no-format --workspace
+cargo sort --no-format --grouped --workspace
 cargo clippy --all-features --all-targets -- -D warnings
 cargo machete --with-metadata
 cargo build

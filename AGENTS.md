@@ -68,7 +68,7 @@ Most PRs from people new to Iggy are written with an agent. The person opening t
 ```bash
 # CI enforces this order (.github/actions/rust/pre-merge).
 cargo fmt --all                                            # step 1
-cargo sort --no-format --workspace                         # step 2 (--no-format mandatory)
+cargo sort --no-format --grouped --workspace               # step 2 (both flags mandatory)
 cargo clippy --all-features --all-targets -- -D warnings   # step 3
 cargo machete --with-metadata                              # step 4
 cargo nextest run -p <package>                             # step 5
@@ -123,9 +123,9 @@ iggy-connectors/
 
 ## The core pin
 
-The root `Cargo.toml` is the only place for the core pin. Six
-`[workspace.dependencies]` entries take core crates from git, with
-the core pin as `rev`: `configs`, `configs_derive`, `iggy`,
+The root `Cargo.toml` is the only place for the core pin. The first
+group of `[workspace.dependencies]` holds six entries that take core
+crates from git, with the core pin as `rev`: `configs`, `configs_derive`, `iggy`,
 `iggy_common`, `integration` (the test `harness` and
 `#[iggy_harness]`) and `system_stats`. `iggy` and `iggy_common` also
 carry a `version`, because the published SDK takes them from
@@ -191,8 +191,8 @@ is a copy of the apache/iggy skill. Run
 ## Repo-wide principles
 
 1. **Apache 2.0 header on every new source file:** Follow the comment style that `licenserc.toml` configures. For example, `.rs` uses `// ...`, and `Cargo.toml` and shell use `# ...`.
-2. **Order of the checks:** `fmt --all` -> `sort --no-format --workspace` -> `clippy --all-features --all-targets -- -D warnings` -> `machete` -> `nextest run`. Plus `taplo.sh --check`. CI enforces all.
-3. **Always pass `--no-format` to `cargo sort`.** Without it multi-line feature arrays flatten and `taplo` re-expands them, churning the workspace.
+2. **Order of the checks:** `fmt --all` -> `sort --no-format --grouped --workspace` -> `clippy --all-features --all-targets -- -D warnings` -> `machete` -> `nextest run`. Plus `taplo.sh --check`. CI enforces all.
+3. **Always pass `--no-format` and `--grouped` to `cargo sort`.** Without `--no-format` multi-line feature arrays flatten and `taplo` re-expands them, churning the workspace. Without `--grouped` the core pin group of the root `Cargo.toml` is sorted into the other dependencies.
 4. **One virtual workspace.** Every dependency of every member is declared once in the root `[workspace.dependencies]`, and members use `{ workspace = true }`.
 5. **Avoid LLM-slop tells: em dashes, gratuitous semicolons, hedging narrative, trailing summaries.** Defaults, not absolute bans. Same rule for code, comments, commits, PR descriptions.
 6. **Idiomatic Rust over free helpers.** `FromStr` not `parse_foo`, `Display` not `format_foo`, `From`/`TryFrom` not `to_foo_from_bar`. Structured `Err` enums, not `String`.

@@ -270,7 +270,7 @@ Filter case bumps `messages_filtered` via `inc_messages_filtered_with_labels`. A
 
 ```bash
 cargo fmt --all
-cargo sort --no-format --workspace
+cargo sort --no-format --grouped --workspace
 cargo clippy -p iggy-connectors --all-targets -- -D warnings
 cargo nextest run -p iggy-connectors --bins
 

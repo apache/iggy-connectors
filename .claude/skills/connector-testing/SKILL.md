@@ -398,7 +398,7 @@ Before pushing:
 
 ```text
 cargo fmt --all
-cargo sort --no-format --workspace
+cargo sort --no-format --grouped --workspace
 cargo clippy -p <package> --all-targets -- -D warnings
 cargo nextest run -p <package> --lib        # --bins for the runtime
 ```

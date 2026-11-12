@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod container;
 mod sink;
 
-pub use container::RabbitMqOps;
+pub use iggy_connector_testing::rabbitmq::RabbitMqOps;
 pub use sink::{
     RabbitMqSinkDirectFixture, RabbitMqSinkFanoutFixture, RabbitMqSinkFixture,
     RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,

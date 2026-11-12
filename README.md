@@ -214,6 +214,7 @@ A source produces messages to an Iggy stream and topic. Configure one `[[streams
 | [MQTT](sources/mqtt_source/README.md)                   | the topics of an MQTT 3.1.1 or MQTT 5 broker, with QoS 0, 1 or 2                             |
 | [OpenSearch](sources/opensearch_source/README.md)       | documents of OpenSearch indices and index patterns, by polling with a timestamp watermark    |
 | [PostgreSQL](sources/postgres_source/README.md)         | PostgreSQL tables, by table polling or Change Data Capture                                   |
+| [RabbitMQ](sources/rabbitmq_source/README.md)           | RabbitMQ queues, through AMQP 0.9.1                                                          |
 | [Random](sources/random_source/README.md)               | random test messages, for testing and development                                            |
 
 ## Write a connector

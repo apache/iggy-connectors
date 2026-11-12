@@ -3,9 +3,9 @@
 Starting point for a new Apache Iggy **sink** connector. Everything except
 pushing data to your actual destination is already implemented and follows
 the project's required resilience and security patterns. See the module-level
-doc comment at the top of `src/lib.rs` for the rationale, and the
-`connector-pr-review` skill and `docs/authoring-sinks-and-sources.md`
-for the checklist this template is built against.
+doc comment at the top of `src/lib.rs` for the rationale, and
+`docs/authoring-sinks-and-sources.md` for the checklist this template is built
+against.
 
 ## How a batch is delivered
 
@@ -97,8 +97,10 @@ Every connector README has to answer these four questions. For this template:
 4. **Dedup key**: none by default, because `push_batch()` is a stub. The
    `dedup_key()` helper builds `stream:topic:partition:offset`. Make your
    destination's write idempotent on it (upsert, `ON CONFLICT`, unique index),
-   and the first three points stop mattering for correctness. See
-   `connector-pr-review` B5.
+   and the first three points stop mattering for correctness. Never key the
+   write on a random id generated per write: a redelivered message would get a
+   new key and be stored twice. If the destination's unique index is only
+   informational, do not claim idempotency in your README.
 
 ### Why the key uses the offset
 
@@ -337,6 +339,6 @@ shape your connector expects.
    the connector runtime. See the
    [quick start](../../README.md#quick-start) in the root README.
 5. Before opening a PR, run the commands in the "Verification before `/ready`"
-   section of `docs/authoring-sinks-and-sources.md` and re-read the
-   `connector-pr-review` checklist. Most review round-trips come from one of its
+   section of `docs/authoring-sinks-and-sources.md` and go through the pre-flight
+   checklist in the same guide. Most review round-trips come from one of its
    items, not from the connector-specific logic in `push_batch()`.

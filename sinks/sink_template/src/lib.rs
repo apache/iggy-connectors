@@ -18,7 +18,8 @@
 //! Template Apache Iggy **sink** connector.
 //!
 //! Everything in this file is already wired up and follows the patterns the
-//! connector-pr-review checklist expects: config validation happens in
+//! connector authoring guide (`docs/authoring-sinks-and-sources.md`) expects: config
+//! validation happens in
 //! `open()`, secrets are `SecretString`, the destination identifier is
 //! validated before it's ever interpolated into a request, outbound calls
 //! go through a retry-wrapped client plus a circuit breaker, and messages
@@ -283,8 +284,10 @@ impl TemplateSink {
     /// redelivery, from replaying an offset range after a logged loss, and from
     /// a server failover before the stored offset replicated. Build a stable
     /// key with `dedup_key()` below for every message you write, and make the
-    /// write idempotent on it (upsert / `ON CONFLICT` / unique index) - see
-    /// `connector-pr-review` B5.
+    /// write idempotent on it (upsert / `ON CONFLICT` / unique index). Never key on
+    /// a random id generated per write: a redelivered message would get a new key and
+    /// be stored twice. If the destination's unique index is only informational, do
+    /// not claim idempotency in your README.
     ///
     /// If your destination's write call can succeed at the transport level
     /// while rejecting some or all rows individually (a bulk/batch API
@@ -298,8 +301,10 @@ impl TemplateSink {
     /// written is safe because the write is idempotent on `dedup_key()`. Four
     /// unrelated sinks shipped exactly this bug in review (BigQuery,
     /// Elasticsearch, Doris, S3): the call "succeeded," `consume()` reported
-    /// success, and the batch was gone with no signal anywhere. See
-    /// `connector-pr-review` B9.
+    /// success, and the batch was gone with no signal anywhere. Likewise, a
+    /// per-record encode failure must not be replaced by an empty or default value
+    /// that is then counted as delivered: fail the chunk, or skip the record and
+    /// count it as lost, visibly.
     async fn push_batch(
         &self,
         client: &ClientWithMiddleware,

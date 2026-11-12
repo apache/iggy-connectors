@@ -3,9 +3,9 @@
 Starting point for a new Apache Iggy **source** connector. Everything except
 talking to your actual external system is already implemented and follows
 the project's required resilience/security patterns - see the module-level
-doc comment at the top of `src/lib.rs` for the full rationale, and the
-`connector-pr-review` skill and `docs/authoring-sinks-and-sources.md`
-for the checklist this template is built against.
+doc comment at the top of `src/lib.rs` for the full rationale, and
+`docs/authoring-sinks-and-sources.md` for the checklist this template is built
+against.
 
 ## Delivery Semantics
 
@@ -56,8 +56,9 @@ shipping:
    one - it becomes `ProducedMessage.id`, which a downstream sink can key an
    idempotent upsert on (see `mongodb_sink`) so the redelivery above doesn't
    produce a duplicate at the destination. Leave it `None` only when records
-   genuinely have no natural identity (a pure generator). See
-   `connector-pr-review` B5.
+   genuinely have no natural identity (a pure generator). A random id per emit
+   defeats that dedup: a redelivered record would get a new id and be stored
+   twice, and a timestamp cursor alone is rarely unique per record.
 
 ## What's already done for you
 
@@ -147,7 +148,8 @@ and two ask for a decision or a description:
 2. **`connection_string`'s doc comment** (documentation only) - describe
    the exact shape your connector expects instead of the generic example.
 3. **`FetchedRecord::natural_id`** (decision) - set it from a true per-record
-   identity, or leave it `None` only when records have none (delivery item 6).
+   identity, or leave it `None` only when records have none (see the dedup key
+   point under Delivery Semantics).
 
 ## Using it
 
@@ -166,7 +168,7 @@ and two ask for a decision or a description:
    and run the connector runtime - see the
    [quick start](../../README.md#quick-start) in the root README.
 5. Before opening a PR, run the commands in the "Verification before `/ready`"
-   section of `docs/authoring-sinks-and-sources.md` and re-read the
-   `connector-pr-review` checklist once more with fresh eyes. Most review
+   section of `docs/authoring-sinks-and-sources.md` and go through the pre-flight
+   checklist in the same guide once more with fresh eyes. Most review
    round-trips come from one of its items, not from the connector-specific logic
    in `fetch_records()`.

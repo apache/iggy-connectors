@@ -18,7 +18,8 @@
 //! Template Apache Iggy **source** connector.
 //!
 //! Everything in this file is already wired up and follows the patterns the
-//! connector-pr-review checklist expects: config validation happens in
+//! connector authoring guide (`docs/authoring-sinks-and-sources.md`) expects: config
+//! validation happens in
 //! `open()`, secrets are `SecretString`, outbound calls go through a
 //! retry-wrapped client plus a circuit breaker, and the read cursor is
 //! staged in `poll()` and only committed in `on_batch_result()` on an ACK so
@@ -148,8 +149,8 @@ struct FetchedRecord {
     /// a numeric row PK, a hash of a document `_id`, an event UUID the
     /// upstream system itself assigned - so `ProducedMessage.id` below is
     /// stable across a NACK-triggered redelivery of this same record. A
-    /// *fresh* random id per emit defeats a downstream sink's dedup-by-id
-    /// (see `connector-pr-review` B5): a redelivered row would arrive with a
+    /// *fresh* random id per emit defeats a downstream sink's dedup-by-id:
+    /// a redelivered row would arrive with a
     /// different id than its first delivery, so a sink keying its upsert on
     /// `message.id` would store it twice instead of overwriting. Leave this
     /// `None` only when records genuinely have no natural per-record
@@ -483,7 +484,7 @@ impl Source for TemplateSource {
     ///    than one operation, budget for *all* of them (a per-item retry
     ///    budget multiplies with the item count), and reject
     ///    `max_retries`/`retry_delay` combinations in `open()` that would
-    ///    make that stall unbounded. See `connector-pr-review` B11.
+    ///    make that stall unbounded.
     /// 2. A failed op must not be silently logged while the batch is still
     ///    ACKed - the cursor has already committed past it by the time you
     ///    find out. Count consecutive failures and return `Err` past a

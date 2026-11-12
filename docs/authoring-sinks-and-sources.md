@@ -1,10 +1,9 @@
 # Authoring Apache Iggy sink and source connectors
 
 > Reference guide for the connectors in this repository. For the narrative version
-> suitable for the Apache Iggy blog, see [`BLOG_POST.md`](BLOG_POST.md).
+> suitable for the Apache Iggy blog, will be authored soon.
 > Companion materials:
 >
-> - Review checklist skill: `.claude/skills/connector-pr-review/SKILL.md`
 > - Sink template: `sinks/sink_template` (README: HTTP and non-HTTP paths)
 > - Source template: `sources/source_template` (same)
 > - Testing skill: `.claude/skills/connector-testing/SKILL.md`
@@ -257,8 +256,7 @@ touch unrelated foreign SDKs in the same PR.
 [ ] Cargo.lock churn limited to this crate's deps
 ```
 
-Agents and reviewers: load `.claude/skills/connector-pr-review/SKILL.md`
-and treat unchecked blockers as CHANGES_REQUESTED.
+Reviewers: treat an unchecked item as CHANGES_REQUESTED.
 
 ## Why this exists
 
@@ -267,5 +265,5 @@ convention bring-up, MySQL/JDBC, Doris retry, Redshift, Airflow, Fluss,
 and others), the expensive review threads were rarely about the novel
 backend call. They were about framework contracts: secrets, retries,
 idempotency honesty, config names, README drift, and missing state
-tests. Codifying those contracts as a skill + templates is how we make
+tests. Codifying those contracts as a guide and templates is how we make
 connector contributions predictable without lowering the bar.

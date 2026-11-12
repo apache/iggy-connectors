@@ -1408,6 +1408,21 @@ mod tests {
     }
 
     #[test]
+    fn omits_headers_when_include_metadata_is_false() {
+        let mut config = base_config();
+        config.include_metadata = Some(false);
+        let sink = sink_with_config(config);
+        let mut message = message(Payload::Json(simd_json::json!({"name": "Alice"})));
+        message.headers = Some(header_case_map());
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("prepare document");
+
+        assert!(document.get("iggy_headers").is_none());
+    }
+
+    #[test]
     fn omits_metadata_when_include_metadata_is_false() {
         let mut config = base_config();
         config.include_metadata = Some(false);

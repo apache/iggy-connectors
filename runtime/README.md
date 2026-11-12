@@ -78,8 +78,9 @@ The [README of the Iggy Rust client SDK](https://github.com/apache/iggy/blob/mas
 ## Sink delivery guarantees
 
 A sink delivers at most once by default: the offset of a poll is stored when the
-server answers it, so a batch that the plugin fails to write is lost. A
-`[delivery]` table makes a sink deliver at least once:
+server answers it, so a batch that the plugin fails to write is lost. A message
+whose user headers do not decode goes to the plugin without its user headers and
+counts an error. A `[delivery]` table makes a sink deliver at least once:
 
 ```toml
 [delivery]

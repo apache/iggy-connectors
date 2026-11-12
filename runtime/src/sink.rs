@@ -39,8 +39,8 @@ use iggy::prelude::{
 };
 use iggy_connector_sdk::decoders::avro::{AvroConfig, AvroStreamDecoder};
 use iggy_connector_sdk::{
-    DecodedMessage, MessagesMetadata, RawMessage, RawMessages, ReceivedMessage, Schema,
-    StreamDecoder, TopicMetadata,
+    DecodedMessage, MessagesMetadata, RawMessage, RawMessages, Schema, StreamDecoder,
+    TopicMetadata,
     sink::{ConsumeCallback, SinkCallStatus},
     transforms::Transform,
 };
@@ -960,45 +960,24 @@ pub(crate) async fn process_messages(
     let decode_start = Instant::now();
     let mut decoded = Vec::with_capacity(count);
     for message in messages {
-        let headers = match user_headers(&message) {
-            Ok(headers) => headers,
-            Err(reason) => {
-                // Core already warned about a failed wire check without naming the connector.
-                error!(
-                    "Failed to decode user headers (id: {}, offset: {}) for sink connector with ID: {plugin_id}. {reason}",
-                    message.header.id, message.header.offset
-                );
-                error_count += 1;
-                if stop_on_invalid {
-                    failure = Some(BatchFailure::invalid(
-                        message.header.offset,
-                        format!("The user headers do not decode: {reason}"),
-                    ));
-                    break;
-                }
-                None
-            }
-        };
-        let message = ReceivedMessage {
-            id: message.header.id,
-            offset: message.header.offset,
-            checksum: message.header.checksum,
-            timestamp: message.header.timestamp,
-            origin_timestamp: message.header.origin_timestamp,
-            headers,
-            payload: message.payload.into(),
-        };
-        let payload = match decoder.decode(message.payload) {
+        // Read before the payload moves out, but acted on only after the payload decodes: a
+        // message whose payload fails is dropped anyway, and counting its headers too would
+        // count one message twice.
+        let headers = user_headers(&message);
+        let IggyMessage {
+            header, payload, ..
+        } = message;
+        let payload = match decoder.decode(payload.into()) {
             Ok(payload) => payload,
             Err(error) => {
                 error!(
                     "Failed to decode message payload (id: {}, offset: {}) for sink connector with ID: {plugin_id}. {error}",
-                    message.id, message.offset
+                    header.id, header.offset
                 );
                 error_count += 1;
                 if stop_on_invalid {
                     failure = Some(BatchFailure::invalid(
-                        message.offset,
+                        header.offset,
                         format!("The payload does not decode: {error}"),
                     ));
                     break;
@@ -1006,13 +985,32 @@ pub(crate) async fn process_messages(
                 continue;
             }
         };
+        let headers = match headers {
+            Ok(headers) => headers,
+            Err(reason) => {
+                // Core already warned about a failed wire check without naming the connector.
+                error!(
+                    "Failed to decode user headers (id: {}, offset: {}) for sink connector with ID: {plugin_id}. {reason}",
+                    header.id, header.offset
+                );
+                error_count += 1;
+                if stop_on_invalid {
+                    failure = Some(BatchFailure::invalid(
+                        header.offset,
+                        format!("The user headers do not decode: {reason}"),
+                    ));
+                    break;
+                }
+                None
+            }
+        };
         decoded.push(DecodedMessage {
-            id: Some(message.id),
-            offset: Some(message.offset),
-            checksum: Some(message.checksum),
-            timestamp: Some(message.timestamp),
-            origin_timestamp: Some(message.origin_timestamp),
-            headers: message.headers,
+            id: Some(header.id),
+            offset: Some(header.offset),
+            checksum: Some(header.checksum),
+            timestamp: Some(header.timestamp),
+            origin_timestamp: Some(header.origin_timestamp),
+            headers,
             payload,
         });
     }
@@ -2322,6 +2320,26 @@ mod tests {
                 "{policy:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn given_undecodable_headers_and_payload_when_processed_should_count_one_error() {
+        let plugin_id = next_plugin_id();
+        let mut message = message_with_unknown_header_kind(0);
+        message.payload = Bytes::from_static(b"not json");
+        message.header.payload_length = message.payload.len() as u32;
+
+        let (_, metrics) = run_with(
+            plugin_id,
+            capturing_consume,
+            Schema::Json.decoder(),
+            Vec::new(),
+            vec![message],
+        )
+        .await;
+
+        assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 1);
+        assert!(captured(plugin_id)[0].offsets.is_empty());
     }
 
     #[tokio::test]

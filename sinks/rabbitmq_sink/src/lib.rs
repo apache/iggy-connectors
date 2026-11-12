@@ -620,15 +620,7 @@ mod tests {
     #[test]
     fn given_offset_above_u32_max_when_build_headers_should_encode_full_value() {
         let sink = test_sink(test_config());
-        let topic = TopicMetadata {
-            stream: "test_stream".into(),
-            topic: "test_topic".into(),
-        };
-        let metadata = MessagesMetadata {
-            partition_id: 0,
-            current_offset: 0,
-            schema: Schema::Json,
-        };
+        let (topic, metadata) = header_test_metadata();
         let headers = sink.build_headers(&topic, &metadata, &test_message(u32::MAX as u64 + 1));
         match headers.inner().get(&ShortString::from("iggy_offset")) {
             Some(AMQPValue::LongLongInt(value)) => assert_eq!(*value, u32::MAX as i64 + 1),
@@ -651,15 +643,7 @@ mod tests {
         message.headers = Some(user_headers);
 
         let sink = test_sink(test_config());
-        let topic = TopicMetadata {
-            stream: "test_stream".into(),
-            topic: "test_topic".into(),
-        };
-        let metadata = MessagesMetadata {
-            partition_id: 0,
-            current_offset: 0,
-            schema: Schema::Json,
-        };
+        let (topic, metadata) = header_test_metadata();
         let headers = sink.build_headers(&topic, &metadata, &message);
         let inner = headers.inner();
         assert!(matches!(

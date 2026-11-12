@@ -39,8 +39,8 @@ updates:
       # The root Cargo.toml takes these crates from git at one apache/iggy
       # commit, and the versions of iggy and iggy_common must match that
       # commit. Dependabot cannot move the rev, and a bump of one entry
-      # alone would break the pin check. scripts/bump-r.sh moves them
-      # together.
+      # alone would break the pin check. scripts/bump-core-pin.sh moves
+      # them together.
       - dependency-name: "configs"
       - dependency-name: "configs_derive"
       - dependency-name: "iggy"

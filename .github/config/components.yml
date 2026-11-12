@@ -20,7 +20,8 @@
 # run inside the Rust lane is up to cargo-rail and .config/rail.toml.
 components:
   # Workspace-level changes that affect all Rust components. The root
-  # Cargo.toml also holds R, the apache/iggy commit of the core crates.
+  # Cargo.toml also holds the core pin, the apache/iggy commit of the
+  # core crates.
   rust-workspace:
     paths:
       - "Cargo.toml"
@@ -35,7 +36,7 @@ components:
 
   # crates.io publish chain verification. Runs scripts/verify-sdk-publish.sh,
   # which spins up cargo-http-registry as a local alt-registry and publishes
-  # the core crates at R and then the SDK.
+  # the core crates at the core pin and then the SDK.
   rust-sdk-publish:
     depends_on:
       - "rust-workspace"

@@ -25,12 +25,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/ci/lib/core-pin.sh"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/bump-r.sh <core tag, branch or commit>
+Usage: scripts/bump-core-pin.sh <core tag, branch or commit>
 
-Moves R, the apache/iggy commit that the workspace pins, to the given ref.
-It sets the rev of every core git dependency in the root Cargo.toml to that
-commit, and the iggy and iggy_common versions to the versions at that
-commit. Then it runs `cargo update` for the core git packages.
+Moves the core pin, the apache/iggy commit that the workspace pins, to
+the given ref. It sets the rev of every core git dependency in the root
+Cargo.toml to that commit, and the iggy and iggy_common versions to the
+versions at that commit. Then it runs `cargo update` for the core git
+packages.
 USAGE
 }
 
@@ -66,7 +67,7 @@ MANIFEST="$REPO_ROOT/Cargo.toml"
 
 OLD_REV=$(core_rev "$MANIFEST")
 
-SCRATCH_DIR="$(mktemp -d -t iggy-bump-r.XXXXXX)"
+SCRATCH_DIR="$(mktemp -d -t iggy-bump-core-pin.XXXXXX)"
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 CORE_GIT_DIR="$SCRATCH_DIR/core.git"
 git init --quiet --bare "$CORE_GIT_DIR"
@@ -116,7 +117,7 @@ for crate in "${!NEW_VERSIONS[@]}"; do
     die "$MANIFEST does not pin $crate at ${NEW_VERSIONS[$crate]}"
 done
 
-echo "R: $OLD_REV -> $NEW_REV ($REF)"
+echo "core pin: $OLD_REV -> $NEW_REV ($REF)"
 for crate in "${!NEW_VERSIONS[@]}"; do
   echo "$crate: ${NEW_VERSIONS[$crate]}"
 done

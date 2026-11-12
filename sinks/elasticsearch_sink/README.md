@@ -30,6 +30,8 @@ Retry delays allow zero; invalid duration strings log a warning and fall back to
 
 With `include_headers = true`, each document gets an `_iggy_headers` object with one field per user header:
 
+Upgrade note: earlier versions wrote no user headers, and `include_headers` defaults to `true`. After an upgrade, documents with headers carry `_iggy_headers` for the first time. For an index that already exists, add the templates below by hand. For an index with `"dynamic": "strict"`, set `include_headers = false` or declare `_iggy_headers`, as the limits below explain.
+
 ```json
 "_iggy_headers": {
   "trace-id": {"data": "abc", "data_encoding": "utf8"},

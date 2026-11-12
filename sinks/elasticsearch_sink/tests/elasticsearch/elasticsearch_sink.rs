@@ -301,6 +301,10 @@ fn message_with_header(id: u128, key: &str, value: &str) -> IggyMessage {
         HeaderKey::try_from(key).expect("valid header key"),
         HeaderValue::try_from(value).expect("valid header value"),
     )]);
+    message_with_headers(id, headers)
+}
+
+fn message_with_headers(id: u128, headers: BTreeMap<HeaderKey, HeaderValue>) -> IggyMessage {
     IggyMessage::builder()
         .id(id)
         .payload(Bytes::from(
@@ -322,7 +326,14 @@ async fn elasticsearch_sink_stores_user_headers(
     let client = harness.root_client().await.expect("root client");
     let stream_id: Identifier = seeds::names::STREAM.try_into().expect("stream ID");
     let topic_id: Identifier = seeds::names::TOPIC.try_into().expect("topic ID");
-    let mut messages = vec![message_with_header(1, "a", "b")];
+    let headers = BTreeMap::from([
+        (
+            HeaderKey::try_from("a").expect("valid header key"),
+            HeaderValue::try_from("b").expect("valid header value"),
+        ),
+        (HeaderKey::from(1i32), HeaderValue::from(2i32)),
+    ]);
+    let mut messages = vec![message_with_headers(1, headers)];
 
     client
         .send_messages(
@@ -342,7 +353,10 @@ async fn elasticsearch_sink_stores_user_headers(
 
     assert_eq!(
         search_result.hits.hits[0].source["_iggy_headers"],
-        serde_json::json!({"a": {"data": "b", "data_encoding": "utf8"}})
+        serde_json::json!({
+            "a": {"data": "b", "data_encoding": "utf8"},
+            "~int32:1": {"data": "2", "data_encoding": "utf8"}
+        })
     );
 }
 

@@ -96,8 +96,9 @@ object with one field per header, for example
 of any other kind, or a string key that starts with `~`, gets a generated name
 such as `~int32:1`, `~raw:AQI` or `~string:~note`. A text or typed value is a
 plain string, so that you can filter on it. A raw value, or a string value that
-is not valid UTF-8, is `{"data": "<base64>", "iggy_header_encoding": "base64"}`,
-the same shape as the HTTP sink.
+is not valid UTF-8, is `{"data": "<base64>", "iggy_header_encoding": "base64"}`.
+Raw values have the same shape as in the HTTP sink, which writes a string value
+that is not valid UTF-8 as lossy text instead.
 
 ## Delivery Semantics
 

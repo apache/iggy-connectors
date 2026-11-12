@@ -715,6 +715,34 @@ mod tests {
     }
 
     #[test]
+    fn given_raw_keys_at_the_amqp_limit_when_build_headers_should_keep_187_and_skip_188_bytes() {
+        // `~raw:` plus unpadded base64url: 187 bytes give 255, 188 bytes give 256.
+        let kept = HeaderKey::from_raw(HeaderKind::Raw, &[0u8; 187]).unwrap();
+        let skipped = HeaderKey::from_raw(HeaderKind::Raw, &[1u8; 188]).unwrap();
+        let mut message = test_message(0);
+        message.headers = Some(std::collections::BTreeMap::from([
+            (kept.clone(), HeaderValue::from_str("kept").unwrap()),
+            (skipped, HeaderValue::from_str("skipped").unwrap()),
+        ]));
+        let mut config = test_config();
+        config.include_metadata = Some(false);
+        let sink = test_sink(config);
+        let (topic, metadata) = header_test_metadata();
+
+        let headers = sink.build_headers(&topic, &metadata, &message);
+
+        let kept_name = HeaderName(&kept).to_string();
+        assert_eq!(kept_name.len(), 255);
+        assert_eq!(headers.inner().len(), 1);
+        assert!(
+            headers
+                .inner()
+                .contains_key(&ShortString::try_new(kept_name).unwrap())
+        );
+        assert_eq!(sink.skipped_header_names.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn given_user_header_named_like_metadata_when_build_headers_should_keep_metadata() {
         let mut message = test_message(0);
         message.headers = Some(std::collections::BTreeMap::from([(

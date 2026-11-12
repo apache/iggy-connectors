@@ -374,6 +374,40 @@ mod tests {
     }
 
     #[test]
+    fn given_float_values_should_serialize_decimal_text() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            HeaderKey::try_from("f32").unwrap(),
+            HeaderValue::from(1.5f32),
+        );
+        headers.insert(
+            HeaderKey::try_from("f64").unwrap(),
+            HeaderValue::from(-0.25f64),
+        );
+        headers.insert(
+            HeaderKey::try_from("nan").unwrap(),
+            HeaderValue::from(f64::NAN),
+        );
+        headers.insert(
+            HeaderKey::try_from("negative_zero").unwrap(),
+            HeaderValue::from(-0.0f32),
+        );
+
+        let json = serde_json::to_value(JsonHeaders(&headers)).unwrap();
+
+        assert_eq!(json["f32"], json!({"data": "1.5", "data_encoding": "utf8"}));
+        assert_eq!(
+            json["f64"],
+            json!({"data": "-0.25", "data_encoding": "utf8"})
+        );
+        assert_eq!(json["nan"], json!({"data": "NaN", "data_encoding": "utf8"}));
+        assert_eq!(
+            json["negative_zero"],
+            json!({"data": "-0", "data_encoding": "utf8"})
+        );
+    }
+
+    #[test]
     fn given_headers_should_serialize_through_simd_json() {
         let mut headers = BTreeMap::new();
         headers.insert(HeaderKey::from(1i32), HeaderValue::try_from("a").unwrap());

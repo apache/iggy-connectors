@@ -1369,6 +1369,8 @@ mod tests {
         messages_schema: Schema,
         payloads: Vec<Vec<u8>>,
         offsets: Vec<u64>,
+        /// Postcard-encoded user headers per message, empty when a message has none.
+        headers: Vec<Vec<u8>>,
     }
 
     /// Runs the stub sink fails, keyed by plugin id and matched on the run's
@@ -1402,6 +1404,11 @@ mod tests {
             metadata_schema: metadata.schema,
             messages_schema: raw.schema,
             offsets: raw.messages.iter().map(|message| message.offset).collect(),
+            headers: raw
+                .messages
+                .iter()
+                .map(|message| message.headers.clone())
+                .collect(),
             payloads: raw
                 .messages
                 .into_iter()
@@ -2243,9 +2250,39 @@ mod tests {
         message
     }
 
+    fn valid_headers() -> BTreeMap<HeaderKey, HeaderValue> {
+        BTreeMap::from([(
+            HeaderKey::try_from("a").expect("valid key"),
+            HeaderValue::try_from("b").expect("valid value"),
+        )])
+    }
+
+    fn message_with_valid_headers(offset: u64) -> IggyMessage {
+        let mut message = IggyMessage::builder()
+            .id(u128::from(offset) + 1)
+            .payload(Bytes::from_static(br#"{"id":1}"#))
+            .user_headers(valid_headers())
+            .build()
+            .expect("valid message");
+        message.header.offset = offset;
+        message
+    }
+
+    /// The user headers that the stub sink received, one entry per message.
+    fn delivered_headers(batch: &ConsumedBatch) -> Vec<Option<BTreeMap<HeaderKey, HeaderValue>>> {
+        batch
+            .headers
+            .iter()
+            .map(|bytes| {
+                (!bytes.is_empty())
+                    .then(|| postcard::from_bytes(bytes).expect("headers deserialize"))
+            })
+            .collect()
+    }
+
     fn undecodable_header_batch() -> Vec<IggyMessage> {
         vec![
-            test_message(0, br#"{"id":1}"#.to_vec()),
+            message_with_valid_headers(0),
             message_with_unknown_header_kind(1),
             message_with_malformed_headers(2),
         ]
@@ -2273,6 +2310,11 @@ mod tests {
             assert_eq!(timing.failure, None, "{policy:?}");
             assert_eq!(batches.len(), 1, "{policy:?}");
             assert_eq!(batches[0].offsets, vec![0, 1, 2], "{policy:?}");
+            assert_eq!(
+                delivered_headers(&batches[0]),
+                vec![Some(valid_headers()), None, None],
+                "{policy:?}"
+            );
             assert_eq!(
                 metrics.get_errors("test_sink", ConnectorType::Sink),
                 2,

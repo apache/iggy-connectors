@@ -42,6 +42,7 @@ members = [
     "sources/influxdb_source",
     "sources/mqtt_source",
     "sources/postgres_source",
+    "sources/rabbitmq_source",
     "sources/random_source",
     "testing",
 ]

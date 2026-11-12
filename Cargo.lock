@@ -5898,7 +5898,6 @@ dependencies = [
  "ctor 1.0.13",
  "dashmap",
  "dtor 1.0.6",
- "futures",
  "iggy",
  "iggy_common",
  "iggy_connector_sdk",
@@ -5909,10 +5908,37 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "testcontainers-modules",
  "tokio",
  "tracing",
- "uuid",
+]
+
+[[package]]
+name = "iggy_connector_rabbitmq_source"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "ctor 1.0.13",
+ "dashmap",
+ "dtor 1.0.6",
+ "futures",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "iggy_connector_testing",
+ "integration",
+ "lapin",
+ "rand 0.10.3",
+ "reqwest 0.13.5",
+ "rustls",
+ "rustls-pemfile",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -6093,8 +6119,10 @@ dependencies = [
 name = "iggy_connector_testing"
 version = "0.0.1"
 dependencies = [
+ "futures",
  "iggy_common",
  "integration",
+ "lapin",
  "reqwest 0.13.5",
  "reqwest-middleware",
  "reqwest-retry",

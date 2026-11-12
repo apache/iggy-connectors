@@ -42,14 +42,17 @@ With `include_headers = true`, each document gets an `_iggy_headers` object with
 - `data` holds a string value as text, a raw value or a string value that is not valid UTF-8 as standard base64 (`data_encoding: "base64"`), and every other value as decimal or `true` / `false` text.
 - A message without headers drops any `_iggy_headers` field that its payload carries, so that a payload value cannot fix the field type.
 
-When the sink creates the index, it adds the dynamic template `iggy_header_data`, which maps `_iggy_headers.*.data` as `keyword`. Without it, a date-like first value maps the field as a date, and later values of that header fail to index. If `index_mapping` is set, the template goes first in its `mappings.dynamic_templates`. If the index already exists, or `create_index_if_not_exists = false`, add the template yourself:
+When the sink creates the index, it adds the dynamic templates `iggy_header_data` and `iggy_header_data_date`, which map `_iggy_headers.*.data` as `keyword` for string and date-like values. Without them, a date-like first value maps the field as a date, and later values of that header fail to index. If `index_mapping` is set, the templates go first in its `mappings.dynamic_templates`. If the index already exists, or `create_index_if_not_exists = false`, add both templates yourself:
 
 ```json
-{"iggy_header_data": {"path_match": "_iggy_headers.*.data", "mapping": {"type": "keyword"}}}
+[
+  {"iggy_header_data": {"path_match": "_iggy_headers.*.data", "match_mapping_type": "string", "mapping": {"type": "keyword"}}},
+  {"iggy_header_data_date": {"path_match": "_iggy_headers.*.data", "match_mapping_type": "date", "mapping": {"type": "keyword"}}}
+]
 ```
 
 Limits:
 
-- A header key that contains `.`, such as `mqtt.qos`, becomes an object path in the mapping.
+- A header key that contains `.`, such as `mqtt.qos`, becomes an object path in the mapping. Elasticsearch rejects the whole document for a key that starts with `.`, contains `..`, or holds only dots or whitespace, such as `.a` or `a..b`. Two keys where one is a path inside the other, such as `x` and `x.data`, conflict, and the second one to arrive fails to index.
 - Each distinct header name adds mapped fields, which count toward `index.mapping.total_fields.limit`.
 - An index with `"dynamic": "strict"` rejects documents with headers unless its mapping declares `_iggy_headers`. Set `include_headers = false` for such an index.

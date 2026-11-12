@@ -350,7 +350,7 @@ async fn elasticsearch_sink_stores_user_headers(
     server(connectors_runtime(config_path = "tests/elasticsearch/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn elasticsearch_sink_indexes_date_like_then_text_header_values(
+async fn elasticsearch_sink_indexes_date_like_text_and_dotted_header_values(
     harness: &TestHarness,
     fixture: ElasticsearchSinkFixture,
 ) {
@@ -359,9 +359,12 @@ async fn elasticsearch_sink_indexes_date_like_then_text_header_values(
     let topic_id: Identifier = seeds::names::TOPIC.try_into().expect("topic ID");
     // Without the keyword template, the first value maps the field as a date
     // and Elasticsearch rejects the second document.
+    // A key ending in `.data` expands to an object on the template's path, which
+    // a template without `match_mapping_type` maps as keyword and rejects.
     let mut messages = vec![
         message_with_header(1, "when", "2024-01-01"),
         message_with_header(2, "when", "not a date"),
+        message_with_header(3, "x.data", "v"),
     ];
 
     client
@@ -375,7 +378,7 @@ async fn elasticsearch_sink_indexes_date_like_then_text_header_values(
         .expect("send messages with headers");
 
     fixture
-        .wait_for_documents(2)
+        .wait_for_documents(3)
         .await
-        .expect("both documents must index");
+        .expect("every document must index");
 }

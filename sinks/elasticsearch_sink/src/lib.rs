@@ -45,8 +45,12 @@ const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
 const DEFAULT_INCLUDE_HEADERS: bool = true;
 const HEADERS_FIELD: &str = "_iggy_headers";
-const HEADER_DATA_TEMPLATE_NAME: &str = "iggy_header_data";
 const HEADER_DATA_PATH_MATCH: &str = "_iggy_headers.*.data";
+/// Name and `match_mapping_type` of each keyword template for header `data`.
+const HEADER_DATA_TEMPLATES: [(&str, &str); 2] = [
+    ("iggy_header_data", "string"),
+    ("iggy_header_data_date", "date"),
+];
 
 #[derive(Deserialize)]
 struct BulkResponse {
@@ -334,13 +338,19 @@ impl ElasticsearchSink {
     }
 }
 
-/// Prepends the keyword template for header `data` to
-/// `body.mappings.dynamic_templates`, unless a template of the same name is
-/// there. Returns `false` when `body` has a shape that cannot hold it.
+/// Prepends the keyword templates for header `data` to
+/// `body.mappings.dynamic_templates`, except those whose name is there.
+/// Returns `false` when `body` has a shape that cannot hold them.
 ///
 /// Dynamic mapping pins a field type on first write, so a date-like header
 /// value would make every later non-date value of that header fail to index.
-/// Elasticsearch applies the first matching template, so this one goes first.
+/// Elasticsearch applies the first matching template, so these go first.
+///
+/// Each template names its `match_mapping_type`. Without one, a header key
+/// such as `x.data` expands to an object at `_iggy_headers.x.data`, the
+/// template maps that object as keyword, and Elasticsearch rejects the
+/// document. Date detection reports a date-like string as `date`, not
+/// `string`, so a `string` template alone misses those values.
 fn prepend_header_data_template(body: &mut serde_json::Value) -> bool {
     let Some(root) = body.as_object_mut() else {
         return false;
@@ -359,21 +369,30 @@ fn prepend_header_data_template(body: &mut serde_json::Value) -> bool {
     else {
         return false;
     };
-    let present = templates
+    let missing: Vec<serde_json::Value> = HEADER_DATA_TEMPLATES
         .iter()
-        .any(|template| template.get(HEADER_DATA_TEMPLATE_NAME).is_some());
-    if !present {
-        templates.insert(
-            0,
-            serde_json::json!({
-                HEADER_DATA_TEMPLATE_NAME: {
-                    "path_match": HEADER_DATA_PATH_MATCH,
-                    "mapping": {"type": "keyword"}
-                }
-            }),
-        );
-    }
+        .filter(|(name, _)| {
+            !templates
+                .iter()
+                .any(|template| template.get(*name).is_some())
+        })
+        .map(|(name, mapping_type)| header_data_template(name, mapping_type))
+        .collect();
+    templates.splice(0..0, missing);
     true
+}
+
+fn header_data_template(name: &str, mapping_type: &str) -> serde_json::Value {
+    let mut template = serde_json::Map::new();
+    template.insert(
+        name.to_owned(),
+        serde_json::json!({
+            "path_match": HEADER_DATA_PATH_MATCH,
+            "match_mapping_type": mapping_type,
+            "mapping": {"type": "keyword"}
+        }),
+    );
+    serde_json::Value::Object(template)
 }
 
 /// Writes `headers` to `_iggy_headers`. A message without headers loses any
@@ -917,11 +936,19 @@ mod tests {
         });
     }
 
-    fn header_template() -> serde_json::Value {
-        json!({HEADER_DATA_TEMPLATE_NAME: {
-            "path_match": HEADER_DATA_PATH_MATCH,
-            "mapping": {"type": "keyword"}
-        }})
+    fn header_templates() -> Vec<serde_json::Value> {
+        vec![
+            json!({"iggy_header_data": {
+                "path_match": HEADER_DATA_PATH_MATCH,
+                "match_mapping_type": "string",
+                "mapping": {"type": "keyword"}
+            }}),
+            json!({"iggy_header_data_date": {
+                "path_match": HEADER_DATA_PATH_MATCH,
+                "match_mapping_type": "date",
+                "mapping": {"type": "keyword"}
+            }}),
+        ]
     }
 
     fn document_with_headers(
@@ -1039,17 +1066,17 @@ mod tests {
     }
 
     #[test]
-    fn given_no_index_mapping_when_building_create_body_should_carry_header_template() {
+    fn given_no_index_mapping_when_building_create_body_should_carry_header_templates() {
         let sink = ElasticsearchSink::new(1, test_config());
 
         assert_eq!(
             sink.index_create_body(),
-            Some(json!({"mappings": {"dynamic_templates": [header_template()]}}))
+            Some(json!({"mappings": {"dynamic_templates": header_templates()}}))
         );
     }
 
     #[test]
-    fn given_index_mapping_when_building_create_body_should_prepend_header_template() {
+    fn given_index_mapping_when_building_create_body_should_prepend_header_templates() {
         let user_template =
             json!({"strings": {"match_mapping_type": "string", "mapping": {"type": "text"}}});
         let sink = ElasticsearchSink::new(
@@ -1073,7 +1100,7 @@ mod tests {
             json!({
                 "settings": {"number_of_shards": 1},
                 "mappings": {
-                    "dynamic_templates": [header_template(), user_template],
+                    "dynamic_templates": ([header_templates(), vec![user_template]].concat()),
                     "properties": {"name": {"type": "keyword"}}
                 }
             })
@@ -1123,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn given_missing_index_when_creating_it_should_send_the_header_template() {
+    fn given_missing_index_when_creating_it_should_send_the_header_templates() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
         runtime.block_on(async {
             let server = MockServer::start().await;
@@ -1169,7 +1196,7 @@ mod tests {
                 serde_json::from_slice(&create.body).expect("create body is JSON");
             assert_eq!(
                 body,
-                json!({"mappings": {"dynamic_templates": [header_template()]}})
+                json!({"mappings": {"dynamic_templates": header_templates()}})
             );
         });
     }

@@ -2284,15 +2284,14 @@ mod tests {
     #[tokio::test]
     async fn given_undecodable_user_headers_when_policy_stops_should_end_the_batch_at_the_message()
     {
-        for (messages, failed_offset) in [
-            (undecodable_header_batch(), 1),
-            (
-                vec![
-                    test_message(0, br#"{"id":1}"#.to_vec()),
-                    message_with_malformed_headers(1),
-                ],
-                1,
-            ),
+        // Each batch has its first undecodable message at offset 1: an unknown kind code,
+        // then headers that fail the wire check.
+        for messages in [
+            undecodable_header_batch(),
+            vec![
+                test_message(0, br#"{"id":1}"#.to_vec()),
+                message_with_malformed_headers(1),
+            ],
         ] {
             let plugin_id = next_plugin_id();
 
@@ -2307,7 +2306,7 @@ mod tests {
             .await;
 
             let failure = timing.failure.expect("the batch must stop");
-            assert_eq!(failure.offset, failed_offset);
+            assert_eq!(failure.offset, 1);
             assert!(
                 failure.reason.contains("user headers"),
                 "{}",

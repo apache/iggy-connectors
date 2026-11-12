@@ -107,6 +107,7 @@ pub struct ElasticsearchSink {
     config: ElasticsearchSinkConfig,
     client: Option<Elasticsearch>,
     retry_policy: RetryPolicy,
+    include_headers: bool,
     state: Mutex<State>,
 }
 
@@ -117,11 +118,13 @@ impl ElasticsearchSink {
             base_delay: parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY),
             max_delay: parse_duration(config.retry_max_delay.as_deref(), DEFAULT_RETRY_MAX_DELAY),
         };
+        let include_headers = config.include_headers.unwrap_or(DEFAULT_INCLUDE_HEADERS);
         ElasticsearchSink {
             id,
             config,
             client: None,
             retry_policy,
+            include_headers,
             state: Mutex::new(State {
                 invocations_count: 0,
                 documents_indexed: 0,
@@ -205,17 +208,11 @@ impl ElasticsearchSink {
         Ok(())
     }
 
-    fn include_headers(&self) -> bool {
-        self.config
-            .include_headers
-            .unwrap_or(DEFAULT_INCLUDE_HEADERS)
-    }
-
     /// The body of the index-create request. `None` creates the index with no
     /// body.
     fn index_create_body(&self) -> Option<serde_json::Value> {
         let mapping = self.config.index_mapping.clone();
-        if !self.include_headers() {
+        if !self.include_headers {
             return mapping;
         }
         let mut body = mapping.unwrap_or_else(|| serde_json::json!({}));
@@ -497,7 +494,6 @@ impl Sink for ElasticsearchSink {
             .ok_or_else(|| Error::Connection("Elasticsearch client not initialized".to_string()))?;
 
         let messages_count = messages.len();
-        let include_headers = self.include_headers();
         let mut documents = Vec::with_capacity(messages_count);
         for message in messages {
             let Some(mut doc) = document_from_payload(message.payload, messages_metadata.schema)
@@ -525,7 +521,8 @@ impl Sink for ElasticsearchSink {
                     OwnedValue::from(IggyTimestamp::now().as_millis() as i64),
                 );
 
-                if include_headers && let Err(error) = insert_headers(obj, message.headers.as_ref())
+                if self.include_headers
+                    && let Err(error) = insert_headers(obj, message.headers.as_ref())
                 {
                     warn!(
                         "Elasticsearch sink with ID: {} indexes the message at offset: {} without user headers, error: {error}",

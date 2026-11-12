@@ -17,10 +17,10 @@
 
 use async_trait::async_trait;
 use iggy_connector_testing::elasticsearch::{
-    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_INCLUDE_HEADERS, ENV_SINK_INDEX,
-    ENV_SINK_PATH, ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA,
-    ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_URL, ElasticsearchContainer,
-    ElasticsearchOps, ElasticsearchSearchResponse, create_http_client,
+    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_INDEX, ENV_SINK_PATH,
+    ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
+    ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_URL, ElasticsearchContainer, ElasticsearchOps,
+    ElasticsearchSearchResponse, create_http_client,
 };
 use integration::harness::{TestBinaryError, TestFixture};
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
@@ -199,7 +199,6 @@ impl TestFixture for ElasticsearchSinkFixture {
         let mut envs = HashMap::new();
         envs.insert(ENV_SINK_URL.to_string(), self.container.base_url.clone());
         envs.insert(ENV_SINK_INDEX.to_string(), self.index.clone());
-        envs.insert(ENV_SINK_INCLUDE_HEADERS.to_string(), "true".to_string());
         envs.insert(
             ENV_SINK_STREAMS_0_STREAM.to_string(),
             DEFAULT_TEST_STREAM.to_string(),

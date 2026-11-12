@@ -268,7 +268,7 @@ is worth more than the reuse.
 
 ### The `#[iggy_harness]` proc macro
 
-Each integration test is annotated with this macro from the `integration` crate of apache/iggy at R. It launches the prebuilt `target/debug/iggy-server` (from `./scripts/build-test-server.sh`) and optionally `target/debug/iggy-connectors` for the duration of the test, runs the seeds, then injects a `&TestHarness` and your fixture. It never builds them: run `cargo build` first, or a stale binary runs.
+Each integration test is annotated with this macro from the `integration` crate of apache/iggy at the core pin. It launches the prebuilt `target/debug/iggy-server` (from `./scripts/build-test-server.sh`) and optionally `target/debug/iggy-connectors` for the duration of the test, runs the seeds, then injects a `&TestHarness` and your fixture. It never builds them: run `cargo build` first, or a stale binary runs.
 
 ```rust
 use integration::harness::seeds;
@@ -400,7 +400,7 @@ Before pushing:
 
 ```text
 cargo fmt --all
-cargo sort --no-format --workspace
+cargo sort --no-format --grouped --workspace
 cargo clippy -p <package> --all-targets -- -D warnings
 cargo nextest run -p <package> --lib        # --bins for the runtime
 ```
@@ -408,7 +408,7 @@ cargo nextest run -p <package> --lib        # --bins for the runtime
 Integration tests run per test target. Build what the harness launches first, then filter by target and test name:
 
 ```text
-./scripts/build-test-server.sh                                          # once per R
+./scripts/build-test-server.sh                                          # once per core pin
 cargo build -p iggy-connectors -p iggy_connector_postgres_sink
 cargo nextest run -p iggy_connector_postgres_sink --test postgres postgres_sink::   # one module
 cargo nextest run -p iggy_connector_postgres_sink --test postgres                   # the whole suite

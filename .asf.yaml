@@ -50,6 +50,8 @@ github:
         dismiss_stale_reviews: true
         required_approving_review_count: 2
       required_conversation_resolution: true
+  collaborators:
+    - justinmclean
 
 notifications:
   commits: commits@iggy.apache.org

@@ -16,10 +16,10 @@
 # under the License.
 
 # Tests the connectors against the tip of core master, so a core change
-# that breaks them shows up before the next move of R. The run moves R in
-# a scratch commit that never leaves the runner, builds the server at that
-# commit and runs the full suite. A failure opens an issue, or comments on
-# the open one.
+# that breaks them shows up before the next move of the core pin. The run
+# moves the core pin in a scratch commit that never leaves the runner,
+# builds the server at that commit and runs the full suite. A failure opens
+# an issue, or comments on the open one.
 
 name: Nightly
 
@@ -63,19 +63,19 @@ jobs:
           install-nextest: "true"
           free-disk-space: "true"
 
-      - name: Move R to core ${{ env.CORE_REF }}
+      - name: Move the core pin to ${{ env.CORE_REF }}
         id: bump
         run: |
           set -euo pipefail
-          ./scripts/bump-r.sh "$CORE_REF"
+          ./scripts/bump-core-pin.sh "$CORE_REF"
           source scripts/ci/lib/core-pin.sh
           rev=$(core_rev Cargo.toml)
           echo "core_rev=$rev" >> "$GITHUB_OUTPUT"
-          # R already at that commit leaves nothing to commit.
+          # A core pin already at that commit leaves nothing to commit.
           if ! git diff --quiet; then
             git -c user.name="github-actions[bot]" \
               -c user.email="github-actions[bot]@users.noreply.github.com" \
-              commit --quiet --all --message "chore(deps): move R to core $CORE_REF ($rev)"
+              commit --quiet --all --message "chore(deps): move the core pin to $CORE_REF ($rev)"
           fi
 
       - name: Build test server

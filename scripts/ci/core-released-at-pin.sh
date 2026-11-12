@@ -16,13 +16,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Prints "true" when core released the crates that the SDK pins from R, and
-# "false" with the reason on stderr otherwise. The published SDK resolves
-# those crates from crates.io, and crates.io can hold the same version from
-# an older commit than R. Core tags a crate release only after it published
-# the crate, so a release tag that points to R proves the crates.io copy.
+# Prints "true" when core released the crates that the SDK pins from the
+# core pin, and "false" with the reason on stderr otherwise. The published
+# SDK resolves those crates from crates.io, and crates.io can hold the same
+# version from an older commit than the core pin. Core tags a crate release
+# only after it published the crate, so a release tag that points to the
+# core pin proves the crates.io copy.
 #
-# Usage: scripts/ci/core-released-at-r.sh
+# Usage: scripts/ci/core-released-at-pin.sh
 
 set -euo pipefail
 
@@ -34,15 +35,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/git-tag.sh"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-R=$(core_rev Cargo.toml)
+CORE_REV=$(core_rev Cargo.toml)
 
 released=true
 for entry in "${CORE_VERSIONED_CRATES[@]}"; do
   IFS=: read -r crate _ tag_prefix <<< "$entry"
   tag="$tag_prefix-$(core_pinned_version Cargo.toml "$crate")"
   commit=$(tag_commit "$CORE_GIT_URL" "$tag")
-  if [[ "$commit" != "$R" ]]; then
-    echo "core tag $tag points to ${commit:-no commit}, not to R $R" >&2
+  if [[ "$commit" != "$CORE_REV" ]]; then
+    echo "core tag $tag points to ${commit:-no commit}, not to the core pin $CORE_REV" >&2
     released=false
   fi
 done

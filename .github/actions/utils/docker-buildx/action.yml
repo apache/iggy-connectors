@@ -139,7 +139,7 @@ runs:
 
     - name: Login to Docker Hub
       if: steps.config.outputs.should_push == 'true'
-      uses: apache/iggy/.github/actions/utils/docker-login@d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8
+      uses: apache/iggy/.github/actions/utils/docker-login@fe822af6bef32a2630f70688756618d2b3d060e5
       with:
         username: ${{ env.DOCKERHUB_USER }}
         password: ${{ env.DOCKERHUB_TOKEN }}

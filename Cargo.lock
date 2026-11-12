@@ -2340,7 +2340,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "clock"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "iggy_common",
 ]
@@ -2683,7 +2683,7 @@ dependencies = [
 [[package]]
 name = "configs"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "configs_derive",
  "cpu_allocation",
@@ -2704,7 +2704,7 @@ dependencies = [
 [[package]]
 name = "configs_derive"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "darling 0.24.1",
  "proc-macro2",
@@ -2715,7 +2715,7 @@ dependencies = [
 [[package]]
 name = "consensus"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "bit-set",
  "blake3",
@@ -2849,7 +2849,7 @@ checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 [[package]]
 name = "cpu_allocation"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "nix",
  "serde",
@@ -4579,7 +4579,7 @@ dependencies = [
 [[package]]
 name = "harness_derive"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5193,7 +5193,7 @@ dependencies = [
 [[package]]
 name = "iggy"
 version = "0.12.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -5297,7 +5297,7 @@ dependencies = [
 [[package]]
 name = "iggy_binary_protocol"
 version = "0.12.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -5312,7 +5312,7 @@ dependencies = [
 [[package]]
 name = "iggy_common"
 version = "0.12.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "aes-gcm 0.11.1",
  "aes-gcm-siv",
@@ -6123,7 +6123,7 @@ checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 [[package]]
 name = "integration"
 version = "0.0.1"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -6131,6 +6131,7 @@ dependencies = [
  "cfg_aliases",
  "configs",
  "consensus",
+ "fs2",
  "futures",
  "harness_derive",
  "iggy",
@@ -6350,7 +6351,7 @@ dependencies = [
 [[package]]
 name = "journal"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "bytemuck",
  "compio",
@@ -6861,7 +6862,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "message_bus"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "ahash",
  "async-channel",
@@ -9941,7 +9942,7 @@ dependencies = [
 [[package]]
 name = "server_common"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "aligned-vec",
  "argon2",
@@ -10684,7 +10685,7 @@ dependencies = [
 [[package]]
 name = "system_stats"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "cpu_allocation",
  "sysinfo 0.40.1",

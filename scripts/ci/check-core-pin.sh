@@ -16,11 +16,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Checks the pin of R, the apache/iggy commit in the root Cargo.toml.
+# Checks the core pin, the apache/iggy commit in the root Cargo.toml.
 # Cargo accepts `version = "0.12.0"` next to a git rev whose crate is 0.12.3,
 # but the published SDK would then ask crates.io for a core it was never
-# tested with. So each pinned version must equal the version at R. The
-# resolved graph must also hold one copy of core only, the one at R.
+# tested with. So each pinned version must equal the version at the core
+# pin. The resolved graph must also hold one copy of core only, the one at
+# the core pin.
 
 set -euo pipefail
 
@@ -32,8 +33,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/core-pin.sh"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-R=$(core_rev Cargo.toml)
-EXPECTED_SOURCE=$(core_package_source "$R")
+CORE_REV=$(core_rev Cargo.toml)
+EXPECTED_SOURCE=$(core_package_source "$CORE_REV")
 METADATA=$(cargo metadata --format-version 1 --locked)
 
 FAILED=0
@@ -53,10 +54,10 @@ while read -r crate _ pinned; do
   resolved=$(jq -r --arg name "$crate" --arg source "$EXPECTED_SOURCE" '
     [.packages[] | select(.name == $name and .source == $source) | .version] | join(" ")' <<< "$METADATA")
   if [[ "$resolved" == "$pinned" ]]; then
-    echo "$crate $pinned matches R $R"
+    echo "$crate $pinned matches the core pin $CORE_REV"
   else
-    echo "error: Cargo.toml pins $crate at $pinned, but $crate at R $R is ${resolved:-missing}" >&2
-    echo "Run scripts/bump-r.sh $R to fix the pin." >&2
+    echo "error: Cargo.toml pins $crate at $pinned, but $crate at the core pin $CORE_REV is ${resolved:-missing}" >&2
+    echo "Run scripts/bump-core-pin.sh $CORE_REV to fix the pin." >&2
     FAILED=1
   fi
 done < <(core_dependencies Cargo.toml)

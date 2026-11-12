@@ -137,6 +137,8 @@ Per `[[streams]]` entry per sink:
    The reader retries most errors by itself. For a partition that it stops, `handle_read_error` seeks: after a read with an unknown outcome (`FetchProgressUncertain`, `PartitionLaneBlocked`) it first calls `abandon_operation` and then seeks `Next` (after the stored offset). It seeks the `skip` of a message that does not decode, and `Next` after `HistoryUnavailable`.
 
    It also seeks `Next` after six refusals in a row that a retry does not change (`ReadError::is_lasting_refusal`: `Unauthorized`, a missing stream, topic or partition, and the other lasting refusals). A seek to `Next` stores nothing, so it works while the refusal lasts.
+
+   A report with `ReadError::lost` names the offsets that a lost read committed and that the reader cannot read again. The batch after that range arrives after the report, and a seek drops it. So `handle_read_error` seeks the `skip` of the report, which stores the offset before that batch and reads it again. If that seek fails, it seeks `Next`, which resumes a partition that the reader stopped.
 4. Decode via `Schema::decoder()`. Decode failure logs + bumps `errors`. `messages_filtered` is reserved for the transform filter contract (`Ok(None)`).
 5. Apply transforms (chain). A transform `Err` is logged, bumps `errors`, and drops only that message (drop-and-continue, mirroring the source) - one bad payload never kills the batch. `Ok(None)` filters the message - bumps `messages_filtered{connector_type="sink"}`.
 6. Postcard-encode batch as `RawMessages`. Headers as a separate postcard blob. Per-message failures (missing field, payload conversion, header serialization) bump `errors` + skip. Batch-level failures (postcard serialization of metadata / `RawMessages`) propagate `Err` -> `spawn_consume_tasks` wrapper bumps `errors` + `set_error`. The total histogram and benchmark emit still fire for the failed batch before the `Err` propagates.
@@ -268,14 +270,14 @@ Filter case bumps `messages_filtered` via `inc_messages_filtered_with_labels`. A
 
 ```bash
 cargo fmt --all
-cargo sort --no-format --workspace
+cargo sort --no-format --grouped --workspace
 cargo clippy -p iggy-connectors --all-targets -- -D warnings
 cargo nextest run -p iggy-connectors --bins
 
 # The runtime test targets launch target/debug/iggy-connectors and load these plugins:
 cargo build -p iggy-connectors -p iggy_connector_stdout_sink -p iggy_connector_random_source
 
-# Unit + runtime integration tests (Docker, plus ./scripts/build-test-server.sh once per R):
+# Unit + runtime integration tests (Docker, plus ./scripts/build-test-server.sh once per core pin):
 cargo nextest run -p iggy-connectors
 
 # Smoke-test with example config:

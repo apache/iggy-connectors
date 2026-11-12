@@ -50,7 +50,7 @@ pub const DATA_ENCODING_BASE64: &str = "base64";
 /// The backend name of one user-header key.
 ///
 /// `Display` writes the name. `Serialize` writes it as a string, so it can be
-/// a map key. A plain string key is written without a copy.
+/// a map key.
 #[derive(Debug, Clone, Copy)]
 pub struct HeaderName<'a>(pub &'a HeaderKey);
 
@@ -69,14 +69,12 @@ impl Display for HeaderName<'_> {
                 ),
             },
             HeaderKind::Raw => write!(f, "~raw:{}", Base64Display::new(bytes, &URL_SAFE_NO_PAD)),
-            HeaderKind::Float32 => match fixed::<4>(bytes) {
-                Some(bits) => write!(f, "~float32:{:08x}", u32::from_le_bytes(bits)),
-                None => write_malformed(f, HeaderKind::Float32, bytes),
-            },
-            HeaderKind::Float64 => match fixed::<8>(bytes) {
-                Some(bits) => write!(f, "~float64:{:016x}", u64::from_le_bytes(bits)),
-                None => write_malformed(f, HeaderKind::Float64, bytes),
-            },
+            // The little-endian value bytes, written in reverse, are the hex of
+            // `to_bits()` at its fixed width.
+            kind @ (HeaderKind::Float32 | HeaderKind::Float64) => {
+                write!(f, "~{kind}:")?;
+                write_hex(f, bytes.iter().rev())
+            }
             kind => {
                 write!(f, "~{kind}:")?;
                 write_scalar(f, key)
@@ -201,13 +199,10 @@ fn write_scalar<T>(f: &mut Formatter<'_>, field: &HeaderField<T>) -> fmt::Result
     written.unwrap_or_else(|| write_hex(f, bytes))
 }
 
-fn write_malformed(f: &mut Formatter<'_>, kind: HeaderKind, bytes: &[u8]) -> fmt::Result {
-    write!(f, "~{kind}:")?;
-    write_hex(f, bytes)
-}
-
-fn write_hex(f: &mut Formatter<'_>, bytes: &[u8]) -> fmt::Result {
-    bytes.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+fn write_hex<'a>(f: &mut Formatter<'_>, bytes: impl IntoIterator<Item = &'a u8>) -> fmt::Result {
+    bytes
+        .into_iter()
+        .try_for_each(|byte| write!(f, "{byte:02x}"))
 }
 
 fn fixed<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {

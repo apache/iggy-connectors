@@ -75,7 +75,8 @@ pub enum InvalidMessages {
     #[default]
     #[strum(to_string = "stop")]
     Stop,
-    /// Skip the message, counting an error and logging its offset.
+    /// Skip the message, counting an error and logging its offset. A message whose user headers
+    /// do not decode is delivered without them instead.
     #[strum(to_string = "skip")]
     Skip,
 }

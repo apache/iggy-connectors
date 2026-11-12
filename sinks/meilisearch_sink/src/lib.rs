@@ -1360,6 +1360,19 @@ mod tests {
     }
 
     #[test]
+    fn omits_headers_for_an_empty_header_map() {
+        let sink = sink_with_config(base_config());
+        let mut message = message(Payload::Json(simd_json::json!({"name": "Alice"})));
+        message.headers = Some(BTreeMap::new());
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("prepare document");
+
+        assert!(document.get("iggy_headers").is_none());
+    }
+
+    #[test]
     fn writes_binary_header_values_as_base64_objects() {
         let sink = sink_with_config(base_config());
         let mut message = message(Payload::Json(simd_json::json!({"name": "Alice"})));

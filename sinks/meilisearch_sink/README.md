@@ -100,6 +100,12 @@ is not valid UTF-8, is `{"data": "<base64>", "iggy_header_encoding": "base64"}`.
 Raw values have the same shape as in the HTTP sink, which writes a string value
 that is not valid UTF-8 as lossy text instead.
 
+Upgrade note: earlier versions wrote no user headers. After an upgrade, documents
+with headers carry `iggy_headers` for the first time. If your index declares
+`filterableAttributes` or `searchableAttributes`, add `iggy_headers` fields
+there as needed. To keep documents without headers, set
+`include_metadata = false`, which also leaves out the other `iggy_*` fields.
+
 ## Delivery Semantics
 
 The connector runtime invokes `consume()` through an FFI callback whose status

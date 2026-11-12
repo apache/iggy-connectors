@@ -743,6 +743,48 @@ mod tests {
     }
 
     #[test]
+    fn given_escaped_string_keys_at_the_amqp_limit_when_build_headers_should_keep_255_byte_names() {
+        // `~string_b64:` plus unpadded base64url: 182 bytes give 255, 183 bytes give 256.
+        // `~string:` plus the key: 247 bytes give 255, 248 bytes give 256.
+        let kept = [
+            HeaderKey::from_raw(HeaderKind::String, &[0xffu8; 182]).unwrap(),
+            HeaderKey::from_str(&format!("~{}", "k".repeat(246))).unwrap(),
+        ];
+        let skipped = [
+            HeaderKey::from_raw(HeaderKind::String, &[0xfeu8; 183]).unwrap(),
+            HeaderKey::from_str(&format!("~{}", "s".repeat(247))).unwrap(),
+        ];
+        let mut message = test_message(0);
+        message.headers = Some(
+            kept.iter()
+                .chain(&skipped)
+                .map(|key| (key.clone(), HeaderValue::from_str("value").unwrap()))
+                .collect(),
+        );
+        let mut config = test_config();
+        config.include_metadata = Some(false);
+        let sink = test_sink(config);
+        let (topic, metadata) = header_test_metadata();
+
+        let headers = sink.build_headers(&topic, &metadata, &message);
+
+        assert_eq!(headers.inner().len(), kept.len());
+        for key in &kept {
+            let name = HeaderName(key).to_string();
+            assert_eq!(name.len(), 255, "name {name}");
+            assert!(
+                headers
+                    .inner()
+                    .contains_key(&ShortString::try_new(name).unwrap())
+            );
+        }
+        assert_eq!(
+            sink.skipped_header_names.load(Ordering::Relaxed),
+            skipped.len() as u64
+        );
+    }
+
+    #[test]
     fn given_user_header_named_like_metadata_when_build_headers_should_keep_metadata() {
         let mut message = test_message(0);
         message.headers = Some(std::collections::BTreeMap::from([(

@@ -14,7 +14,7 @@ A sink connector that consumes messages from Iggy streams and indexes them to El
 - `retry_max_delay`: Maximum backoff delay in humantime format (default: `"5s"`)
 - `create_index_if_not_exists`: Automatically create index (default: true)
 - `index_mapping`: Index mapping configuration
-- `include_headers`: Write user headers to `_iggy_headers` (default: true)
+- `include_headers`: Write user headers to `_iggy_headers` (default: false)
 
 Retry delays allow zero; invalid duration strings log a warning and fall back to `1s`. The HTTP timeout applies per request, so a consume call can span multiple requests and backoff delays; there is no separate total time budget.
 
@@ -30,7 +30,7 @@ Retry delays allow zero; invalid duration strings log a warning and fall back to
 
 With `include_headers = true`, each document gets an `_iggy_headers` object with one field per user header:
 
-Upgrade note: earlier versions wrote no user headers, and `include_headers` defaults to `true`. After an upgrade, documents with headers carry `_iggy_headers` for the first time. For an index that already exists, add the templates below by hand. For an index with `"dynamic": "strict"`, set `include_headers = false` or declare `_iggy_headers`, as the limits below explain.
+Upgrade note: earlier versions wrote no user headers. `include_headers` defaults to `false`, so an upgrade changes no document until you turn it on. Before you turn it on for an index that already exists, add the templates below by hand. An index with `"dynamic": "strict"` must declare `_iggy_headers` first, as the limits below explain.
 
 ```json
 "_iggy_headers": {
@@ -57,4 +57,4 @@ Limits:
 
 - A header key that contains `.`, such as `mqtt.qos`, becomes an object path in the mapping. Elasticsearch rejects the whole document for a key that starts with `.`, contains `..`, or holds only dots or whitespace, such as `.a` or `a..b`. Two keys where one is a path inside the other, such as `x` and `x.data`, conflict, and the second one to arrive fails to index.
 - Each distinct header name adds mapped fields, which count toward `index.mapping.total_fields.limit`.
-- An index with `"dynamic": "strict"` rejects documents with headers unless its mapping declares `_iggy_headers`. Set `include_headers = false` for such an index.
+- An index with `"dynamic": "strict"` rejects documents with headers unless its mapping declares `_iggy_headers`. Keep `include_headers = false` for such an index.

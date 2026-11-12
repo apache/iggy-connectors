@@ -43,7 +43,7 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
-const DEFAULT_INCLUDE_HEADERS: bool = true;
+const DEFAULT_INCLUDE_HEADERS: bool = false;
 const HEADERS_FIELD: &str = "_iggy_headers";
 const HEADER_DATA_PATH_MATCH: &str = "_iggy_headers.*.data";
 /// Name and `match_mapping_type` of each keyword template for header `data`.
@@ -97,7 +97,8 @@ pub struct ElasticsearchSinkConfig {
     pub create_index_if_not_exists: Option<bool>,
     pub index_mapping: Option<serde_json::Value>,
     /// Writes user headers to `_iggy_headers` and maps their `data` as keyword
-    /// on index creation. Defaults to `true`.
+    /// on index creation. Defaults to `false`, so that an upgrade leaves the
+    /// documents of an existing index unchanged.
     pub include_headers: Option<bool>,
 }
 
@@ -584,7 +585,7 @@ mod tests {
             retry_max_delay: None,
             create_index_if_not_exists: Some(false),
             index_mapping: None,
-            include_headers: None,
+            include_headers: Some(true),
         }
     }
 
@@ -600,6 +601,20 @@ mod tests {
         assert_eq!(sink.retry_policy.max_attempts, 3);
         assert_eq!(sink.retry_policy.base_delay, Duration::from_secs(1));
         assert_eq!(sink.retry_policy.max_delay, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn given_omitted_include_headers_when_loading_should_write_no_headers_or_template() {
+        let config = serde_json::from_value(json!({
+            "url": "http://localhost:9200",
+            "index": "test"
+        }))
+        .expect("Existing configurations should remain valid");
+
+        let sink = ElasticsearchSink::new(1, config);
+
+        assert!(!sink.include_headers);
+        assert_eq!(sink.index_create_body(), None);
     }
 
     #[test]
@@ -1131,6 +1146,7 @@ mod tests {
     fn given_index_mapping_of_unexpected_shape_when_building_create_body_should_send_it_unchanged()
     {
         for mapping in [
+            json!([]),
             json!({"mappings": "not an object"}),
             json!({"mappings": {"dynamic_templates": {}}}),
         ] {

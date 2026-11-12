@@ -31,7 +31,7 @@
 //! row in its group sets. Columns no row mentions are left out, so BigQuery
 //! fills them according to `missing_value` (the column default, or NULL).
 
-use std::fmt::Write as _;
+use std::fmt::{self, Display, Write as _};
 use std::io;
 use std::sync::Arc;
 
@@ -246,10 +246,27 @@ fn estimated_headers_size(message: &ConsumedMessage) -> usize {
             let value_size = value
                 .as_raw()
                 .map_or_else(|_| value.to_string_value().len(), |raw| raw.len());
-            size.saturating_add(HeaderName(key).to_string().len())
+            size.saturating_add(display_len(&HeaderName(key)))
                 .saturating_add(value_size)
         })
     })
+}
+
+/// The byte length of `value`'s `Display` text, without building the text.
+fn display_len(value: &impl Display) -> usize {
+    let mut counter = ByteCounter(0);
+    // `ByteCounter::write_str` never fails, so neither does `write!`.
+    let _ = write!(counter, "{value}");
+    counter.0
+}
+
+struct ByteCounter(usize);
+
+impl fmt::Write for ByteCounter {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0 = self.0.saturating_add(text.len());
+        Ok(())
+    }
 }
 
 fn estimated_json_size(value: &OwnedValue) -> usize {

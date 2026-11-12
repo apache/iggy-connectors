@@ -100,6 +100,9 @@ pub struct TemplateSourceConfig {
     /// Optional path (e.g. "/health") probed with retry during `open()`
     /// before the connector is considered ready. Leave unset if your target
     /// has no health endpoint - the probe is skipped, not failed, in that case.
+    /// It is resolved against `connection_string` with URL join rules: a path that starts
+    /// with `/` replaces any path of the base URL, so `https://host/v1` plus `/health`
+    /// probes `https://host/health`.
     pub health_check_path: Option<String>,
 
     pub batch_size: Option<u32>,
@@ -294,6 +297,9 @@ impl TemplateSource {
                 headers: None,
                 checksum: None,
                 timestamp: None,
+                // Leave `None`: the runtime builds the Iggy message without this field and
+                // Iggy stamps the send time in microseconds, so a millisecond value copied
+                // from another source would be dropped, not forwarded.
                 origin_timestamp: None,
                 payload,
             });

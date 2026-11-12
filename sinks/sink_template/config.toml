@@ -44,6 +44,9 @@ consumer_group = "template_sink_connector"
 [plugin_config]
 connection_string = "https://api.example.com"
 target = "events"
+# Resolved against `connection_string` with URL join rules: a path starting with `/`
+# replaces any path in the base URL, so a base of https://host/v1 is probed at
+# https://host/health.
 health_check_path = "/health"
 batch_size = 100
 timeout = "30s"
@@ -63,7 +66,9 @@ verbose_logging = false
 
 # Delivery guarantee (a table of the connector config, not of `plugin_config`). By default the
 # server stores the offset when it answers a poll, so a batch that `consume()` fails is lost.
-# With "at_least_once" the runtime stores it after `consume()` succeeds and hands a failed
-# batch over again; a permanent rejection then stops delivery of that topic at that offset.
+# With "at_least_once" the runtime stores it once the destination holds the messages (after
+# `consume()` for a sink that writes inside it, after `flush()` for one that buffers) and
+# hands a failed batch over again; a permanent rejection then stops delivery of that topic
+# at that offset.
 # [delivery]
 # guarantee = "at_least_once"

@@ -32,6 +32,12 @@ Copy the closest existing plugin by shape:
 | Fill-in-the-blank sink | `sinks/sink_template` |
 | Fill-in-the-blank source | `sources/source_template` |
 
+Config key names differ between siblings. `http_sink` uses `url` and
+`max_retry_delay`, while the templates use `connection_string` and
+`retry_max_delay` (plus an optional `auth_token`) and reject unknown keys with
+`deny_unknown_fields`. A config copied from a sibling therefore fails to load until
+you rename its keys.
+
 `sink_template` / `source_template` are compiling, tested starting
 points: config parsing, `SecretString`, retry loops, circuit breaker,
 the time-budgeted delivery loop (sink), ACK/NACK cursor staging (source),
@@ -162,8 +168,9 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
   nothing about whether the destination is up. At most once, skip that
   error's chunk. At least once, fail the call instead, because the runtime
   stores the offset past every message of a successful call and a skipped
-  chunk would be lost for good. An unclassified error also stops the call at
-  its chunk, so no later chunk is written before the runtime redelivers the batch.
+  chunk would be lost for good. At least once, an unclassified error also stops the
+  call at its chunk, so no later chunk is written before the runtime redelivers the
+  batch. At most once it fails only its own chunk and the rest are still tried.
 - **Decide on at-least-once.** `enable_at_least_once()` runs when the sink
   is configured for it, and the default returns `Error::Unsupported`, so a
   sink refuses the mode until it overrides the method. Accept only if a
@@ -173,8 +180,10 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
   calls also implements `flush()` and keeps buffers per topic and partition.
 - **Make the destination idempotent.** Retries, replays and a server
   failover all repeat messages. Key writes on `stream:topic:partition:offset`
-  (or a natural backend key), which names a log position for good and never
-  collides across different messages. Use `message.id` only if your
+  (or a natural backend key), which names a log position for good. A stream or
+  topic name that contains `:` can make two positions join to the same key (`a` /
+  `b:c` and `a:b` / `c`), which `mongodb_sink` accepts too, so encode the parts if your
+  names may contain `:`. Use `message.id` only if your
   producers guarantee unique ids, because producers can reuse one. No random
   UUIDs per emit.
 - Batching comes from the sink's `[[streams]]` entry: `batch_length`,
@@ -239,7 +248,7 @@ touch unrelated foreign SDKs in the same PR.
 
 ```text
 [ ] SecretString on all credentials; no secret logs/state
-[ ] consume/poll never returns Ok(()) after a failed batch
+[ ] consume/poll never returns Ok(()) after a failed batch (the one exception is the at-most-once skip of a permanently rejected chunk: logged and counted, see the sink README)
 [ ] Transient vs permanent errors mapped (no Display substring matching)
 [ ] Sources: a record that cannot be converted never lets the cursor pass it (stop before it, or skip it on purpose with a log and a counter)
 [ ] Sinks: one delivery time budget per consume(); breaker paces attempts and never discards a batch; cool-down shorter than the budget; offset range logged when giving up

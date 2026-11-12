@@ -30,9 +30,10 @@
 //! the offset when it answers the poll and the runtime never redelivers a
 //! batch after an error, so `consume()` keeps trying a batch for up to
 //! `max_delivery_time` before it gives up and logs the lost offset range. With
-//! `guarantee = "at_least_once"` the runtime stores the offset only after
-//! `consume()` succeeds, hands a failed batch over again, and stops delivery of that topic on
-//! a permanent error instead of skipping the batch. The circuit breaker only
+//! `guarantee = "at_least_once"` the runtime stores the offset only once the destination
+//! holds the messages (after `consume()` for a sink that writes inside it, as this one does,
+//! after `flush()` for a sink that buffers), hands a failed batch over again, and stops
+//! delivery of that topic on a permanent error instead of skipping the batch. The circuit breaker only
 //! paces the attempts; it never discards a batch. Writes must be idempotent on
 //! `dedup_key()`, because retries, redelivery and failovers can repeat a
 //! message.
@@ -135,6 +136,9 @@ pub struct TemplateSinkConfig {
     /// Optional path (e.g. "/health") probed with retry during `open()`
     /// before the connector is considered ready. Leave unset if your target
     /// has no health endpoint - the probe is skipped, not failed, in that case.
+    /// It is resolved against `connection_string` with URL join rules: a path that starts
+    /// with `/` replaces any path of the base URL, so `https://host/v1` plus `/health`
+    /// probes `https://host/health`.
     pub health_check_path: Option<String>,
 
     pub batch_size: Option<usize>,
@@ -253,8 +257,8 @@ impl TemplateSink {
     ///
     /// The error you return decides what `consume()` does next:
     /// - `Error::HttpRequestFailed`, `Error::Connection`, `Error::CannotStoreData`,
-    ///   `Error::WriteFailure`, `Error::Storage`, `Error::TransientState` and
-    ///   `Error::CatalogCommitError` (network error, 5xx, timeout) are transient.
+    ///   `Error::WriteFailure`, `Error::Storage` and `Error::TransientState`
+    ///   (network error, 5xx, timeout) are transient.
     ///   `consume()` retries the same chunk with backoff until
     ///   `max_delivery_time` runs out, and each failed round counts toward the
     ///   circuit breaker. At least once, the failed call then makes the
@@ -268,18 +272,20 @@ impl TemplateSink {
     ///   skipped chunk would let the stored offset pass an undelivered
     ///   message. See the doc comment on that variant in
     ///   `iggy_connector_sdk::Error`.
-    /// - Any other error is not retried. At most once, the chunk is counted as
-    ///   failed and the error is returned once every chunk has been tried. At
+    /// - Any other error is not retried by this call. At most once, the chunk is counted
+    ///   as failed and the error is returned once every chunk has been tried. At
     ///   least once, the call stops at that chunk like a permanent error,
     ///   because the runtime redelivers the whole batch and a later chunk that
-    ///   was written would be written again.
+    ///   was written would be written again. `Error::CatalogCommitError` belongs here on
+    ///   purpose: the SDK says retrying a failed catalog commit can duplicate it unless
+    ///   the catalog is checked first, so verify inside `push_batch()` before you retry.
     ///
     /// By default the runtime never redelivers a batch after an error, because
     /// the server stored the offset when it answered the poll. The retries
     /// above are then the only second chance a batch gets, so from Iggy to this
     /// plugin delivery is at-most-once. With `[delivery] guarantee =
     /// "at_least_once"` the runtime stores the offset after `consume()`
-    /// succeeds and redelivers a failed batch. Duplicates come from the
+    /// succeeds (after `flush()` for a sink that buffers) and redelivers a failed batch. Duplicates come from the
     /// retries (a request that failed part way through a write), from
     /// redelivery, from replaying an offset range after a logged loss, and from
     /// a server failover before the stored offset replicated. Build a stable
@@ -363,8 +369,13 @@ impl TemplateSink {
                 Err(err) if self.at_least_once && !is_transient(&err) => {
                     let undelivered = &messages[start..];
                     failed += undelivered.len() as u64;
+                    let outcome = if err.is_permanent() {
+                        "permanent, delivery of this topic stops here"
+                    } else {
+                        "not retried by this call, the runtime redelivers the batch"
+                    };
                     error!(
-                        "{CONNECTOR_NAME} connector with ID: {} stops at {} messages (not retryable), \
+                        "{CONNECTOR_NAME} connector with ID: {} stops at {} messages ({outcome}), \
                          stream: {}, topic: {}, partition: {}, offsets {}. The stored offset stays \
                          below them. Cause: {err}",
                         self.id,
@@ -414,10 +425,13 @@ impl TemplateSink {
                 Err(err) => {
                     failed += chunk.len() as u64;
                     error!(
-                        "{CONNECTOR_NAME} connector with ID: {} failed {} messages, offsets {}: \
-                         {err}",
+                        "{CONNECTOR_NAME} connector with ID: {} failed {} messages, stream: {}, \
+                         topic: {}, partition: {}, offsets {}: {err}",
                         self.id,
                         chunk.len(),
+                        topic_metadata.stream,
+                        topic_metadata.topic,
+                        messages_metadata.partition_id,
                         offset_range(chunk)
                     );
                     last_err = Some(err);
@@ -534,6 +548,8 @@ fn dedup_key(
     )
 }
 
+// `Error::CatalogCommitError` is left out on purpose: a retried catalog commit can duplicate
+// data unless the catalog is checked first (see its doc in the SDK).
 fn is_transient(error: &Error) -> bool {
     matches!(
         error,
@@ -543,7 +559,6 @@ fn is_transient(error: &Error) -> bool {
             | Error::WriteFailure(_)
             | Error::Storage(_)
             | Error::TransientState(_)
-            | Error::CatalogCommitError(_)
     )
 }
 
@@ -576,9 +591,19 @@ impl Sink for TemplateSink {
         validate_identifier("target", &self.config.target)?;
         if self.cool_down >= self.max_delivery_time {
             return Err(Error::InvalidConfigValue(format!(
-                "circuit_breaker_cool_down ({:?}) must be shorter than max_delivery_time ({:?}), \
-                 or a batch that meets an open breaker could never be retried",
-                self.cool_down, self.max_delivery_time
+                "circuit_breaker_cool_down ({:?}, configured as {:?}) must be shorter than \
+                 max_delivery_time ({:?}, configured as {:?}), or a batch that meets an open \
+                 breaker could never be retried. A duration that does not parse falls back to 1s.",
+                self.cool_down,
+                self.config
+                    .circuit_breaker_cool_down
+                    .as_deref()
+                    .unwrap_or(DEFAULT_CIRCUIT_BREAKER_COOL_DOWN),
+                self.max_delivery_time,
+                self.config
+                    .max_delivery_time
+                    .as_deref()
+                    .unwrap_or(DEFAULT_MAX_DELIVERY_TIME)
             )));
         }
 
@@ -1019,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn given_same_batch_written_twice_should_leave_one_row_per_message() {
+    fn given_same_batch_keyed_twice_should_give_one_key_per_message() {
         let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
         let batch: Vec<_> = (0..5).map(consumed_message).collect();
         let mut destination = std::collections::HashMap::new();
@@ -1034,6 +1059,23 @@ mod tests {
         }
 
         assert_eq!(destination.len(), batch.len());
+    }
+
+    #[test]
+    fn given_unparsable_budget_when_open_should_name_the_configured_value() {
+        let mut config = test_config();
+        config.circuit_breaker_cool_down = Some("10s".to_string());
+        config.max_delivery_time = Some("soon".to_string());
+        let mut sink = TemplateSink::new(1, config);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let error = runtime
+            .block_on(sink.open())
+            .expect_err("a budget that falls back to 1s is below the 10s cool-down");
+
+        assert!(
+            matches!(error, Error::InvalidConfigValue(ref message) if message.contains("soon"))
+        );
     }
 
     #[test]
@@ -1151,11 +1193,14 @@ mod tests {
             Error::WriteFailure("w".to_string()),
             Error::Storage("s".to_string()),
             Error::TransientState("t".to_string()),
-            Error::CatalogCommitError("c".to_string()),
         ] {
             assert!(is_transient(&error), "{error} must be retried");
         }
         assert!(!is_transient(&Error::InitError("i".to_string())));
+        assert!(
+            !is_transient(&Error::CatalogCommitError("c".to_string())),
+            "a catalog commit retry can duplicate it, so it is not retried blindly"
+        );
     }
 
     #[tokio::test(start_paused = true)]

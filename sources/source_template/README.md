@@ -95,7 +95,9 @@ state handling, because none of that depends on the transport.
 Keep the crate as it is. `connection_string` is the base URL, `self.client` is
 a `reqwest` client wrapped by the SDK retry middleware (it retries a transient
 failure up to `max_retries` total attempts), and `open()` probes
-`health_check_path` with `check_connectivity_with_retry`.
+`health_check_path` with `check_connectivity_with_retry`. The path is joined to
+`connection_string` with URL rules: a path starting with `/` replaces any base
+path, so `https://host/v1` plus `/health` probes `https://host/health`.
 
 ### Path B: non-HTTP backend (database, queue, filesystem)
 

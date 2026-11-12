@@ -45,7 +45,7 @@ What `consume()` does with each chunk of up to `batch_size` messages, in order:
    runtime does not ask Iggy for more until `consume()` returns.
 2. It calls `push_batch()`.
 3. A transient error (`HttpRequestFailed`, `Connection`, `CannotStoreData`,
-   `WriteFailure`, `Storage`, `TransientState`, `CatalogCommitError`)
+   `WriteFailure`, `Storage`, `TransientState`)
    counts as one failed round toward the breaker. It waits with jittered
    exponential backoff (`retry_delay` up to `retry_max_delay`) and tries again.
 4. A permanent error (`Error::is_permanent()`, such as `PermanentHttpError` or
@@ -57,7 +57,10 @@ What `consume()` does with each chunk of up to `batch_size` messages, in order:
    would let the stored offset pass an undelivered message, so `consume()` stops
    at that chunk, counts it and every later message as failed, and returns the
    error. The runtime then stops delivery of that topic at that offset.
-5. Any other error is not retried. The runtime reads it as transient and
+5. Any other error is not retried by this call. `CatalogCommitError` is here on
+   purpose: the SDK says retrying a failed catalog commit can duplicate it unless
+   the catalog is checked first, so verify inside `push_batch()` before you retry.
+   The runtime reads it as transient and
    `retry_max_attempts` is unset by default, so at least once it redelivers
    without end, with backoff, until a permanent error or an operator stops it.
    At most once, the chunk is counted as failed,
@@ -151,7 +154,7 @@ rejected when the config is loaded.
 | `connection_string` | required | Destination URL or DSN. A `SecretString`. |
 | `target` | required | Table, index or collection name, validated in `open()`. |
 | `auth_token` | none | Optional secret, e.g. a bearer token. |
-| `health_check_path` | none | Path probed in `open()`. The probe is skipped when unset. |
+| `health_check_path` | none | Path probed in `open()`, joined to `connection_string` with URL rules: a path starting with `/` replaces any base path (`https://host/v1` plus `/health` probes `https://host/health`). The probe is skipped when unset. |
 | `batch_size` | `100` | Messages per `push_batch()` call. |
 | `timeout` | `30s` | Per-request timeout of the HTTP client. |
 | `max_retries` | `3` | Total attempts per request in the HTTP retry middleware. |
@@ -320,6 +323,11 @@ bulk API answering 200 with per-item errors), count the accepted rows yourself
 and return an error unless every row was accepted. At least once, `Ok(())` for a
 partly rejected chunk would let the stored offset pass the rejected rows. Do not
 return `Ok(())` for a batch that was not written.
+
+Until you replace the stub, every call fails with `InitError`. At most once the
+batch is counted as failed and lost, and at least once the runtime redelivers it
+without end because `retry_max_attempts` is unset by default, so keep
+`enabled = false` until `push_batch()` is implemented.
 
 **`connection_string`'s doc comment** (documentation only): describe the exact
 shape your connector expects.

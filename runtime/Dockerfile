@@ -106,6 +106,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
 FROM debian:trixie-slim AS runtime
 WORKDIR /app
 
+# reqwest cannot build an HTTP client without system CA certificates.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /app/iggy-connectors /usr/local/bin/iggy-connectors
 COPY --from=builder /app/LICENSE-binary /usr/share/doc/iggy-connect/LICENSE-binary
 COPY LICENSE NOTICE /usr/share/doc/iggy-connect/

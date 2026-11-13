@@ -29,6 +29,7 @@ members = [
     "sinks/influxdb_sink",
     "sinks/meilisearch_sink",
     "sinks/mongodb_sink",
+    "sinks/mqtt_sink",
     "sinks/otlp_sink",
     "sinks/postgres_sink",
     "sinks/quickwit_sink",

@@ -20,15 +20,14 @@ use integration::harness::{TestBinaryError, TestFixture};
 use rumqttc_v5::mqttbytes::v5::PublishProperties;
 use std::collections::HashMap;
 
-mod container;
 mod publisher;
 
-use container::{
-    DEFAULT_IGGY_TOPIC, DEFAULT_TEST_STREAM, ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_BATCH_TIMEOUT,
-    ENV_SOURCE_BROKER_URL, ENV_SOURCE_CLIENT_ID, ENV_SOURCE_INCLUDE_METADATA, ENV_SOURCE_PASSWORD,
-    ENV_SOURCE_PATH, ENV_SOURCE_PROTOCOL, ENV_SOURCE_QOS, ENV_SOURCE_SCHEMA, ENV_SOURCE_STREAM,
-    ENV_SOURCE_TOPIC, ENV_SOURCE_USERNAME, INVALID_MQTT_PASSWORD, MQTT_PASSWORD, MQTT_USERNAME,
-    MqttBrokerContainer,
+use iggy_connector_testing::mqtt::{
+    DEFAULT_IGGY_TOPIC, DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SOURCE_BATCH_SIZE,
+    ENV_SOURCE_BATCH_TIMEOUT, ENV_SOURCE_BROKER_URL, ENV_SOURCE_CLIENT_ID,
+    ENV_SOURCE_INCLUDE_METADATA, ENV_SOURCE_PASSWORD, ENV_SOURCE_PATH, ENV_SOURCE_PROTOCOL,
+    ENV_SOURCE_QOS, ENV_SOURCE_SCHEMA, ENV_SOURCE_STREAM, ENV_SOURCE_TOPIC, ENV_SOURCE_USERNAME,
+    INVALID_MQTT_PASSWORD, MQTT_PASSWORD, MQTT_USERNAME, MqttBrokerContainer,
 };
 
 const SOURCE_CLIENT_ID: &str = "iggy-mqtt-integration-source";
@@ -111,7 +110,7 @@ impl MqttFixture {
     async fn publish(&self, payload: &[u8]) -> Result<(), String> {
         publisher::publish(
             &self.broker.broker_url,
-            container::DEFAULT_TEST_TOPIC,
+            DEFAULT_TEST_TOPIC,
             self.protocol,
             self.qos,
             payload,
@@ -124,7 +123,7 @@ impl MqttFixture {
     async fn publish_batch(&self, payloads: &[Vec<u8>]) -> Result<(), String> {
         publisher::publish_batch(
             &self.broker.broker_url,
-            container::DEFAULT_TEST_TOPIC,
+            DEFAULT_TEST_TOPIC,
             self.protocol,
             self.qos,
             payloads,
@@ -137,7 +136,7 @@ impl MqttFixture {
     async fn publish_mixed_batch(&self, messages: &[(u8, Vec<u8>)]) -> Result<(), String> {
         publisher::publish_mixed_batch(
             &self.broker.broker_url,
-            container::DEFAULT_TEST_TOPIC,
+            DEFAULT_TEST_TOPIC,
             self.protocol,
             messages,
             MQTT_USERNAME,
@@ -155,7 +154,7 @@ impl MqttFixture {
             publisher::Protocol::Mqtt5 => {
                 publisher::publish_mqtt5_with_properties(
                     &self.broker.broker_url,
-                    container::DEFAULT_TEST_TOPIC,
+                    DEFAULT_TEST_TOPIC,
                     self.qos,
                     payload,
                     properties,

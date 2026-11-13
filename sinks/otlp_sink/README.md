@@ -16,13 +16,15 @@ A message is dropped and logged when it does not decode, when it holds no resour
 | --- | --- | --- |
 | `endpoint` | Required | The base URL, `http(s)://host:4318`, to which `/v1/logs` is appended after any path it has. A query string is kept. An endpoint that already ends with `/v1/logs` is rejected. |
 | `compression` | `none` | `none` or `gzip`. |
-| `headers` | none | Sent with every export as HTTP headers. Values are treated as secrets and never logged. Names are case-insensitive, so two names that differ only in case are rejected. Set them in the connector's TOML file or through the HTTP config provider: a map cannot come from an environment variable. |
+| `headers` | none | Sent with every export as HTTP headers. Values are treated as secrets and never logged. Names are case-insensitive, so two names that differ only in case are rejected. `content-type` and `content-encoding` are rejected too, because the sink sets both. Set them in the connector's TOML file or through the HTTP config provider: a map cannot come from an environment variable. |
 | `timeout` | `10s` | Timeout of one attempt. Must be greater than zero. |
 | `max_retries` | `8` | Total attempts per request, including the first. `0` and `1` both mean a single attempt. With the default delays, 8 attempts wait about 45 s in total between them. A higher value holds a batch longer instead of losing it, for retryable failures only. See [Delivery](#delivery). |
 | `retry_delay` | `1s` | Backoff before the first retry. It doubles per retry, with ±20% jitter. |
 | `max_retry_delay` | `10s` | Upper bound on one backoff. When `retry_delay` is larger, every backoff is `max_retry_delay`. |
 | `max_request_bytes` | `4000000` | Upper bound on the encoded size of one request, below the 4 MiB limit most receivers use. Messages are packed whole into requests, so a single message larger than this is sent on its own. |
 | `verbose_logging` | `false` | Log each batch at `info` with the running counters, instead of at `debug`. |
+
+A key that is not in this table is rejected, so a misspelled key stops the connector at start instead of taking its default.
 
 TLS is used when the endpoint scheme is `https`, verified against the system's root certificates. Client certificates (mTLS) are not supported.
 
@@ -56,7 +58,8 @@ Some limits of this approach:
 
 - The sink uses its own backoff. It does not read the delay that a `Retry-After` header asks for.
 - A retry can deliver records twice. That happens when the receiver stored a request but its answer did not arrive in time.
-- While a request is retried, `consume` does not return. That is the backpressure: the runtime polls the next batch only after `consume` returns. With the defaults, one request can take about 45 s of backoff plus up to `timeout` per attempt. A connector stop waits for it.
+- While a request is retried, `consume` does not return. That is the only backpressure: the runtime polls the next batch only after `consume` returns. With the defaults, one request can take about 45 s of backoff plus up to `timeout` per attempt. A connector stop waits for it.
+- A permanent failure has no such wait. A status such as `401` or `404` ends the request after one attempt, and the runtime goes on to read and commit the next batch. An expired token or a wrong endpoint path therefore drains the backlog: every batch is read, refused and lost until the config is fixed.
 - The requests of one batch are sent one after another, each with its own retries, so a batch that needs several requests can wait that long once per request. Lower `batch_length` to bound how many requests a batch needs.
 - A batch with a dropped message counts as one error, and as zero processed messages, in the runtime's metrics, although its other messages were exported. When an export of the batch also failed, the error the runtime logs is the export failure.
 

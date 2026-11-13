@@ -48,6 +48,9 @@ const DEFAULT_MAX_RETRY_DELAY: &str = "10s";
 const DEFAULT_MAX_REQUEST_BYTES: usize = 4_000_000;
 /// The OTLP/HTTP path of the logs signal, appended to the endpoint.
 const LOGS_PATH: &str = "/v1/logs";
+/// Set by the exporter for every request. A configured `content-encoding` would label an
+/// uncompressed body as compressed, and a configured `content-type` would be overwritten.
+const RESERVED_HEADERS: [&str; 2] = ["content-type", "content-encoding"];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -60,6 +63,8 @@ pub enum Compression {
 // `Deserialize` only. Nothing re-serializes a plugin config, and leaving `Serialize` off is
 // what keeps the header values, which carry API keys, unserializable.
 #[derive(Debug, Clone, Deserialize)]
+// Every key but `endpoint` is optional, so a misspelled one would take its default in silence.
+#[serde(deny_unknown_fields)]
 pub struct OtlpSinkConfig {
     /// The base URL, `http(s)://host:4318`, to which `/v1/logs` is appended.
     pub endpoint: String,
@@ -143,6 +148,14 @@ impl Settings {
 
         let mut header_names = HashSet::new();
         for name in config.headers.iter().flatten().map(|(name, _)| name) {
+            if RESERVED_HEADERS
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            {
+                return Err(Error::InvalidConfigValue(format!(
+                    "header \"{name}\" is set by the sink and cannot be configured: use compression to choose the encoding"
+                )));
+            }
             if !header_names.insert(name.to_ascii_lowercase()) {
                 return Err(Error::InvalidConfigValue(format!(
                     "header \"{name}\" is set twice: header names are case-insensitive"
@@ -484,7 +497,11 @@ mod tests {
     use super::*;
     use iggy_connector_sdk::Schema;
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use prost::Message;
+    use wiremock::matchers::body_bytes;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_config() -> OtlpSinkConfig {
         OtlpSinkConfig {
@@ -533,6 +550,26 @@ mod tests {
         }
     }
 
+    /// An encoded export request of one log record with this body.
+    fn request_with_body(body: &str) -> Vec<u8> {
+        let record = LogRecord {
+            body: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(body.to_owned())),
+            }),
+            ..Default::default()
+        };
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![record],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec()
+    }
+
     #[test]
     fn given_minimal_config_should_apply_defaults() {
         let settings = Settings::resolve(1, &test_config()).expect("valid config");
@@ -571,6 +608,22 @@ mod tests {
         assert_eq!(
             headers["authorization"].expose_secret(),
             "Bearer secret-token"
+        );
+    }
+
+    #[test]
+    fn given_unknown_config_key_should_fail_to_parse() {
+        let error = toml::from_str::<OtlpSinkConfig>(
+            r#"
+            endpoint = "http://localhost:4318"
+            max_retry = 5
+            "#,
+        )
+        .expect_err("max_retry is not a key");
+
+        assert!(
+            error.to_string().contains("unknown field `max_retry`"),
+            "{error}"
         );
     }
 
@@ -666,6 +719,23 @@ mod tests {
     }
 
     #[test]
+    fn given_header_that_the_sink_sets_itself_should_fail_open() {
+        for name in ["Content-Type", "content-encoding"] {
+            let mut config = test_config();
+            config.headers = Some(HashMap::from([(
+                name.to_owned(),
+                SecretString::from("gzip"),
+            )]));
+            let mut sink = OtlpSink::new(1, config);
+
+            assert!(
+                matches!(open(&mut sink), Err(Error::InvalidConfigValue(_))),
+                "{name} would contradict what the sink sends"
+            );
+        }
+    }
+
+    #[test]
     fn given_endpoint_without_scheme_should_fail_open() {
         let mut config = test_config();
         config.endpoint = "localhost:4318".to_owned();
@@ -730,6 +800,48 @@ mod tests {
             matches!(result, Err(Error::CannotStoreData(_))),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn given_failed_request_should_still_send_the_next_request_of_the_batch() {
+        let refused = request_with_body("to refuse");
+        let accepted = request_with_body("to accept");
+
+        let (result, received) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let server = MockServer::start().await;
+                Mock::given(body_bytes(refused.clone()))
+                    .respond_with(ResponseTemplate::new(400))
+                    .mount(&server)
+                    .await;
+                Mock::given(body_bytes(accepted.clone()))
+                    .respond_with(ResponseTemplate::new(200))
+                    .mount(&server)
+                    .await;
+                let mut config = test_config();
+                config.endpoint = server.uri();
+                // Room for one of the two messages, so each is a request of its own.
+                config.max_request_bytes = Some(refused.len());
+                let mut sink = OtlpSink::new(1, config);
+                sink.open().await.expect("valid config");
+
+                let result = sink
+                    .consume(
+                        &topic(),
+                        raw_metadata(),
+                        vec![raw_message(refused.clone()), raw_message(accepted.clone())],
+                    )
+                    .await;
+                (result, server.received_requests().await.unwrap_or_default())
+            });
+
+        assert!(
+            matches!(result, Err(Error::PermanentHttpError(_))),
+            "{result:?}"
+        );
+        let bodies: Vec<_> = received.iter().map(|request| &request.body).collect();
+        assert_eq!(bodies, [&refused, &accepted]);
     }
 
     #[test]

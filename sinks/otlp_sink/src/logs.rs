@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_connector_sdk::Error;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
+
+const TRACE_ID_BYTES: usize = 16;
+const SPAN_ID_BYTES: usize = 8;
 
 /// The log records in every resource entry of `request`.
 pub(crate) fn log_record_count(request: &ExportLogsServiceRequest) -> u64 {
@@ -29,6 +33,23 @@ pub(crate) fn log_record_count(request: &ExportLogsServiceRequest) -> u64 {
         .sum()
 }
 
+/// Check that every trace ID and span ID is absent or has the length OTLP defines.
+///
+/// The decode accepts an ID of any length, because the field is plain `bytes` to protobuf. The
+/// Collector checks the length, and rejects the whole request for one ID that fails.
+pub(crate) fn check_id_lengths(request: &ExportLogsServiceRequest) -> Result<(), Error> {
+    let log_records = request
+        .resource_logs
+        .iter()
+        .flat_map(|resource| &resource.scope_logs)
+        .flat_map(|scope| &scope.log_records);
+    for log_record in log_records {
+        check_id_length("trace_id", &log_record.trace_id, TRACE_ID_BYTES)?;
+        check_id_length("span_id", &log_record.span_id, SPAN_ID_BYTES)?;
+    }
+    Ok(())
+}
+
 /// Log records the receiver accepted the request but dropped, with its reason.
 pub(crate) fn rejected_log_records(response: &ExportLogsServiceResponse) -> Option<(i64, &str)> {
     response
@@ -36,6 +57,16 @@ pub(crate) fn rejected_log_records(response: &ExportLogsServiceResponse) -> Opti
         .as_ref()
         .filter(|partial| partial.rejected_log_records > 0)
         .map(|partial| (partial.rejected_log_records, partial.error_message.as_str()))
+}
+
+fn check_id_length(field: &str, id: &[u8], expected: usize) -> Result<(), Error> {
+    if id.is_empty() || id.len() == expected {
+        return Ok(());
+    }
+    Err(Error::InvalidRecordValue(format!(
+        "a log record has a {field} of {} bytes, not {expected}",
+        id.len()
+    )))
 }
 
 #[cfg(test)]
@@ -57,6 +88,16 @@ mod tests {
         }
     }
 
+    /// Two resources, with `log_record` as the last record of the second one, so a check that
+    /// stops at the first resource, scope or record does not reach it.
+    fn request_ending_with(log_record: LogRecord) -> ExportLogsServiceRequest {
+        let mut last = resource(&[1, 1]);
+        last.scope_logs[1].log_records.push(log_record);
+        ExportLogsServiceRequest {
+            resource_logs: vec![resource(&[1]), last],
+        }
+    }
+
     #[test]
     fn given_request_should_count_every_record_across_resources_and_scopes() {
         let request = ExportLogsServiceRequest {
@@ -64,6 +105,49 @@ mod tests {
         };
 
         assert_eq!(log_record_count(&request), 6);
+    }
+
+    #[test]
+    fn given_ids_that_are_absent_or_of_the_defined_length_should_pass() {
+        let request = request_ending_with(LogRecord {
+            trace_id: vec![1; 16],
+            span_id: vec![1; 8],
+            ..Default::default()
+        });
+
+        assert_eq!(check_id_lengths(&request), Ok(()));
+    }
+
+    #[test]
+    fn given_trace_id_of_another_length_should_fail() {
+        // A trace ID written as its 32 hex characters, not as 16 bytes.
+        let request = request_ending_with(LogRecord {
+            trace_id: b"5b8efff798038103d269b633813fc60c".to_vec(),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            check_id_lengths(&request),
+            Err(Error::InvalidRecordValue(
+                "a log record has a trace_id of 32 bytes, not 16".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn given_span_id_of_another_length_should_fail() {
+        let request = request_ending_with(LogRecord {
+            trace_id: vec![1; 16],
+            span_id: vec![1; 7],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            check_id_lengths(&request),
+            Err(Error::InvalidRecordValue(
+                "a log record has a span_id of 7 bytes, not 8".to_owned()
+            ))
+        );
     }
 
     #[test]

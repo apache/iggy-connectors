@@ -26,7 +26,7 @@
 //! accounts for an exact number of them. A request grows until the next message would take
 //! it past `max_request_bytes`. A single message larger than that is sent on its own.
 
-use crate::logs::log_record_count;
+use crate::logs::{check_id_lengths, log_record_count};
 use iggy_connector_sdk::{ConsumedMessage, Error, Payload};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message;
@@ -37,17 +37,23 @@ pub(crate) struct Packed {
     pub body: Vec<u8>,
     pub messages: u64,
     pub log_records: u64,
+    /// The offsets of the first and the last message. A message dropped between them is not
+    /// in the request.
+    pub first_offset: u64,
+    pub last_offset: u64,
     /// One message larger than `max_request_bytes`, sent on its own.
     pub oversized: bool,
 }
 
 impl Packed {
-    fn push(&mut self, bytes: Vec<u8>, log_records: u64) {
+    fn push(&mut self, bytes: Vec<u8>, log_records: u64, offset: u64) {
         if self.messages == 0 {
             self.body = bytes;
+            self.first_offset = offset;
         } else {
             self.body.extend_from_slice(&bytes);
         }
+        self.last_offset = offset;
         self.messages += 1;
         self.log_records += log_records;
     }
@@ -58,7 +64,8 @@ impl Packed {
 pub(crate) struct Prepared {
     pub requests: Vec<Packed>,
     pub dropped: u64,
-    pub first_error: Option<Error>,
+    /// The offset of the first dropped message, and why it was dropped.
+    pub first_dropped: Option<(u64, Error)>,
 }
 
 /// Check that each message holds one OTLP export request, then pack them.
@@ -66,20 +73,21 @@ pub(crate) fn pack_requests(messages: Vec<ConsumedMessage>, max_request_bytes: u
     let mut requests = Vec::new();
     let mut current = Packed::default();
     let mut dropped = 0u64;
-    let mut first_error = None;
+    let mut first_dropped = None;
     for message in messages {
+        let offset = message.offset;
         let (bytes, log_records) = match check_request(message.payload) {
             Ok(checked) => checked,
             Err(error) => {
                 dropped += 1;
-                first_error.get_or_insert(error);
+                first_dropped.get_or_insert((offset, error));
                 continue;
             }
         };
         if current.messages > 0 && current.body.len() + bytes.len() > max_request_bytes {
             requests.push(std::mem::take(&mut current));
         }
-        current.push(bytes, log_records);
+        current.push(bytes, log_records, offset);
         // Only a request of one message can be over the limit here.
         if current.body.len() > max_request_bytes {
             current.oversized = true;
@@ -93,7 +101,7 @@ pub(crate) fn pack_requests(messages: Vec<ConsumedMessage>, max_request_bytes: u
     Prepared {
         requests,
         dropped,
-        first_error,
+        first_dropped,
     }
 }
 
@@ -103,7 +111,8 @@ pub(crate) fn pack_requests(messages: Vec<ConsumedMessage>, max_request_bytes: u
 /// The decode is a full one, not a walk over the top-level fields, because only a full decode
 /// finds a fault inside a resource entry. A faulty message joined with others makes the
 /// receiver reject the whole request, and the runtime does not deliver a batch again. The
-/// decode also rejects a message of another signal, whose fields have other wire types.
+/// decode also rejects a message of another signal, whose fields have other wire types. The
+/// ID lengths are checked for the same reason, because the decode accepts any length.
 fn check_request(payload: Payload) -> Result<(Vec<u8>, u64), Error> {
     let Payload::Raw(bytes) = payload else {
         return Err(Error::InvalidPayloadType);
@@ -117,6 +126,7 @@ fn check_request(payload: Payload) -> Result<(Vec<u8>, u64), Error> {
                 .to_owned(),
         ));
     }
+    check_id_lengths(&request)?;
     Ok((bytes, log_record_count(&request)))
 }
 
@@ -129,9 +139,13 @@ mod tests {
     const NO_LIMIT: usize = usize::MAX;
 
     fn message(payload: Payload) -> ConsumedMessage {
+        message_at(7, payload)
+    }
+
+    fn message_at(offset: u64, payload: Payload) -> ConsumedMessage {
         ConsumedMessage {
             id: 42,
-            offset: 7,
+            offset,
             checksum: 0,
             timestamp: 2_000,
             origin_timestamp: 1_000,
@@ -208,8 +222,8 @@ mod tests {
 
         assert_eq!(prepared.dropped, 1);
         assert!(matches!(
-            prepared.first_error,
-            Some(Error::InvalidRecordValue(_))
+            prepared.first_dropped,
+            Some((7, Error::InvalidRecordValue(_)))
         ));
         assert!(prepared.requests.is_empty());
     }
@@ -228,9 +242,65 @@ mod tests {
         );
 
         assert_eq!(prepared.dropped, 1);
-        assert_eq!(prepared.first_error, Some(Error::InvalidProtobufPayload));
+        assert_eq!(
+            prepared.first_dropped,
+            Some((7, Error::InvalidProtobufPayload))
+        );
         assert_eq!(prepared.requests.len(), 1);
         assert_eq!(prepared.requests[0].messages, 2);
+    }
+
+    #[test]
+    fn given_trace_id_of_wrong_length_should_drop_only_that_message() {
+        let valid = logs_request(&["a"]).encode_to_vec();
+        let mut faulty = logs_request(&["b"]);
+        faulty.resource_logs[0].scope_logs[0].log_records[0].trace_id = vec![1; 32];
+
+        let prepared = pack_requests(
+            vec![
+                message(Payload::Raw(valid.clone())),
+                message(Payload::Raw(faulty.encode_to_vec())),
+                message(Payload::Raw(valid)),
+            ],
+            NO_LIMIT,
+        );
+
+        assert_eq!(prepared.dropped, 1);
+        assert!(matches!(
+            prepared.first_dropped,
+            Some((7, Error::InvalidRecordValue(_)))
+        ));
+        assert_eq!(prepared.requests.len(), 1);
+        assert_eq!(prepared.requests[0].messages, 2);
+    }
+
+    #[test]
+    fn given_dropped_and_packed_messages_should_keep_their_offsets() {
+        let payload = logs_request(&["0123456789"]).encode_to_vec();
+        let one_message = payload.len();
+
+        let prepared = pack_requests(
+            vec![
+                message_at(10, Payload::Raw(payload.clone())),
+                message_at(11, Payload::Raw(vec![0xff, 0xff, 0xff])),
+                message_at(12, Payload::Raw(payload.clone())),
+                message_at(13, Payload::Raw(vec![0xff, 0xff, 0xff])),
+                message_at(14, Payload::Raw(payload)),
+            ],
+            one_message * 2,
+        );
+
+        assert_eq!(prepared.dropped, 2);
+        assert_eq!(
+            prepared.first_dropped,
+            Some((11, Error::InvalidProtobufPayload))
+        );
+        let offsets: Vec<(u64, u64)> = prepared
+            .requests
+            .iter()
+            .map(|packed| (packed.first_offset, packed.last_offset))
+            .collect();
+        assert_eq!(offsets, vec![(10, 12), (14, 14)]);
     }
 
     #[test]
@@ -241,7 +311,7 @@ mod tests {
         );
 
         assert_eq!(prepared.dropped, 1);
-        assert_eq!(prepared.first_error, Some(Error::InvalidPayloadType));
+        assert_eq!(prepared.first_dropped, Some((7, Error::InvalidPayloadType)));
         assert!(prepared.requests.is_empty());
     }
 

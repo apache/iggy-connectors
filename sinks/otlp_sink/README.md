@@ -6,7 +6,9 @@ The OTLP sink exports logs from Iggy topics to any backend that speaks the OpenT
 
 Each message on the consumed topics holds one protobuf `ExportLogsServiceRequest`, with the stream `schema` set to `raw`. This is the `otlp_proto` encoding of the OpenTelemetry Collector's Kafka exporter and receiver, so a topic written by a collector can be exported unchanged.
 
-The sink checks that each message decodes, then forwards it as the bytes it arrived in. Resources, scopes and attributes are not rewritten, and fields this sink does not know still reach the receiver. A message that does not decode, or that holds no resource entry, is dropped and logged. The other messages of its batch are still exported.
+The sink checks that each message decodes, then forwards it as the bytes it arrived in. Resources, scopes and attributes are not rewritten, and fields this sink does not know still reach the receiver.
+
+A message is dropped and logged when it does not decode, when it holds no resource entry, or when one of its log records has a `trace_id` that is not 16 bytes or a `span_id` that is not 8 bytes. An absent ID is valid. The length is checked because a Collector rejects a whole request for one such ID, and a request packs many messages. The other messages of the batch are still exported.
 
 ## Configuration
 
@@ -60,6 +62,8 @@ Some limits of this approach:
 
 The sink does not contact the endpoint when it opens, so it starts even when the receiver is down.
 
+The warning for dropped messages names the stream, the topic, the partition and the offset of the first dropped message. The error for a failed request names the stream, the topic, the partition and the offsets of its first and last message, so the messages can be found in Iggy.
+
 ## Counters
 
 The sink keeps these counters, logs them when it closes and, with `verbose_logging`, after every batch:
@@ -68,7 +72,7 @@ The sink keeps these counters, logs them when it closes and, with `verbose_loggi
 | --- | --- |
 | `messages_sent` | Messages in requests the receiver accepted. |
 | `messages_failed` | Messages in requests that failed after every retry. |
-| `messages_dropped` | Messages that could not be decoded, or that held no resource entry. |
+| `messages_dropped` | Messages that could not be decoded, that held no resource entry, or that held a `trace_id` or `span_id` of the wrong length. |
 | `batches_sent` / `batches_failed` | Export requests that succeeded or failed. |
 | `items_rejected` | Log records the receiver reported as rejected. |
 | `retries` | Retried attempts. |

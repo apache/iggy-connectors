@@ -24,7 +24,7 @@ use batch::{Packed, Prepared};
 use exporter::{ExportError, ExporterSettings, HttpExporter};
 use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Schema, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
 use reqwest::Url;
 use secrecy::{ExposeSecret, SecretString};
@@ -267,25 +267,26 @@ impl OtlpSink {
         opened: &Opened,
         prepared: Prepared,
         received: usize,
-        schema: Schema,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
     ) -> Result<(), Error> {
         let Prepared {
             requests,
             dropped,
-            first_error: decode_error,
+            first_dropped,
         } = prepared;
 
-        if dropped > 0 {
+        if let Some((offset, reason)) = &first_dropped {
             self.counters
                 .messages_dropped
                 .fetch_add(dropped, Ordering::Relaxed);
             warn!(
-                "OTLP sink ID: {} dropped {dropped} of {received} messages that hold no protobuf OTLP export request (stream schema: {schema}). First reason: {}",
+                "OTLP sink ID: {} dropped {dropped} of {received} messages that hold no valid protobuf OTLP export request (stream: {}, topic: {}, partition_id: {}, schema: {}). First at offset: {offset}, reason: {reason}",
                 self.id,
-                decode_error
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default()
+                topic_metadata.stream,
+                topic_metadata.topic,
+                messages_metadata.partition_id,
+                messages_metadata.schema
             );
         }
         let oversized = requests.iter().filter(|packed| packed.oversized).count();
@@ -301,7 +302,15 @@ impl OtlpSink {
         let mut export_error = None;
         for packed in requests {
             let messages = packed.messages;
-            match self.send(opened, packed).await {
+            match self
+                .send(
+                    opened,
+                    packed,
+                    topic_metadata,
+                    messages_metadata.partition_id,
+                )
+                .await
+            {
                 Ok(()) => {
                     exported += messages;
                     self.counters
@@ -332,15 +341,30 @@ impl OtlpSink {
         }
 
         // A failed export is the more urgent of the two, so the SDK logs it first.
-        export_error.or(decode_error).map_or(Ok(()), Err)
+        export_error
+            .or(first_dropped.map(|(_, reason)| reason))
+            .map_or(Ok(()), Err)
     }
 
     /// Export one request with bounded retry. The runtime commits offsets before `consume`
     /// runs, so this is the only redelivery a transient failure gets.
-    async fn send(&self, opened: &Opened, packed: Packed) -> Result<(), Error> {
+    async fn send(
+        &self,
+        opened: &Opened,
+        packed: Packed,
+        topic_metadata: &TopicMetadata,
+        partition_id: u32,
+    ) -> Result<(), Error> {
+        // The offsets let an operator find the messages of a failed request in Iggy.
         let context = format!(
-            "OTLP sink ID: {} export of {} log records from {} messages",
-            self.id, packed.log_records, packed.messages
+            "OTLP sink ID: {} export of {} log records from {} messages (stream: {}, topic: {}, partition_id: {partition_id}, offsets: {}-{})",
+            self.id,
+            packed.log_records,
+            packed.messages,
+            topic_metadata.stream,
+            topic_metadata.topic,
+            packed.first_offset,
+            packed.last_offset
         );
         let exporter = &opened.exporter;
         let body = exporter.prepare_body(packed.body)?;
@@ -400,7 +424,7 @@ impl Sink for OtlpSink {
 
     async fn consume(
         &self,
-        _topic_metadata: &TopicMetadata,
+        topic_metadata: &TopicMetadata,
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
@@ -416,8 +440,14 @@ impl Sink for OtlpSink {
 
         let received = messages.len();
         let prepared = batch::pack_requests(messages, opened.settings.max_request_bytes);
-        self.send_all(opened, prepared, received, messages_metadata.schema)
-            .await
+        self.send_all(
+            opened,
+            prepared,
+            received,
+            topic_metadata,
+            &messages_metadata,
+        )
+        .await
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -452,6 +482,7 @@ fn endpoint_for_log(endpoint: &Url) -> Url {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_connector_sdk::Schema;
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use prost::Message;
 

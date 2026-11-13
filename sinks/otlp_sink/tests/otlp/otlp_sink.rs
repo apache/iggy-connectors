@@ -88,6 +88,39 @@ async fn undecodable_message_is_dropped_without_losing_its_batch(
     assert_eq!(bodies, vec!["after", "before"]);
 }
 
+// The Collector rejects a whole request for one ID of the wrong length, so the valid messages
+// arrive only when the sink keeps the faulty one out of their request.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/otlp/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn message_with_wrong_length_trace_id_is_dropped_without_losing_its_batch(
+    harness: &TestHarness,
+    fixture: OtlpHttpProtoLogsFixture,
+) {
+    let mut faulty = logs_request("http-proto", &["faulty".to_owned()]);
+    faulty.resource_logs[0].scope_logs[0].log_records[0].trace_id = vec![1; 32];
+    send_payloads(
+        harness,
+        [
+            logs_request("http-proto", &["before".to_owned()]).encode_to_vec(),
+            faulty.encode_to_vec(),
+            logs_request("http-proto", &["after".to_owned()]).encode_to_vec(),
+        ],
+    )
+    .await;
+
+    let exports = fixture
+        .collector()
+        .wait_for_log_records(2)
+        .await
+        .expect("collector received the valid records");
+
+    let mut bodies = log_bodies(&exports);
+    bodies.sort();
+    assert_eq!(bodies, vec!["after", "before"]);
+}
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/otlp/sink.toml")),
     seed = seeds::connector_stream

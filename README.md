@@ -192,6 +192,7 @@ A `Sink` implementation uses the `sink_connector!` macro, which exposes the FFI 
 | [InfluxDB](sinks/influxdb_sink/README.md)           | InfluxDB V2 and V3, as line-protocol points                             |
 | [Meilisearch](sinks/meilisearch_sink/README.md)     | a Meilisearch index                                                     |
 | [MongoDB](sinks/mongodb_sink/README.md)             | a MongoDB collection                                                    |
+| [MQTT](sinks/mqtt_sink/README.md)                   | the topics of an MQTT 3.1.1 or MQTT 5 broker, with QoS 0, 1 or 2        |
 | [PostgreSQL](sinks/postgres_sink/README.md)         | PostgreSQL tables                                                       |
 | [Quickwit](sinks/quickwit_sink/README.md)           | a Quickwit index                                                        |
 | [RabbitMQ](sinks/rabbitmq_sink/README.md)           | RabbitMQ exchanges, through AMQP 0.9.1                                  |

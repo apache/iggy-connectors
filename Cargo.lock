@@ -5732,6 +5732,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_mqtt_sink"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "ctor 1.0.13",
+ "dtor 1.0.6",
+ "humantime",
+ "iggy",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "iggy_connector_testing",
+ "integration",
+ "reqwest 0.13.5",
+ "rumqttc-v4-next",
+ "rumqttc-v5-next",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "simd-json",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "iggy_connector_mqtt_source"
 version = "0.6.0"
 dependencies = [
@@ -5754,7 +5785,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "testcontainers-modules",
  "tokio",
  "tracing",
  "url",
@@ -6055,6 +6085,7 @@ dependencies = [
  "reqwest 0.13.5",
  "reqwest-middleware",
  "reqwest-retry",
+ "rumqttc-v5-next",
  "rust-s3",
  "serde",
  "serde_json",
@@ -6063,6 +6094,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 

@@ -26,7 +26,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::{HeaderKey, HeaderValue, Identifier, MessageClient};
-use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStatus};
+use iggy_connector_sdk::api::ConnectorRuntimeStats;
 use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
 use reqwest::Client;
@@ -79,10 +79,12 @@ async fn mqtt5_invalid_credentials_should_fail_sink_initialization(
     server(connectors_runtime(config_path = "tests/mqtt/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn mqtt5_broker_rejection_should_not_publish_to_the_broker(
+async fn mqtt5_broker_rejection_should_skip_record_without_failing_sink(
     harness: &TestHarness,
     fixture: MqttSinkFixture,
 ) {
+    wait_for_sink_status(harness, "running").await;
+    let messages_consumed_before_rejection = sink_messages_consumed(harness).await;
     let errors_before_rejection = sink_errors(harness).await;
     fixture
         .deny_sink_publications()
@@ -90,13 +92,20 @@ async fn mqtt5_broker_rejection_should_not_publish_to_the_broker(
         .expect("EMQX must deny the sink publication topic");
     send_json_messages(harness, vec![serde_json::json!({"rejected": true})]).await;
 
+    wait_for_sink_messages_consumed(harness, messages_consumed_before_rejection + 1).await;
+
     assert!(
         timeout(Duration::from_secs(1), fixture.receive_messages(1))
             .await
             .is_err(),
         "a broker-rejected publication must not reach MQTT subscribers"
     );
-    wait_for_sink_error_after(harness, errors_before_rejection).await;
+    wait_for_sink_status(harness, "running").await;
+    assert_eq!(
+        sink_errors(harness).await,
+        errors_before_rejection,
+        "a permanent broker rejection must not fail the sink"
+    );
 }
 
 #[iggy_harness(
@@ -837,31 +846,36 @@ async fn sink_errors(harness: &TestHarness) -> u64 {
         .errors
 }
 
-async fn wait_for_sink_error_after(harness: &TestHarness, previous_errors: u64) {
+async fn sink_messages_consumed(harness: &TestHarness) -> u64 {
     let runtime = harness
         .connectors_runtime()
         .expect("connectors runtime must be configured");
-    let http = Client::new();
+    let stats = Client::new()
+        .get(format!("{}/stats", runtime.http_url()))
+        .send()
+        .await
+        .expect("runtime statistics request must complete")
+        .json::<ConnectorRuntimeStats>()
+        .await
+        .expect("runtime statistics must be valid JSON");
 
+    stats
+        .connectors
+        .iter()
+        .find(|connector| connector.key == MQTT_SINK_KEY)
+        .and_then(|connector| connector.messages_consumed)
+        .expect("MQTT sink consumed-message statistics must be present")
+}
+
+async fn wait_for_sink_messages_consumed(harness: &TestHarness, minimum: u64) {
     timeout(SINK_STATUS_TIMEOUT, async {
         loop {
-            if let Ok(response) = http
-                .get(format!("{}/stats", runtime.http_url()))
-                .send()
-                .await
-                && let Ok(stats) = response.json::<ConnectorRuntimeStats>().await
-                && let Some(sink) = stats
-                    .connectors
-                    .iter()
-                    .find(|connector| connector.key == MQTT_SINK_KEY)
-                && sink.status == ConnectorStatus::Running
-                && sink.errors > previous_errors
-            {
+            if sink_messages_consumed(harness).await >= minimum {
                 return;
             }
             sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("sink failure must increase the MQTT sink error counter");
+    .expect("MQTT sink must consume the rejected message");
 }

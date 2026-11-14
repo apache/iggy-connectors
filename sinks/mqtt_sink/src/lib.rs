@@ -262,6 +262,15 @@ struct PublicationAccounting<'a> {
     armed: bool,
 }
 
+struct WindowOutcomeAccounting<'a> {
+    topic_metadata: &'a TopicMetadata,
+    publications: &'a [PreparedPublication],
+    confirmed: &'a mut [bool],
+    skipped_publications: &'a mut [bool],
+    skipped: &'a mut u64,
+    window_indices: &'a [usize],
+}
+
 impl PublicationAccounting<'_> {
     fn disarm(&mut self) {
         self.armed = false;
@@ -493,6 +502,62 @@ impl MqttSink {
         newly_confirmed
     }
 
+    fn requeue_confirmed_window_suffix(
+        confirmed: &mut [bool],
+        skipped: &[bool],
+        window_indices: &[usize],
+    ) -> usize {
+        let Some(first_unconfirmed) = window_indices.iter().position(|&index| !confirmed[index])
+        else {
+            return 0;
+        };
+
+        // Keep retries in source order when an earlier publication has an uncertain outcome.
+        let mut requeued = 0;
+        for &index in &window_indices[first_unconfirmed..] {
+            if confirmed[index] && !skipped[index] {
+                confirmed[index] = false;
+                requeued += 1;
+            }
+        }
+        requeued
+    }
+
+    fn account_window_outcomes(
+        &self,
+        accounting: &mut WindowOutcomeAccounting<'_>,
+        window_state: &PublishWindowState,
+    ) {
+        let newly_confirmed = Self::mark_window_confirmed(
+            accounting.confirmed,
+            accounting.window_indices,
+            &window_state.confirmed_indexes(),
+        );
+        self.in_flight_publications
+            .fetch_sub(newly_confirmed as u64, Ordering::Relaxed);
+
+        for (local_index, rejection) in window_state.rejected_publications() {
+            let index = accounting.window_indices[local_index];
+            if accounting.confirmed[index] {
+                continue;
+            }
+
+            warn!(
+                "Skipping MQTT record rejected by broker for connector with ID {}: stream: {}, topic: {}, offset: {}: {}",
+                self.id,
+                accounting.topic_metadata.stream,
+                accounting.topic_metadata.topic,
+                accounting.publications[index].offset,
+                rejection
+            );
+            accounting.confirmed[index] = true;
+            accounting.skipped_publications[index] = true;
+            *accounting.skipped += 1;
+            self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
+            self.publish_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn publish_window_deadline(&self) -> Result<Instant, Error> {
         Instant::now()
             .checked_add(self.publish_timeout)
@@ -519,7 +584,6 @@ impl MqttSink {
             self.publish_errors.fetch_add(1, Ordering::Relaxed);
             error
         })?;
-        let batch_size = messages.len();
         let mut publications = Vec::with_capacity(messages.len());
         for message in messages {
             let offset = message.offset;
@@ -559,11 +623,6 @@ impl MqttSink {
                 }
             }
         }
-        if batch_size > 0 && publications.is_empty() {
-            return Err(Error::InvalidRecordValue(
-                "all MQTT records in the batch were skipped".to_string(),
-            ));
-        }
         Ok(publications)
     }
 
@@ -582,6 +641,7 @@ impl MqttSink {
         // with the publication that caused them.
         let _publish_guard = self.publish_lock.lock().await;
         let confirmed = vec![false; publications.len()];
+        let mut skipped_publications = vec![false; publications.len()];
         let mut skipped = 0_u64;
         self.in_flight_publications
             .fetch_add(publications.len() as u64, Ordering::Relaxed);
@@ -638,6 +698,7 @@ impl MqttSink {
                         max_packet_size
                     );
                     accounting.confirmed[index] = true;
+                    skipped_publications[index] = true;
                     skipped += 1;
                     self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
                     self.publish_errors.fetch_add(1, Ordering::Relaxed);
@@ -670,6 +731,7 @@ impl MqttSink {
                         publications[publication_index].offset
                     );
                     accounting.confirmed[publication_index] = true;
+                    skipped_publications[publication_index] = true;
                     skipped += 1;
                     self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
                     self.publish_errors.fetch_add(1, Ordering::Relaxed);
@@ -686,12 +748,17 @@ impl MqttSink {
                         .await
                     {
                         Ok(PublishWindowProgress::Complete) => {
-                            for &index in window_indices {
-                                if !accounting.confirmed[index] {
-                                    accounting.confirmed[index] = true;
-                                    self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
-                                }
-                            }
+                            self.account_window_outcomes(
+                                &mut WindowOutcomeAccounting {
+                                    topic_metadata,
+                                    publications: &publications,
+                                    confirmed: &mut accounting.confirmed,
+                                    skipped_publications: &mut skipped_publications,
+                                    skipped: &mut skipped,
+                                    window_indices,
+                                },
+                                &window_state,
+                            );
                             break;
                         }
                         // rumqttc retains unacknowledged requests only when the broker resumes
@@ -712,15 +779,17 @@ impl MqttSink {
                             );
                         }
                         Ok(PublishWindowProgress::SessionPresent(false)) => {
-                            let confirmed_indexes = window_state.confirmed_indexes();
-                            let newly_confirmed = Self::mark_window_confirmed(
-                                &mut accounting.confirmed,
-                                window_indices,
-                                &confirmed_indexes,
+                            self.account_window_outcomes(
+                                &mut WindowOutcomeAccounting {
+                                    topic_metadata,
+                                    publications: &publications,
+                                    confirmed: &mut accounting.confirmed,
+                                    skipped_publications: &mut skipped_publications,
+                                    skipped: &mut skipped,
+                                    window_indices,
+                                },
+                                &window_state,
                             );
-                            self.in_flight_publications
-                                .fetch_sub(newly_confirmed as u64, Ordering::Relaxed);
-                            let unconfirmed = window.len() - confirmed_indexes.len();
                             if !retry_in_progress {
                                 if batch_retries >= self.max_retries {
                                     return Err(Error::Connection(
@@ -729,8 +798,19 @@ impl MqttSink {
                                 }
                                 batch_retries += 1;
                             }
+                            let requeued_confirmed = Self::requeue_confirmed_window_suffix(
+                                &mut accounting.confirmed,
+                                &skipped_publications,
+                                window_indices,
+                            );
+                            self.in_flight_publications
+                                .fetch_add(requeued_confirmed as u64, Ordering::Relaxed);
+                            let requeued = window_indices
+                                .iter()
+                                .filter(|&&index| !accounting.confirmed[index])
+                                .count();
                             warn!(
-                                "MQTT reconnect for connector with ID {} did not resume the previous session; recreating the driver and requeuing {unconfirmed} unconfirmed publications (retry {}/{})",
+                                "MQTT reconnect for connector with ID {} did not resume the previous session; recreating the driver and requeuing {requeued} publications from the first unconfirmed publication (retry {}/{})",
                                 self.id, batch_retries, self.max_retries,
                             );
                             let delay = retry_backoff(
@@ -743,18 +823,28 @@ impl MqttSink {
                             continue 'publish;
                         }
                         Err(window_error) => {
-                            let confirmed_indexes = window_state.confirmed_indexes();
-                            let newly_confirmed = Self::mark_window_confirmed(
-                                &mut accounting.confirmed,
-                                window_indices,
-                                &confirmed_indexes,
+                            self.account_window_outcomes(
+                                &mut WindowOutcomeAccounting {
+                                    topic_metadata,
+                                    publications: &publications,
+                                    confirmed: &mut accounting.confirmed,
+                                    skipped_publications: &mut skipped_publications,
+                                    skipped: &mut skipped,
+                                    window_indices,
+                                },
+                                &window_state,
                             );
-                            self.in_flight_publications
-                                .fetch_sub(newly_confirmed as u64, Ordering::Relaxed);
                             if !window_error.retryable || batch_retries >= self.max_retries {
                                 return Err(window_error.error);
                             }
                             if window_error.requires_requeue {
+                                let requeued_confirmed = Self::requeue_confirmed_window_suffix(
+                                    &mut accounting.confirmed,
+                                    &skipped_publications,
+                                    window_indices,
+                                );
+                                self.in_flight_publications
+                                    .fetch_add(requeued_confirmed as u64, Ordering::Relaxed);
                                 // Recreate the driver before requeuing because the failed window
                                 // leaves packet mappings and acknowledgement events uncertain. A
                                 // fresh driver prevents stale MQTT events from confirming a retried
@@ -1419,15 +1509,32 @@ mod tests {
     }
 
     #[test]
-    fn given_session_reset_with_partially_confirmed_window_should_requeue_only_unconfirmed() {
+    fn given_session_reset_with_partially_confirmed_window_should_requeue_from_first_unconfirmed() {
         let mut confirmed = vec![false; 3];
+        let skipped = vec![false; 3];
         let window_indices = [0, 1, 2];
 
         let newly_confirmed =
-            MqttSink::mark_window_confirmed(&mut confirmed, &window_indices, &[1]);
+            MqttSink::mark_window_confirmed(&mut confirmed, &window_indices, &[1, 2]);
+        let requeued_confirmed =
+            MqttSink::requeue_confirmed_window_suffix(&mut confirmed, &skipped, &window_indices);
 
-        assert_eq!(newly_confirmed, 1);
-        assert_eq!(unconfirmed_publication_indexes(&confirmed), vec![0, 2]);
+        assert_eq!(newly_confirmed, 2);
+        assert_eq!(requeued_confirmed, 2);
+        assert_eq!(unconfirmed_publication_indexes(&confirmed), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn given_skipped_publication_in_requeued_suffix_should_remain_skipped() {
+        let mut confirmed = vec![false, true, true, true];
+        let skipped = vec![false, false, true, false];
+        let window_indices = [0, 1, 2, 3];
+
+        let requeued_confirmed =
+            MqttSink::requeue_confirmed_window_suffix(&mut confirmed, &skipped, &window_indices);
+
+        assert_eq!(requeued_confirmed, 2);
+        assert_eq!(unconfirmed_publication_indexes(&confirmed), vec![0, 1, 3]);
     }
 
     #[test]
@@ -1612,34 +1719,6 @@ mod tests {
 
         assert_eq!(publications.len(), 1);
         assert_eq!(publications[0].payload.as_ref(), b"valid");
-        assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn given_all_oversized_records_when_publishing_should_return_error() {
-        let mut config = test_config();
-        config.max_packet_size = Some(32);
-        let sink = MqttSink::new(1, config);
-        let metadata = TopicMetadata {
-            stream: "devices".to_string(),
-            topic: "telemetry".to_string(),
-        };
-        let messages = vec![ConsumedMessage {
-            id: 1,
-            offset: 10,
-            checksum: 1,
-            timestamp: 1,
-            origin_timestamp: 1,
-            headers: None,
-            payload: Payload::Raw(vec![b'x'; 64]),
-        }];
-        let runtime = tokio::runtime::Runtime::new().expect("runtime must start");
-
-        let error = runtime
-            .block_on(sink.publish_messages(&metadata, messages))
-            .expect_err("a batch with no publishable MQTT records must fail");
-
-        assert!(matches!(error, Error::InvalidRecordValue(_)));
         assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
     }
 

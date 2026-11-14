@@ -128,9 +128,10 @@ topic_mode = "template"
 topic_template = "iggy/{stream}/{topic}"
 ```
 
-Dynamic mode reads `mqtt.topic` from raw-message headers. With MQTT 5, it can
-also read the topic from a versioned JSON envelope. `fallback_topic` selects
-the output topic when the record has no valid MQTT topic.
+Dynamic mode reads `mqtt.topic` from Iggy message headers for every payload.
+With MQTT 5, a topic in a versioned JSON envelope takes precedence.
+If neither source provides a topic, or the topic is blank, `fallback_topic`
+selects the output topic. The sink skips records with invalid MQTT topics.
 
 ```toml
 topic_mode = "dynamic"
@@ -191,7 +192,7 @@ connection that created it.
 | `topic_mode` | All modes | `"static"` | Selects `"static"`, `"template"`, or `"dynamic"`. |
 | `topic` | Static mode | `"iggy.messages"` | Sets the MQTT output topic for static routing. It must not begin with `$` or contain `+` or `#`. |
 | `topic_template` | Template mode | `"{stream}/{topic}"` | Sets the template for template routing. It accepts only `{stream}` and `{topic}`. The rendered topic must not begin with `$` or contain `+` or `#`. |
-| `fallback_topic` | Dynamic mode | `"{stream}/{topic}"` | Sets the MQTT output topic when dynamic routing has no valid topic. The rendered topic must not begin with `$` or contain `+` or `#`. |
+| `fallback_topic` | Dynamic mode | `"{stream}/{topic}"` | Sets the MQTT output topic when the dynamic topic is absent or blank. The sink skips records with invalid MQTT topics. The rendered topic must not begin with `$` or contain `+` or `#`. |
 | `qos` | All modes | `1` | Sets MQTT publication QoS. Use `0`, `1`, or `2`. |
 | `retain` | All modes | `false` | Sets the MQTT retained-message flag. |
 | `keep_alive` | All modes | `"30s"` | Sets the MQTT ping interval. MQTT 3.1.1 accepts `"0s"` or at least `"1s"`. MQTT 5 needs at least `"5s"`. The maximum is `"65535s"`. |
@@ -231,8 +232,9 @@ each connector TOML file from its configured `config_dir`.
 For QoS 0, the sink confirms a publication after it queues the request. For
 QoS 1, it waits for `PUBACK`. For QoS 2, it waits for `PUBCOMP`. If the result
 is uncertain, the sink reconnects and retries. This can publish duplicates.
-Retries preserve order within one Iggy partition and MQTT topic, but not across
-partitions or topics.
+An MQTT 5 permanent broker rejection skips and counts only that record. The sink
+continues with later records. Retries preserve order within one Iggy partition
+and MQTT topic, but not across partitions or topics.
 
 For `clean_start = false`, set a stable, unique `client_id` for this sink.
 When a new MQTT 3.1.1 driver starts, the sink clears the old broker session,

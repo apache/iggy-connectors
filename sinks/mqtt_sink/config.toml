@@ -50,7 +50,8 @@ topic_mode = "static"
 # topic_template = "{stream}/{topic}"
 
 # Dynamic routing reads mqtt.topic from Iggy headers or an MQTT 5 envelope.
-# It uses fallback_topic when the record has no valid MQTT topic.
+# It uses fallback_topic when the record topic is absent or blank.
+# The sink skips records with invalid MQTT topics.
 # To select it, comment the active static topic and topic_mode lines above.
 # topic_mode = "dynamic"
 # fallback_topic = "{stream}/{topic}"

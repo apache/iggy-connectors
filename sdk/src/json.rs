@@ -186,7 +186,7 @@ mod tests {
         let documents = [
             r#"{"int":1,"neg":-2,"u64":18446744073709551615,"i64":-9223372036854775808}"#,
             r#"{"float":0.1,"exp":1.5e300,"true":true,"false":false,"null":null}"#,
-            r#"{"text":"tab\tquote\"slash\\éé😀","esc\"aped key":"",
+            r#"{"text":"tab\tquote\"slash\\é\u00e9\ud83d\ude00","esc\"aped key":"",
                 "empty":{},"none":[],"nested":[1,"two",{"three":[null,{"four":4}]}]}"#,
             r#""a string""#,
             "42",

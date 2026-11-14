@@ -37,12 +37,14 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
 humantime = { workspace = true }
+iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "logs"] }
 prost = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+simd-json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -50,7 +52,6 @@ ctor = { workspace = true }
 dtor = { workspace = true }
 http = { workspace = true }
 iggy = { workspace = true }
-iggy_common = { workspace = true }
 iggy_connector_testing = { workspace = true }
 integration = { workspace = true }
 # Reads back the OTLP/JSON that the collector exported.

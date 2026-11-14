@@ -12,7 +12,7 @@ The RabbitMQ sink connector publishes messages from Iggy streams to RabbitMQ exc
 | `routing_key` | string | `iggy.messages` | Routing key for published messages. |
 | `durable_exchange` | bool | `true` | Declare the exchange as durable. Must match the durability of an operator-pre-created exchange, otherwise RabbitMQ closes the channel with `PRECONDITION_FAILED`. |
 | `delivery_mode` | string | `persistent` | AMQP delivery mode: `persistent` (2) or `non_persistent` (1). Persistent messages survive broker restarts when the exchange and queue are durable; it forces an fsync on publish, so non-durable topologies may prefer `non_persistent`. |
-| `include_metadata` | bool | `true` | Add `iggy_stream`, `iggy_topic`, `iggy_partition_id`, `iggy_offset` message headers. User-supplied headers are always preserved, regardless of this flag. |
+| `include_metadata` | bool | `true` | Add `iggy_stream`, `iggy_topic`, `iggy_partition_id`, `iggy_offset` message headers. User headers are forwarded regardless of this flag, but a user header with one of these names is replaced by the metadata value. |
 | `verbose_logging` | bool | `false` | Log each published batch at `info` level instead of `debug`. |
 | `max_retries` | u32 | `3` | Maximum transient publish retries before failing the batch. |
 | `retry_delay_secs` | u64 | `1` | Base retry delay in seconds. |
@@ -20,6 +20,12 @@ The RabbitMQ sink connector publishes messages from Iggy streams to RabbitMQ exc
 | `timeout_secs` | u64 | `30` | Timeout for connection, publish, and publisher-confirmation operations. |
 
 User headers on consumed Iggy messages are forwarded as AMQP headers: string values become AMQP `LongString`, raw binary values become `ByteArray`. This allows routing through a `headers` exchange on original user headers.
+
+A string header key keeps its own name. A string key that starts with `~` becomes `~string:<key>`, a string key that is not valid UTF-8 becomes `~string_b64:<base64url>`, and a key of any other kind becomes `~<kind>:<value>`, for example `~int32:1` or `~raw:AQI`. Earlier versions named a non-string key by its string form, so that `1` and `"1"` collided and raw keys used Rust Debug text.
+
+AMQP limits a header name to 255 bytes. The sink skips a user header whose name is longer, instead of failing. This happens for raw keys over 187 bytes, string keys that are not valid UTF-8 and over 182 bytes, and `~`-prefixed string keys of 248 bytes or more. The first skip logs a warning. Later skips log at debug level, and the close summary reports `skipped_header_names`, counted once per publish attempt.
+
+A string value that is not valid UTF-8 is written with replacement characters.
 
 Publishes are confirmed via `ConfirmSelect`. With `mandatory = true`, a message with a routing key that matches no binding is returned by RabbitMQ and the batch fails with a permanent error.
 

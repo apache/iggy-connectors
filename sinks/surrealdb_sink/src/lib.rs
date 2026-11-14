@@ -22,7 +22,8 @@ use bytes::Bytes;
 use iggy_connector_sdk::convert::owned_value_into_serde_json;
 use iggy_connector_sdk::retry::{parse_duration, retry_backoff};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, HeaderName, MessagesMetadata, Payload, Sink, TopicMetadata,
+    sink_connector,
 };
 use reqwest::{Body, Client as HttpClient, RequestBuilder, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
@@ -967,7 +968,7 @@ fn encode_headers(
         } else {
             Value::String(value.to_string_value())
         };
-        encoded.insert(key.to_string_value(), value);
+        encoded.insert(HeaderName(key).to_string(), value);
     }
 
     Ok(Value::Object(encoded))
@@ -1170,6 +1171,7 @@ mod tests {
     use super::*;
     use iggy_common::{HeaderKey, HeaderValue};
     use iggy_connector_sdk::Schema;
+    use iggy_connector_testing::headers::{header_case_map, header_cases};
     use std::collections::BTreeMap;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -1704,6 +1706,24 @@ mod tests {
                 "trace-id": "abc"
             })
         );
+    }
+
+    #[test]
+    fn given_shared_header_cases_should_encode_them_under_header_names() {
+        let cases = header_cases();
+
+        let encoded = encode_headers(&header_case_map()).expect("Failed to encode headers");
+
+        let encoded = encoded.as_object().expect("headers are an object");
+        assert_eq!(encoded.len(), cases.len());
+        for case in &cases {
+            assert_eq!(
+                encoded.get(&case.expected_name),
+                Some(&json!(case.label)),
+                "case {}",
+                case.label
+            );
+        }
     }
 
     #[test]

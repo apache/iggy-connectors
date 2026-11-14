@@ -148,7 +148,7 @@ mod tests {
         assert!(repeats_a_key(["", "a", ""].into_iter()));
     }
 
-    // No parsed object reaches this case: a vec-backed object holds at most `SORTED_KEYS` keys.
+    // No parsed object reaches this case: a vec-backed object holds at most 32 keys.
     #[test]
     fn given_more_keys_than_the_sort_buffer_should_report_a_possible_repeat() {
         let mut keys = keys(SORTED_KEYS + 1);

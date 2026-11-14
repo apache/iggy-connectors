@@ -197,9 +197,12 @@ pub fn parse_jsonl_rows(data: &str) -> Result<Vec<Row>, Error> {
         }
         scratch.clear();
         scratch.extend_from_slice(trimmed.as_bytes());
-        let obj: simd_json::BorrowedValue =
-            iggy_connector_sdk::json::to_borrowed_value(&mut scratch)
-                .map_err(|e| Error::InvalidRecordValue(format!("JSON parse error: {e}")))?;
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "parse_object inserts every field into a map, which keeps the last value of a repeated key"
+        )]
+        let obj: simd_json::BorrowedValue = simd_json::to_borrowed_value(&mut scratch)
+            .map_err(|e| Error::InvalidRecordValue(format!("JSON parse error: {e}")))?;
         rows.push(parse_object(obj, &mut intern)?);
     }
     Ok(rows)

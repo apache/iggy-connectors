@@ -155,6 +155,12 @@ cargo_prerequisites = [
         { package = "iggy_connector_rabbitmq_sink", target = { name = "iggy_connector_rabbitmq_sink", kind = "cdylib" } },
     ] },
     { source_work = "cargo.test", when = [
+        { package = "iggy_connector_rabbitmq_source", target = { name = "rabbitmq", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_rabbitmq_source", target = { name = "iggy_connector_rabbitmq_source", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
         { package = "iggy_connector_random_source", target = { name = "random", kind = "test" } },
     ], require = [
         { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },

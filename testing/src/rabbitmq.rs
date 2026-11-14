@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::unique_container_name;
 use futures::StreamExt;
-use iggy_connector_testing::unique_container_name;
 use integration::harness::TestBinaryError;
 use lapin::{
     Connection, ConnectionProperties, ExchangeKind,
@@ -24,7 +24,9 @@ use lapin::{
     types::{AMQPValue, FieldTable},
 };
 use std::time::Duration;
-use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers_modules::testcontainers::core::{
+    CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor,
+};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::time::sleep;
@@ -34,34 +36,46 @@ use uuid::Uuid;
 const RABBITMQ_IMAGE: &str = "docker.io/rabbitmq";
 const RABBITMQ_TAG: &str = "4.0-management";
 const RABBITMQ_PORT: u16 = 5672;
+const RABBITMQ_MANAGEMENT_PORT: u16 = 15672;
 const RABBITMQ_READY_MSG: &str = "Time to start RabbitMQ:";
 const RABBITMQ_BOOT_ATTEMPTS: usize = 60;
 const RABBITMQ_BOOT_INTERVAL_MS: u64 = 1000;
 
-pub(super) const DEFAULT_TEST_STREAM: &str = "test_stream";
-pub(super) const DEFAULT_TEST_TOPIC: &str = "test_topic";
-pub(super) const DEFAULT_EXCHANGE: &str = "iggy_events";
-pub(super) const DEFAULT_EXCHANGE_TYPE: &str = "topic";
-pub(super) const DEFAULT_ROUTING_KEY: &str = "iggy.messages";
-pub(super) const DEFAULT_CONSUMER_GROUP: &str = "rabbitmq_sink_test_cg";
+pub const DEFAULT_TEST_STREAM: &str = "test_stream";
+pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
+pub const DEFAULT_EXCHANGE: &str = "iggy_events";
+pub const DEFAULT_EXCHANGE_TYPE: &str = "topic";
+pub const DEFAULT_ROUTING_KEY: &str = "iggy.messages";
+pub const DEFAULT_CONSUMER_GROUP: &str = "rabbitmq_sink_test_cg";
 
-pub(super) const ENV_SINK_AMQP_URL: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_PLUGIN_CONFIG_AMQP_URL";
-pub(super) const ENV_SINK_EXCHANGE: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_PLUGIN_CONFIG_EXCHANGE";
-pub(super) const ENV_SINK_EXCHANGE_TYPE: &str =
+pub const ENV_SINK_AMQP_URL: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_PLUGIN_CONFIG_AMQP_URL";
+pub const ENV_SINK_EXCHANGE: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_PLUGIN_CONFIG_EXCHANGE";
+pub const ENV_SINK_EXCHANGE_TYPE: &str =
     "IGGY_CONNECTORS_SINK_RABBITMQ_PLUGIN_CONFIG_EXCHANGE_TYPE";
-pub(super) const ENV_SINK_ROUTING_KEY: &str =
-    "IGGY_CONNECTORS_SINK_RABBITMQ_PLUGIN_CONFIG_ROUTING_KEY";
-pub(super) const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_STREAMS_0_STREAM";
-pub(super) const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_STREAMS_0_TOPICS";
-pub(super) const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_STREAMS_0_SCHEMA";
-pub(super) const ENV_SINK_STREAMS_0_CONSUMER_GROUP: &str =
+pub const ENV_SINK_ROUTING_KEY: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_PLUGIN_CONFIG_ROUTING_KEY";
+pub const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_STREAMS_0_STREAM";
+pub const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_STREAMS_0_TOPICS";
+pub const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_STREAMS_0_SCHEMA";
+pub const ENV_SINK_STREAMS_0_CONSUMER_GROUP: &str =
     "IGGY_CONNECTORS_SINK_RABBITMQ_STREAMS_0_CONSUMER_GROUP";
-pub(super) const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_PATH";
-pub(super) const ENV_SINK_INCLUDE_METADATA: &str =
+pub const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_PATH";
+pub const ENV_SINK_INCLUDE_METADATA: &str =
     "IGGY_CONNECTORS_SINK_RABBITMQ_PLUGIN_CONFIG_INCLUDE_METADATA";
 
+pub const ENV_SOURCE_AMQP_URL: &str = "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_AMQP_URL";
+pub const ENV_SOURCE_QUEUE: &str = "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_QUEUE";
+pub const ENV_SOURCE_INCLUDE_METADATA: &str =
+    "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_INCLUDE_METADATA";
+pub const ENV_SOURCE_BATCH_SIZE: &str = "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_BATCH_SIZE";
+pub const ENV_SOURCE_BATCH_TIMEOUT: &str =
+    "IGGY_CONNECTORS_SOURCE_RABBITMQ_PLUGIN_CONFIG_BATCH_TIMEOUT";
+pub const ENV_SOURCE_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SOURCE_RABBITMQ_STREAMS_0_STREAM";
+pub const ENV_SOURCE_STREAMS_0_TOPIC: &str = "IGGY_CONNECTORS_SOURCE_RABBITMQ_STREAMS_0_TOPIC";
+pub const ENV_SOURCE_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SOURCE_RABBITMQ_STREAMS_0_SCHEMA";
+pub const ENV_SOURCE_PATH: &str = "IGGY_CONNECTORS_SOURCE_RABBITMQ_PATH";
+
 #[derive(PartialEq)]
-pub(super) enum RabbitMqExchangeSetup {
+pub enum RabbitMqExchangeSetup {
     Topic,
     Fanout,
     Direct,
@@ -70,17 +84,24 @@ pub(super) enum RabbitMqExchangeSetup {
 pub struct RabbitMqContainer {
     #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
-    pub(super) amqp_url: String,
-    pub(super) queue_names: Vec<String>,
-    pub(super) exchange_setup: RabbitMqExchangeSetup,
+    pub amqp_url: String,
+    amqp_port: u16,
+    pub management_url: String,
+    pub queue_names: Vec<String>,
+    pub exchange_setup: RabbitMqExchangeSetup,
 }
 
 impl RabbitMqContainer {
-    async fn start_container() -> Result<(ContainerAsync<GenericImage>, String), TestBinaryError> {
+    async fn start_container()
+    -> Result<(ContainerAsync<GenericImage>, String, String, u16), TestBinaryError> {
         let container = GenericImage::new(RABBITMQ_IMAGE, RABBITMQ_TAG)
-            .with_exposed_port(RABBITMQ_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stdout(RABBITMQ_READY_MSG))
+            .with_exposed_port(RABBITMQ_PORT.tcp())
+            .with_exposed_port(RABBITMQ_MANAGEMENT_PORT.tcp())
+            .with_env_var("RABBITMQ_DEFAULT_USER", "iggy_test")
+            .with_env_var("RABBITMQ_DEFAULT_PASS", "iggy_test_password")
             .with_mapped_port(0, RABBITMQ_PORT.tcp())
+            .with_mapped_port(0, RABBITMQ_MANAGEMENT_PORT.tcp())
             .with_container_name(unique_container_name("rabbitmq"))
             .start()
             .await
@@ -101,15 +122,28 @@ impl RabbitMqContainer {
                 fixture_type: "RabbitMqContainer".to_string(),
                 message: "No mapping for RabbitMQ port".to_string(),
             })?;
-        let amqp_url = format!("amqp://guest:guest@127.0.0.1:{mapped_port}");
-        Ok((container, amqp_url))
+        let amqp_url = format!("amqp://iggy_test:iggy_test_password@127.0.0.1:{mapped_port}");
+        let management_port = container
+            .ports()
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "RabbitMqContainer".to_string(),
+                message: format!("Failed to get management port: {e}"),
+            })?
+            .map_to_host_port_ipv4(RABBITMQ_MANAGEMENT_PORT)
+            .ok_or_else(|| TestBinaryError::FixtureSetup {
+                fixture_type: "RabbitMqContainer".to_string(),
+                message: "No mapping for RabbitMQ management port".to_string(),
+            })?;
+        let management_url = format!("http://127.0.0.1:{management_port}");
+        Ok((container, amqp_url, management_url, mapped_port))
     }
 
     async fn start_with(
         exchange_setup: RabbitMqExchangeSetup,
         queue_count: usize,
     ) -> Result<Self, TestBinaryError> {
-        let (container, amqp_url) = Self::start_container().await?;
+        let (container, amqp_url, management_url, amqp_port) = Self::start_container().await?;
         let queue_names = (0..queue_count)
             .map(|index| format!("test_queue_{}_{}", Uuid::new_v4().simple(), index))
             .collect();
@@ -117,28 +151,52 @@ impl RabbitMqContainer {
         let instance = Self {
             container,
             amqp_url,
+            amqp_port,
+            management_url,
             exchange_setup,
             queue_names,
         };
         instance.wait_until_ready().await?;
 
-        info!("RabbitMQ container available at {}", instance.amqp_url);
+        info!(
+            "RabbitMQ container available at 127.0.0.1:{}",
+            instance.amqp_port
+        );
         Ok(instance)
     }
 
-    pub(super) async fn start() -> Result<Self, TestBinaryError> {
+    pub async fn start() -> Result<Self, TestBinaryError> {
         Self::start_with(RabbitMqExchangeSetup::Topic, 1).await
     }
 
-    pub(super) async fn start_fanout() -> Result<Self, TestBinaryError> {
+    pub async fn stop_broker(&self) -> Result<(), String> {
+        self.rabbitmqctl("stop_app").await
+    }
+
+    pub async fn start_broker(&self) -> Result<(), String> {
+        self.rabbitmqctl("start_app").await
+    }
+
+    async fn rabbitmqctl(&self, command: &str) -> Result<(), String> {
+        self.container
+            .exec(
+                ExecCommand::new(vec!["rabbitmqctl", command])
+                    .with_cmd_ready_condition(CmdWaitFor::exit_code(0)),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn start_fanout() -> Result<Self, TestBinaryError> {
         Self::start_with(RabbitMqExchangeSetup::Fanout, 2).await
     }
 
-    pub(super) async fn start_direct() -> Result<Self, TestBinaryError> {
+    pub async fn start_direct() -> Result<Self, TestBinaryError> {
         Self::start_with(RabbitMqExchangeSetup::Direct, 1).await
     }
 
-    pub(super) async fn start_headers() -> Result<Self, TestBinaryError> {
+    pub async fn start_headers() -> Result<Self, TestBinaryError> {
         Self::start_with(RabbitMqExchangeSetup::Headers, 1).await
     }
 
@@ -206,7 +264,8 @@ impl RabbitMqContainer {
                 .queue_declare(
                     queue_name.as_str().into(),
                     QueueDeclareOptions {
-                        auto_delete: true,
+                        durable: true,
+                        auto_delete: false,
                         ..Default::default()
                     },
                     FieldTable::default(),
@@ -253,75 +312,85 @@ pub trait RabbitMqOps: Sync {
         &self.container().queue_names
     }
 
-    async fn consume_messages(
+    fn consume_messages(
         &self,
         count: usize,
-    ) -> Result<Vec<ConsumedDelivery>, TestBinaryError> {
-        self.consume_messages_from(&self.container().queue_names[0], count)
-            .await
+    ) -> impl std::future::Future<Output = Result<Vec<ConsumedDelivery>, TestBinaryError>> + Send
+    {
+        async move {
+            self.consume_messages_from(&self.container().queue_names[0], count)
+                .await
+        }
     }
 
-    async fn consume_messages_from(
+    fn consume_messages_from(
         &self,
         queue_name: &str,
         count: usize,
-    ) -> Result<Vec<ConsumedDelivery>, TestBinaryError> {
-        self.consume_messages_from_with_timeout(queue_name, count, Duration::from_secs(60))
-            .await
+    ) -> impl std::future::Future<Output = Result<Vec<ConsumedDelivery>, TestBinaryError>> + Send
+    {
+        async move {
+            self.consume_messages_from_with_timeout(queue_name, count, Duration::from_secs(60))
+                .await
+        }
     }
 
-    async fn consume_messages_from_with_timeout(
+    fn consume_messages_from_with_timeout(
         &self,
         queue_name: &str,
         count: usize,
         timeout: Duration,
-    ) -> Result<Vec<ConsumedDelivery>, TestBinaryError> {
-        let conn = Connection::connect(&self.container().amqp_url, ConnectionProperties::default())
-            .await
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to connect to RabbitMQ for consume: {e}"),
-            })?;
-        let channel = conn
-            .create_channel()
-            .await
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to create channel for consume: {e}"),
-            })?;
-
-        let mut consumer = channel
-            .basic_consume(
-                queue_name.into(),
-                "".into(),
-                BasicConsumeOptions::default(),
-                FieldTable::default(),
-            )
-            .await
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to start consumer: {e}"),
-            })?;
-
-        let mut messages = Vec::with_capacity(count);
-        let deadline = tokio::time::Instant::now() + timeout;
-        while messages.len() < count && tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_secs(1), consumer.next()).await {
-                Ok(Some(delivery)) => {
-                    let delivery = delivery.map_err(|e| TestBinaryError::InvalidState {
-                        message: format!("Consumer error: {e}"),
+    ) -> impl std::future::Future<Output = Result<Vec<ConsumedDelivery>, TestBinaryError>> + Send
+    {
+        async move {
+            let conn =
+                Connection::connect(&self.container().amqp_url, ConnectionProperties::default())
+                    .await
+                    .map_err(|e| TestBinaryError::InvalidState {
+                        message: format!("Failed to connect to RabbitMQ for consume: {e}"),
                     })?;
-                    let data = delivery.data.clone();
-                    let headers = delivery.properties.headers().clone().unwrap_or_default();
-                    delivery.ack(Default::default()).await.map_err(|e| {
-                        TestBinaryError::InvalidState {
-                            message: format!("Failed to ack message: {e}"),
-                        }
+            let channel =
+                conn.create_channel()
+                    .await
+                    .map_err(|e| TestBinaryError::InvalidState {
+                        message: format!("Failed to create channel for consume: {e}"),
                     })?;
-                    messages.push(ConsumedDelivery { data, headers });
+
+            let mut consumer = channel
+                .basic_consume(
+                    queue_name.into(),
+                    "".into(),
+                    BasicConsumeOptions::default(),
+                    FieldTable::default(),
+                )
+                .await
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to start consumer: {e}"),
+                })?;
+
+            let mut messages = Vec::with_capacity(count);
+            let deadline = tokio::time::Instant::now() + timeout;
+            while messages.len() < count && tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(Duration::from_secs(1), consumer.next()).await {
+                    Ok(Some(delivery)) => {
+                        let delivery = delivery.map_err(|e| TestBinaryError::InvalidState {
+                            message: format!("Consumer error: {e}"),
+                        })?;
+                        let data = delivery.data.clone();
+                        let headers = delivery.properties.headers().clone().unwrap_or_default();
+                        delivery.ack(Default::default()).await.map_err(|e| {
+                            TestBinaryError::InvalidState {
+                                message: format!("Failed to ack message: {e}"),
+                            }
+                        })?;
+                        messages.push(ConsumedDelivery { data, headers });
+                    }
+                    Ok(None) => break,
+                    Err(_) => continue,
                 }
-                Ok(None) => break,
-                Err(_) => continue,
             }
-        }
 
-        Ok(messages)
+            Ok(messages)
+        }
     }
 }

@@ -119,10 +119,15 @@ struct Settings {
     timeout: Duration,
     retry: RetryPolicy,
     max_request_bytes: usize,
-    encoding: Encoding,
-    /// Used with `Encoding::LogRecord` only.
-    template: LogRecordTemplate,
+    packing: Packing,
     verbose: bool,
+}
+
+/// How `consume` turns messages into requests, after the `encoding` of the config.
+#[derive(Debug)]
+enum Packing {
+    OtlpProto,
+    LogRecord(LogRecordTemplate),
 }
 
 impl Settings {
@@ -177,30 +182,41 @@ impl Settings {
             ));
         }
 
-        let encoding = config.encoding.unwrap_or_default();
-        let template = LogRecordTemplate::new(
-            config.resource_attributes.iter().flatten(),
-            config.include_metadata.unwrap_or(true),
-        );
-        match encoding {
+        let packing = match config.encoding.unwrap_or_default() {
             Encoding::OtlpProto => {
                 if config.resource_attributes.is_some() || config.include_metadata.is_some() {
                     warn!(
                         "OTLP sink ID: {id} ignores resource_attributes and include_metadata, which apply to the log_record encoding only"
                     );
                 }
+                Packing::OtlpProto
             }
-            // The resource and the scope are in every request, so a limit they fill alone
-            // would be exceeded by each of them.
             Encoding::LogRecord => {
+                if config
+                    .resource_attributes
+                    .iter()
+                    .flatten()
+                    .any(|(key, _)| key.is_empty())
+                {
+                    return Err(Error::InvalidConfigValue(
+                        "resource_attributes has an empty key: an OTLP attribute key must not be empty".to_owned(),
+                    ));
+                }
+                let template = LogRecordTemplate::new(
+                    config.resource_attributes.iter().flatten(),
+                    config.include_metadata.unwrap_or(true),
+                );
+                // The resource and the scope are in every request, so a limit they fill
+                // alone would be exceeded by each of them.
                 if max_request_bytes <= template.overhead {
                     return Err(Error::InvalidConfigValue(format!(
                         "max_request_bytes ({max_request_bytes}) leaves no room for a log record: a log_record request takes up to {} bytes before its first record",
                         template.overhead
                     )));
                 }
+                Packing::LogRecord(template)
             }
-        }
+        };
 
         let mut header_names = HashSet::new();
         for name in config.headers.iter().flatten().map(|(name, _)| name) {
@@ -229,8 +245,7 @@ impl Settings {
                 max_delay: max_retry_delay,
             },
             max_request_bytes,
-            encoding,
-            template,
+            packing,
             verbose: config.verbose_logging.unwrap_or(false),
         })
     }
@@ -488,7 +503,7 @@ impl Sink for OtlpSink {
             "Opened OTLP sink connector ID: {}, endpoint: {}, encoding: {}",
             self.id,
             endpoint_for_log(&opened.settings.endpoint),
-            opened.settings.encoding
+            self.config.encoding.unwrap_or_default()
         );
         self.opened = Some(opened);
         Ok(())
@@ -512,10 +527,10 @@ impl Sink for OtlpSink {
 
         let received = messages.len();
         let settings = &opened.settings;
-        let prepared = match settings.encoding {
-            Encoding::OtlpProto => batch::pack_requests(messages, settings.max_request_bytes),
-            Encoding::LogRecord => log_record::pack_log_records(
-                &settings.template,
+        let prepared = match &settings.packing {
+            Packing::OtlpProto => batch::pack_requests(messages, settings.max_request_bytes),
+            Packing::LogRecord(template) => log_record::pack_log_records(
+                template,
                 topic_metadata,
                 &messages_metadata,
                 messages,
@@ -652,8 +667,16 @@ mod tests {
         assert_eq!(settings.retry.base_delay, Duration::from_secs(1));
         assert_eq!(settings.retry.max_delay, Duration::from_secs(10));
         assert_eq!(settings.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES);
-        assert_eq!(settings.encoding, Encoding::OtlpProto);
-        assert!(settings.template.include_metadata);
+        assert!(matches!(settings.packing, Packing::OtlpProto));
+
+        let mut config = test_config();
+        config.encoding = Some(Encoding::LogRecord);
+        let settings = Settings::resolve(1, &config).expect("valid config");
+
+        assert!(matches!(
+            &settings.packing,
+            Packing::LogRecord(template) if template.include_metadata
+        ));
     }
 
     #[test]
@@ -774,6 +797,16 @@ mod tests {
     }
 
     #[test]
+    fn given_empty_resource_attribute_key_should_fail_open() {
+        let mut config = test_config();
+        config.encoding = Some(Encoding::LogRecord);
+        config.resource_attributes = Some(BTreeMap::from([(String::new(), "checkout".to_owned())]));
+        let mut sink = OtlpSink::new(1, config);
+
+        assert!(matches!(open(&mut sink), Err(Error::InvalidConfigValue(_))));
+    }
+
+    #[test]
     fn given_otlp_proto_limit_below_log_record_overhead_should_open() {
         let mut config = test_config();
         config.max_request_bytes = Some(1);
@@ -793,7 +826,7 @@ mod tests {
 
         let settings = Settings::resolve(1, &config).expect("ignored, not rejected");
 
-        assert_eq!(settings.encoding, Encoding::OtlpProto);
+        assert!(matches!(settings.packing, Packing::OtlpProto));
     }
 
     #[test]

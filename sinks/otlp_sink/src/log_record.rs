@@ -36,6 +36,7 @@ use opentelemetry_proto::tonic::common::v1::{
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
+use simd_json::prelude::Writable;
 use simd_json::{OwnedValue, StaticNode};
 
 /// The scope every record is exported under names this connector, which created the record.
@@ -45,6 +46,12 @@ const SCOPE_NAME: &str = "iggy_connector_otlp_sink";
 const LENGTH_PREFIX_GROWTH: usize = 18;
 /// How many attributes `include_metadata` adds to a record.
 const METADATA_ATTRIBUTES: usize = 5;
+/// How many levels of a JSON body stay structured. A level nests up to three protobuf
+/// messages and the body sits four deep in its request, so 30 levels reach at most 94 of the
+/// 100 that protobuf decoders other than Go's accept. The limit also bounds the encoding
+/// work, which prost repeats at every level for each message below it. A deeper value becomes
+/// its JSON text.
+const MAX_BODY_DEPTH: usize = 30;
 
 /// The resource and the scope that the log records of this sink are exported under.
 #[derive(Debug)]
@@ -187,10 +194,7 @@ fn log_record(
             "iggy.partition_id",
             any_value::Value::IntValue(i64::from(messages_metadata.partition_id)),
         ));
-        attributes.push(key_value(
-            "iggy.offset",
-            any_value::Value::IntValue(i64::try_from(message.offset).unwrap_or(i64::MAX)),
-        ));
+        attributes.push(key_value("iggy.offset", int_or_text(message.offset)));
         // A message ID is 128 bits wide, and an OTLP integer holds 64.
         attributes.push(key_value(
             "iggy.message_id",
@@ -231,7 +235,7 @@ fn log_record(
 
 fn payload_value(payload: Payload) -> Option<any_value::Value> {
     match payload.into_json_document() {
-        Payload::Json(document) => json_value(document),
+        Payload::Json(document) => json_value(document, 0),
         Payload::Text(text) | Payload::Proto(text) => Some(any_value::Value::StringValue(text)),
         Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
             Some(any_value::Value::BytesValue(bytes))
@@ -239,8 +243,9 @@ fn payload_value(payload: Payload) -> Option<any_value::Value> {
     }
 }
 
-/// A JSON null is an `AnyValue` without a value.
-fn json_value(value: OwnedValue) -> Option<any_value::Value> {
+/// A JSON null is an `AnyValue` without a value. `depth` counts the objects and arrays
+/// around `value`.
+fn json_value(value: OwnedValue, depth: usize) -> Option<any_value::Value> {
     Some(match value {
         OwnedValue::Static(StaticNode::Null) => return None,
         OwnedValue::Static(StaticNode::Bool(flag)) => any_value::Value::BoolValue(flag),
@@ -248,11 +253,14 @@ fn json_value(value: OwnedValue) -> Option<any_value::Value> {
         OwnedValue::Static(StaticNode::U64(number)) => int_or_text(number),
         OwnedValue::Static(StaticNode::F64(number)) => any_value::Value::DoubleValue(number),
         OwnedValue::String(text) => any_value::Value::StringValue(text),
+        OwnedValue::Array(_) | OwnedValue::Object(_) if depth >= MAX_BODY_DEPTH => {
+            any_value::Value::StringValue(value.encode())
+        }
         OwnedValue::Array(items) => any_value::Value::ArrayValue(ArrayValue {
             values: items
                 .into_iter()
                 .map(|item| AnyValue {
-                    value: json_value(item),
+                    value: json_value(item, depth + 1),
                 })
                 .collect(),
         }),
@@ -262,7 +270,7 @@ fn json_value(value: OwnedValue) -> Option<any_value::Value> {
                 .map(|(key, field)| KeyValue {
                     key,
                     value: Some(AnyValue {
-                        value: json_value(field),
+                        value: json_value(field, depth + 1),
                     }),
                     ..Default::default()
                 })
@@ -501,9 +509,70 @@ mod tests {
 
     #[test]
     fn given_u64_above_i64_max_should_keep_exact_value_as_string() {
-        let value = json_value(simd_json::json!(u64::MAX));
+        let value = json_value(simd_json::json!(u64::MAX), 0);
 
         assert_eq!(value, Some(text(&u64::MAX.to_string())));
+    }
+
+    const NESTINGS: [(&str, &str); 2] = [(r#"{"a":"#, "}"), ("[", "]")];
+
+    /// `depth` objects or arrays inside each other, around the number 1.
+    fn nested_json(open: &str, close: &str, depth: usize) -> String {
+        format!("{}1{}", open.repeat(depth), close.repeat(depth))
+    }
+
+    fn json_payload(text: &str) -> Payload {
+        let mut bytes = text.as_bytes().to_vec();
+        Payload::Json(simd_json::to_owned_value(&mut bytes).expect("valid JSON"))
+    }
+
+    /// Follow the first entry of each list or array down from `value`. Return how many it
+    /// passed, and the value it stopped at.
+    fn descend(mut value: &any_value::Value) -> (usize, &any_value::Value) {
+        let mut levels = 0;
+        loop {
+            let inner = match value {
+                any_value::Value::KvlistValue(list) => list.values[0].value.as_ref(),
+                any_value::Value::ArrayValue(array) => array.values.first(),
+                _ => return (levels, value),
+            };
+            levels += 1;
+            value = inner
+                .and_then(|any| any.value.as_ref())
+                .expect("a nested value");
+        }
+    }
+
+    #[test]
+    fn given_json_nested_up_to_the_depth_limit_should_stay_structured() {
+        for (open, close) in NESTINGS {
+            let payload = json_payload(&nested_json(open, close, MAX_BODY_DEPTH));
+
+            let record = record_of(&bare_template(), message(payload));
+
+            let (levels, leaf) = descend(body(&record).expect("a body"));
+            assert_eq!(levels, MAX_BODY_DEPTH, "{open}");
+            assert_eq!(leaf, &any_value::Value::IntValue(1), "{open}");
+        }
+    }
+
+    // `record_of` decodes the request with prost, which refuses more than 100 nested messages.
+    #[test]
+    fn given_json_nested_deeper_than_the_depth_limit_should_keep_the_rest_as_json_text() {
+        let depth = 1_000;
+        for (open, close) in NESTINGS {
+            let payload = json_payload(&nested_json(open, close, depth));
+
+            let record = record_of(&bare_template(), message(payload));
+
+            let (levels, leaf) = descend(body(&record).expect("a body"));
+            assert_eq!(levels, MAX_BODY_DEPTH, "{open}");
+            assert_eq!(
+                leaf,
+                &text(&nested_json(open, close, depth - MAX_BODY_DEPTH)),
+                "{open}"
+            );
+        }
     }
 
     #[test]
@@ -551,6 +620,19 @@ mod tests {
             Some(&any_value::Value::IntValue(7))
         );
         assert_eq!(attribute(&record, "iggy.message_id"), Some(&text("42")));
+    }
+
+    #[test]
+    fn given_offset_above_i64_max_should_keep_exact_value_as_string() {
+        let record = record_of(
+            &template(),
+            message_at(u64::MAX, Payload::Text("x".to_owned())),
+        );
+
+        assert_eq!(
+            attribute(&record, "iggy.offset"),
+            Some(&text(&u64::MAX.to_string()))
+        );
     }
 
     #[test]

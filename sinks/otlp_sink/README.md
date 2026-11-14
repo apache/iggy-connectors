@@ -9,7 +9,7 @@ The `encoding` key tells the sink what the messages on the consumed topics hold.
 | `encoding` | A message holds | Stream `schema` |
 | --- | --- | --- |
 | `otlp_proto` (default) | One protobuf `ExportLogsServiceRequest`, which the sink forwards as it is. | `raw` |
-| `log_record` | Anything. The sink wraps each message in one log record. | Any |
+| `log_record` | Anything that the stream `schema` decodes. The sink wraps each message in one log record. | Any |
 
 ### `otlp_proto`
 
@@ -21,11 +21,11 @@ A message is dropped and logged when it does not decode, when it holds no resour
 
 ### `log_record`
 
-Use this encoding for topics that hold application data, such as JSON events or lines of text. Each message becomes one log record, and no message is dropped.
+Use this encoding for topics that hold application data, such as JSON events or lines of text. Each message becomes one log record, and the sink drops none. The runtime drops a message that the stream `schema` cannot decode before the sink gets it, for example a message that is not JSON with the `json` schema.
 
 | Log record field | Value |
 | --- | --- |
-| `body` | The payload. A JSON payload becomes a structured body: an object becomes a key-value list, an array stays an array, and strings, numbers and booleans keep their types. A text payload becomes a string. A binary payload becomes bytes, and with the `raw` schema every payload is binary. |
+| `body` | The payload. A JSON payload becomes a structured body: an object becomes a key-value list, an array stays an array, and strings, numbers and booleans keep their types. A text payload becomes a string. A binary payload becomes bytes, and with the `raw` schema every payload is binary. A value nested in more than 30 objects or arrays becomes its JSON text, because most protobuf decoders refuse a deeper request. |
 | `time_unix_nano` | The origin timestamp of the message, or its append time when the producer set none. |
 | `observed_time_unix_nano` | The append time of the message. |
 | `attributes` | One per user header, and the Iggy coordinates of the message. |
@@ -51,7 +51,7 @@ Every record is exported under one resource, which holds the `resource_attribute
 | `retry_delay` | `1s` | Backoff before the first retry. It doubles per retry, with ±20% jitter. |
 | `max_retry_delay` | `10s` | Upper bound on one backoff. When `retry_delay` is larger, every backoff is `max_retry_delay`. |
 | `max_request_bytes` | `4000000` | Upper bound on the encoded size of one request, below the 4 MiB limit most receivers use. Messages are packed whole into requests, so a single message larger than this is sent on its own. With `log_record`, a value that the resource and the scope fill before the first record is rejected. |
-| `resource_attributes` | none | `log_record` only. The attributes of the resource that every record is exported under, as strings. Set them where `headers` are set: a map cannot come from an environment variable. |
+| `resource_attributes` | none | `log_record` only. The attributes of the resource that every record is exported under, as strings. A key must not be empty. Set them where `headers` are set: a map cannot come from an environment variable. |
 | `include_metadata` | `true` | `log_record` only. Add the `iggy.*` attributes to each record. |
 | `verbose_logging` | `false` | Log each batch at `info` with the running counters, instead of at `debug`. |
 

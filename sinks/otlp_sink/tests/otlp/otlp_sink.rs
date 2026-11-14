@@ -335,8 +335,6 @@ async fn redirected_http_export_is_not_followed(
     );
 }
 
-/// Send three OTLP log requests produced by `service`, and check that the collector got
-/// every record, under that service's own resource.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/otlp/log_record.toml")),
     seed = seeds::connector_stream
@@ -403,6 +401,8 @@ async fn plain_json_messages_are_exported_as_log_records(
     assert_eq!(offsets, [0, 1, 2]);
 }
 
+/// Send three OTLP log requests produced by `service`, and check that the collector got
+/// every record, under that service's own resource.
 async fn assert_logs_pass_through(
     harness: &TestHarness,
     collector: &OtelCollectorContainer,

@@ -26,7 +26,8 @@ verbose = false
 [[streams]]
 stream = "telemetry"
 topics = ["logs"]
-# "raw" for encoding = "otlp_proto". Any schema for encoding = "log_record".
+# "raw" for encoding = "otlp_proto". With encoding = "log_record", "json" gives
+# structured bodies, "text" gives string bodies and "raw" gives bytes bodies.
 schema = "raw"
 batch_length = 500
 consumer_group = "otlp_sink"

@@ -65,7 +65,6 @@ integration = { workspace = true }
 pgwire = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
 serial_test = { workspace = true }
-simd-json = { workspace = true }
 sqlparser = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }

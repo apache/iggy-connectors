@@ -64,7 +64,6 @@ iggy_connector_testing = { workspace = true }
 integration = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
 serial_test = { workspace = true }
-simd-json = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 wiremock = { workspace = true }
 

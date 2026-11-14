@@ -141,6 +141,11 @@ mod tests {
 
         keys[SORTED_KEYS - 1] = keys[0].clone();
         assert!(repeats_a_key(keys.iter().map(String::as_str)));
+
+        // Fewer keys leave slots of the buffer unused, and those must not count as empty keys.
+        assert!(!repeats_a_key(["", "a", "ab", "b"].into_iter()));
+        assert!(!repeats_a_key(std::iter::empty()));
+        assert!(repeats_a_key(["", "a", ""].into_iter()));
     }
 
     // No parsed object reaches this case: a vec-backed object holds at most `SORTED_KEYS` keys.

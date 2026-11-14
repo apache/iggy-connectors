@@ -5775,6 +5775,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_opensearch_sink"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "ctor 1.0.13",
+ "dtor 1.0.6",
+ "iggy",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "integration",
+ "opensearch",
+ "reqwest 0.13.5",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "simd-json",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "toml 1.1.8+spec-1.1.0",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "iggy_connector_otlp_sink"
 version = "0.1.0"
 dependencies = [
@@ -7584,6 +7616,26 @@ dependencies = [
  "reqsign-file-read-tokio",
  "serde",
  "url",
+]
+
+[[package]]
+name = "opensearch"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2af6815a23449a0860c8fe049a828c3589d3ad56d3b5875d0d1f340d1291871e"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "dyn-clone",
+ "lazy_static",
+ "percent-encoding",
+ "reqwest 0.13.5",
+ "rustc_version",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "url",
+ "void",
 ]
 
 [[package]]

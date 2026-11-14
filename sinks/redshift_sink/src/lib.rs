@@ -1130,7 +1130,9 @@ mod tests {
 
     fn json_payload(value: serde_json::Value) -> Payload {
         let mut bytes = serde_json::to_vec(&value).expect("Failed to serialize JSON");
-        Payload::Json(simd_json::to_owned_value(&mut bytes).expect("Failed to parse JSON"))
+        Payload::Json(
+            iggy_connector_sdk::json::to_owned_value(&mut bytes).expect("Failed to parse JSON"),
+        )
     }
 
     #[test]

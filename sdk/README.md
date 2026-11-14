@@ -57,6 +57,8 @@ Moreover, it contains both, the `decoders` and `encoders` modules, implementing 
 
 The SDK provides decoders and encoders for JSON, raw bytes, text, Protocol Buffers, FlatBuffers, and Avro. Their supported conversions have format-specific limits; see below and the [transforms guide](https://iggy.apache.org/docs/connectors/transforms).
 
+JSON is parsed with `iggy_connector_sdk::json::to_owned_value` or `to_borrowed_value`. When an object repeats a key, the last value wins, as in serde_json and most JSON backends. The simd-json functions of the same names keep every copy in an object of up to 32 keys, so plugins parse JSON with the SDK functions as well. The workspace `clippy.toml` rejects the simd-json ones.
+
 Last but not least, the different `transforms` are available, to transform (add, update, delete etc.) the particular fields of the data being processed via external configuration. It's as simple as adding a new transform to the `transforms` section of the particular connector configuration file:
 
 ```toml

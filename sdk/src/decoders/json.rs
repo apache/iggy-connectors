@@ -27,7 +27,7 @@ impl StreamDecoder for JsonStreamDecoder {
 
     fn decode(&self, mut payload: Vec<u8>) -> Result<Payload, Error> {
         Ok(Payload::Json(
-            simd_json::to_owned_value(&mut payload).map_err(|error| {
+            crate::json::to_owned_value(&mut payload).map_err(|error| {
                 error!("Failed to decode JSON payload: {error}");
                 Error::CannotDecode(self.schema())
             })?,

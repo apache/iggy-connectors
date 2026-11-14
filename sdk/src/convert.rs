@@ -425,7 +425,8 @@ mod tests {
         reason = "a plugin that parses with simd-json directly can still hand over a repeated key"
     )]
     fn apply_field_mappings_should_collapse_a_pre_existing_duplicate_key_to_its_last_value() {
-        // Raw bytes, not `json!` (which dedupes at macro-build time), so the real parser's duplicate-key handling is exercised.
+        // simd-json's own parser keeps both copies, so the input repeats a key on purpose. `json!`
+        // would dedupe at macro-build time.
         let mut bytes = br#"{"a":1,"a":2,"b":3}"#.to_vec();
         let value: OwnedValue = simd_json::to_owned_value(&mut bytes).unwrap();
         if let OwnedValue::Object(map) = &value {

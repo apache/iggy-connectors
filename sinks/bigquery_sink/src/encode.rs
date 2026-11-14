@@ -1116,8 +1116,7 @@ fn raw_text(payload: Payload, kind: RawKind) -> Result<String, String> {
     };
     if kind == RawKind::Json {
         let mut bytes = text.as_bytes().to_vec();
-        iggy_connector_sdk::json::to_borrowed_value(&mut bytes)
-            .map_err(|e| format!("payload is not valid JSON: {e}"))?;
+        simd_json::to_tape(&mut bytes).map_err(|e| format!("payload is not valid JSON: {e}"))?;
     }
     Ok(text)
 }

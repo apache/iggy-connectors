@@ -196,6 +196,8 @@ Metadata mode sets the `json` schema and wraps the body as Base64. The envelope 
 
 The `properties` object contains each AMQP basic property that the publisher set, except `headers`, which has its own envelope field. String properties retain their values. `delivery_mode` and `priority` are JSON numbers. `timestamp` is a decimal string representing seconds since the Unix epoch. The AMQP message type uses the `type` key. Properties that the publisher did not set are omitted.
 
+When `include_metadata` is enabled, RabbitMQ headers can contain nested tables and arrays up to 400 levels deep. Deeper headers fail delivery preparation.
+
 ```json
 {
   "version": 1,
@@ -232,12 +234,7 @@ The source stops after five consecutive batch failures. Restore the Iggy connect
 
 If the connector stops while a delivery is unacknowledged, RabbitMQ can requeue it. Iggy can receive a duplicate if RabbitMQ redelivers a message after Iggy accepted it but before RabbitMQ received its acknowledgement.
 
-After Iggy accepts a batch, the source sends one acknowledgement with `multiple: true` for the last delivery. This acknowledges all deliveries in the batch. If an acknowledgement fails or times out, the source
-attempts to close its RabbitMQ connection and stops with an error. Lapin acknowledgement handles are single-use, so the source
-does not retry an acknowledgement or replay the batch. RabbitMQ requeues deliveries that remain unacknowledged when the
-connection closes. After the source restarts, RabbitMQ can redeliver those messages, so Iggy can receive duplicates. An
-acknowledgement error can have an uncertain outcome, so RabbitMQ can already have accepted the acknowledgement for a
-delivery. Consumers must handle duplicates.
+After Iggy accepts a batch, the source acknowledges the last delivery with `multiple: true`. If the acknowledgement fails or times out, the source attempts to close its RabbitMQ connection and returns success from `on_batch_result`. On the next poll, the source attempts to reconnect. It does not retry the acknowledgement or replay the batch. RabbitMQ can redeliver unacknowledged messages, which can create duplicates in Iggy.
 
 ## Failure Handling
 
@@ -246,9 +243,10 @@ delivery. Consumers must handle duplicates.
 | RabbitMQ is unavailable at startup | Source initialization fails. Start RabbitMQ, then restart the connectors runtime. |
 | RabbitMQ disconnects after startup | The source waits for a random delay from 1 to 5 seconds, then retries connection and consume operations. |
 | Iggy rejects a batch | The source retains and retries the batch. RabbitMQ deliveries remain unacknowledged. |
-| A broker acknowledgement fails | The source attempts to close its AMQP connection and stops with an error. After restart, RabbitMQ can redeliver unacknowledged messages. |
+| A broker acknowledgement fails | The source attempts to close its RabbitMQ connection and attempts to reconnect on the next poll. RabbitMQ can redeliver unacknowledged messages, which can create duplicates in Iggy. |
 | Empty body in raw mode | The connector logs and rejects the delivery without requeuing it. RabbitMQ dead-letters it if a route exists. Otherwise, RabbitMQ drops it. |
 | Payload exceeds 64,000,000 bytes | The connector logs and rejects the delivery without requeuing it. RabbitMQ dead-letters it if a route exists. Otherwise, RabbitMQ drops it. |
+| RabbitMQ header nesting exceeds 400 levels | The connector rejects the delivery without requeuing it. |
 | Delivery preparation fails | The connector logs and rejects the delivery without requeuing it. RabbitMQ dead-letters it if a route exists. Otherwise, RabbitMQ drops it. |
 | Empty body in metadata mode | The connector can encode the empty body in the JSON envelope. |
 

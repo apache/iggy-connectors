@@ -228,7 +228,7 @@ use tokio::{
     sync::Mutex,
     time::{Instant, sleep, timeout},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     batch::PendingBatch,
@@ -364,7 +364,17 @@ impl RabbitMqSource {
             .get(&key)
             .is_none_or(|instant| instant.elapsed() >= Duration::from_secs(60))
         {
-            warn!(connector_id = self.id, queue = %self.config.queue, operation = failure.operation, reply_code = failure.reply_code.as_deref().unwrap_or("none"), error = %failure.error, "RabbitMQ source operation failed");
+            warn!(
+                connector_id = self.id,
+                queue = %self.config.queue,
+                operation = failure.operation,
+                reply_code = failure.reply_code.as_deref().unwrap_or("none"),
+                error = %failure.error,
+                "RabbitMQ source operation failed: operation={}, reply_code={}, error={}",
+                failure.operation,
+                failure.reply_code.as_deref().unwrap_or("none"),
+                failure.error
+            );
             last.insert(key, Instant::now());
         }
         drop(last);
@@ -395,7 +405,7 @@ impl RabbitMqSource {
         driver: RabbitMqDriver,
         deliveries: &mut [(ProducedMessage, Acker)],
     ) -> RejectOutcome {
-        warn!(connector_id = self.id, queue = %self.config.queue, reason, "Rejecting RabbitMQ delivery");
+        warn!(connector_id = self.id, queue = %self.config.queue, reason, "Rejecting RabbitMQ delivery: {reason}");
         let result = timeout(
             Duration::from_secs(self.config.timeout_seconds),
             delivery.acker.reject(BasicRejectOptions { requeue: false }),
@@ -428,9 +438,40 @@ impl RabbitMqSource {
 #[async_trait]
 impl Source for RabbitMqSource {
     async fn open(&mut self) -> Result<(), Error> {
-        self.batch_timeout = self.config.validate()?;
-        self.tls = tls::build(self.config.tls.as_ref())?;
-        let driver = self.connect().await.map_err(|failure| failure.error)?;
+        self.batch_timeout = match self.config.validate() {
+            Ok(batch_timeout) => batch_timeout,
+            Err(error) => {
+                error!(
+                    connector_id = self.id,
+                    "Failed to validate RabbitMQ source configuration: {error}"
+                );
+                return Err(error);
+            }
+        };
+        self.tls = match tls::build(self.config.tls.as_ref()) {
+            Ok(tls) => tls,
+            Err(error) => {
+                error!(
+                    connector_id = self.id,
+                    "Failed to build TLS configuration for RabbitMQ source: {error}"
+                );
+                return Err(error);
+            }
+        };
+        let driver = match self.connect().await {
+            Ok(driver) => driver,
+            Err(failure) => {
+                error!(
+                    connector_id = self.id,
+                    queue = %self.config.queue,
+                    "Failed to connect RabbitMQ source to broker: connector ID {}, queue {}: {}",
+                    self.id,
+                    self.config.queue,
+                    failure.error
+                );
+                return Err(failure.error);
+            }
+        };
         *self.driver.get_mut() = Some(driver);
         info!(
             connector_id = self.id,
@@ -478,9 +519,8 @@ impl Source for RabbitMqSource {
                 }
             },
         };
-        let batch_size = usize::try_from(self.config.batch_size).unwrap_or(usize::MAX);
-        let mut deliveries =
-            Vec::with_capacity(usize::from(self.config.effective_prefetch_count()));
+        let batch_size = usize::from(self.config.effective_prefetch_count());
+        let mut deliveries = Vec::with_capacity(batch_size);
         let mut payload_bytes = 0;
         let mut deadline = None;
         if let Some((message, acker, received_at)) = self.overflow.lock().await.take() {
@@ -595,11 +635,13 @@ impl Source for RabbitMqSource {
         if let Err(error) = result {
             /* An acker is single-use and the broker outcome is uncertain. Closing the
              * connection lets RabbitMQ requeue unsettled deliveries, possibly causing duplicates. */
+            self.overflow.lock().await.take();
+            self.deferred_failure.lock().await.take();
             let driver = self.driver.lock().await.take();
             if let Some(driver) = driver {
                 self.close_driver(driver).await;
             }
-            warn!(connector_id = self.id, queue = %self.config.queue, %error, "RabbitMQ acknowledgement failed; the source will reconnect and RabbitMQ can redeliver unsettled messages");
+            warn!(connector_id = self.id, queue = %self.config.queue, %error, "RabbitMQ acknowledgement failed: {error}; the source will reconnect and RabbitMQ can redeliver unsettled messages");
             return Ok(());
         }
 

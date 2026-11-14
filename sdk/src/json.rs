@@ -143,8 +143,9 @@ mod tests {
 
     #[test]
     fn given_repeated_key_should_keep_the_last_value_at_any_object_size() {
-        // Above 32 keys, simd-json switches to a hash map, which already keeps the last value.
-        for others in [1, 40] {
+        // 30 and 31 give 32 and 33 entries, either side of the size where simd-json switches to a
+        // hash map, which keeps the last value by itself.
+        for others in [1, 30, 31, 40] {
             let owned = to_owned_value(&mut repeated_env(others)).expect("valid JSON");
             let mut bytes = repeated_env(others);
             let borrowed = to_borrowed_value(&mut bytes).expect("valid JSON");

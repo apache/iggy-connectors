@@ -18,8 +18,8 @@
 disallowed-methods = [
     { path = "simd_json::to_owned_value", reason = "keeps every copy of a key that repeats in an object of up to 32 keys, use iggy_connector_sdk::json::to_owned_value" },
     { path = "simd_json::to_borrowed_value", reason = "keeps every copy of a key that repeats in an object of up to 32 keys, parse with iggy_connector_sdk::json::to_owned_value, or allow it where the caller resolves repeated keys itself" },
-    { path = "simd_json::to_owned_value_with_buffers", reason = "keeps every copy of a key that repeats in an object of up to 32 keys, use iggy_connector_sdk::json::to_owned_value" },
-    { path = "simd_json::to_borrowed_value_with_buffers", reason = "keeps every copy of a key that repeats in an object of up to 32 keys, parse with iggy_connector_sdk::json::to_owned_value, or allow it where the caller resolves repeated keys itself" },
+    { path = "simd_json::to_owned_value_with_buffers", reason = "keeps every copy of a key that repeats in an object of up to 32 keys, use iggy_connector_sdk::json::to_owned_value, which does not reuse buffers" },
+    { path = "simd_json::to_borrowed_value_with_buffers", reason = "keeps every copy of a key that repeats in an object of up to 32 keys, parse with iggy_connector_sdk::json::to_owned_value, which does not reuse buffers, or allow it where the caller resolves repeated keys itself" },
     { path = "simd_json::deserialize", reason = "keeps every copy of a key that repeats in an object of up to 32 keys, use iggy_connector_sdk::json" },
-    { path = "simd_json::deserialize_with_buffers", reason = "keeps every copy of a key that repeats in an object of up to 32 keys, use iggy_connector_sdk::json" },
+    { path = "simd_json::deserialize_with_buffers", reason = "keeps every copy of a key that repeats in an object of up to 32 keys, use iggy_connector_sdk::json, which does not reuse buffers" },
 ]

@@ -154,13 +154,25 @@ mod tests {
     }
 
     #[test]
-    fn given_repeated_key_in_nested_objects_should_keep_the_last_value() {
-        let json = br#"{"outer":{"k":1,"k":2},"list":[{"k":3,"k":4}]}"#;
-        let expected = r#"{"outer":{"k":2},"list":[{"k":4}]}"#;
+    fn given_repeated_key_in_nested_objects_should_keep_the_last_value_at_the_first_position() {
+        for (json, expected) in [
+            (
+                r#"{"outer":{"k":1,"k":2},"list":[{"k":3,"k":4}]}"#,
+                r#"{"outer":{"k":2},"list":[{"k":4}]}"#,
+            ),
+            (
+                r#"{"a":{"x":1,"x":2},"b":1,"a":{"y":1,"y":2}}"#,
+                r#"{"a":{"y":2},"b":1}"#,
+            ),
+        ] {
+            let value = to_owned_value(&mut json.as_bytes().to_vec()).expect("valid JSON");
 
-        let owned = to_owned_value(&mut json.to_vec()).expect("valid JSON");
-
-        assert_eq!(simd_json::to_string(&owned).expect("serialize"), expected);
+            assert_eq!(
+                simd_json::to_string(&value).expect("serialize"),
+                expected,
+                "{json}"
+            );
+        }
     }
 
     // Debug output names the variant, so `I64(1)` and `U64(1)` do not compare equal, and an

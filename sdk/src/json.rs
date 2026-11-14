@@ -20,7 +20,7 @@
 //! `simd_json::to_owned_value` and `simd_json::to_borrowed_value` keep every copy of a key that
 //! repeats in an object of up to 32 keys, and only the last value in a larger object. Readers
 //! then disagree: `get` returns the first copy, serde_json and most backends take the last, and
-//! Elasticsearch rejects the document. These functions parse with simd-json and then keep the
+//! Elasticsearch rejects the document. `to_owned_value` parses with simd-json and then keeps the
 //! last value of each repeated key.
 //!
 //! The serde path of simd-json keeps the last value too, but it recurses through several calls
@@ -30,7 +30,7 @@
 //! grow with depth. `given_json_at_the_simd_json_depth_limit_should_parse_within_a_tokio_worker_stack`
 //! guards this.
 
-use simd_json::{BorrowedValue, OwnedValue, borrowed, owned};
+use simd_json::{OwnedValue, owned};
 
 /// Parse `json` in place. A key that repeats in an object keeps its last value.
 pub fn to_owned_value(json: &mut [u8]) -> simd_json::Result<OwnedValue> {
@@ -40,18 +40,6 @@ pub fn to_owned_value(json: &mut [u8]) -> simd_json::Result<OwnedValue> {
     )]
     let mut value = simd_json::to_owned_value(json)?;
     keep_last_owned(&mut value);
-    Ok(value)
-}
-
-/// Parse `json` in place, borrowing its strings. A key that repeats in an object keeps its
-/// last value.
-pub fn to_borrowed_value(json: &mut [u8]) -> simd_json::Result<BorrowedValue<'_>> {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "the pass below removes repeated keys"
-    )]
-    let mut value = simd_json::to_borrowed_value(json)?;
-    keep_last_borrowed(&mut value);
     Ok(value)
 }
 
@@ -91,37 +79,6 @@ fn keep_last_owned(root: &mut OwnedValue) {
     }
 }
 
-fn keep_last_borrowed(root: &mut BorrowedValue<'_>) {
-    let mut pending = Vec::new();
-    let mut next = Some(root);
-    while let Some(value) = next {
-        match value {
-            BorrowedValue::Array(items) => {
-                pending.extend(items.iter_mut().filter(|item| {
-                    matches!(item, BorrowedValue::Array(_) | BorrowedValue::Object(_))
-                }));
-            }
-            BorrowedValue::Object(fields) => {
-                if fields.is_vec() && repeats_a_key(|| fields.keys().map(|key| key.as_ref())) {
-                    let mut unique = borrowed::Object::with_capacity_and_hasher(
-                        fields.len(),
-                        Default::default(),
-                    );
-                    for (key, field) in std::mem::take(&mut **fields) {
-                        unique.insert(key, field);
-                    }
-                    **fields = unique;
-                }
-                pending.extend(fields.values_mut().filter(|field| {
-                    matches!(field, BorrowedValue::Array(_) | BorrowedValue::Object(_))
-                }));
-            }
-            BorrowedValue::Static(_) | BorrowedValue::String(_) => {}
-        }
-        next = pending.pop();
-    }
-}
-
 /// Only an object on the vec backend can hold a repeated key, because simd-json inserts into a
 /// hash-backed one with a check. That is why the callers ask `is_vec` first.
 fn repeats_a_key<'k, I: Iterator<Item = &'k str>>(keys: impl Fn() -> I) -> bool {
@@ -147,8 +104,6 @@ mod tests {
         // hash map, which keeps the last value by itself.
         for others in [1, 30, 31, 40] {
             let owned = to_owned_value(&mut repeated_env(others)).expect("valid JSON");
-            let mut bytes = repeated_env(others);
-            let borrowed = to_borrowed_value(&mut bytes).expect("valid JSON");
 
             assert_eq!(
                 owned.as_object().map(|o| o.len()),
@@ -156,12 +111,6 @@ mod tests {
                 "{others}"
             );
             assert_eq!(owned.get_str("env"), Some("prod"), "{others}");
-            assert_eq!(
-                borrowed.as_object().map(|o| o.len()),
-                Some(others + 1),
-                "{others}"
-            );
-            assert_eq!(borrowed.get_str("env"), Some("prod"), "{others}");
         }
     }
 
@@ -171,14 +120,8 @@ mod tests {
         let expected = r#"{"outer":{"k":2},"list":[{"k":4}]}"#;
 
         let owned = to_owned_value(&mut json.to_vec()).expect("valid JSON");
-        let mut bytes = json.to_vec();
-        let borrowed = to_borrowed_value(&mut bytes).expect("valid JSON");
 
         assert_eq!(simd_json::to_string(&owned).expect("serialize"), expected);
-        assert_eq!(
-            simd_json::to_string(&borrowed).expect("serialize"),
-            expected
-        );
     }
 
     // Debug output names the variant, so `I64(1)` and `U64(1)` do not compare equal, and an
@@ -205,12 +148,6 @@ mod tests {
                 simd_json::to_owned_value(&mut document.as_bytes().to_vec()).expect("valid JSON");
             let actual = to_owned_value(&mut document.as_bytes().to_vec()).expect("valid JSON");
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{document}");
-
-            let mut expected_bytes = document.as_bytes().to_vec();
-            let expected = simd_json::to_borrowed_value(&mut expected_bytes).expect("valid JSON");
-            let mut actual_bytes = document.as_bytes().to_vec();
-            let actual = to_borrowed_value(&mut actual_bytes).expect("valid JSON");
-            assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{document}");
         }
     }
 
@@ -226,9 +163,7 @@ mod tests {
                 let arrays = format!("{}{}", "[".repeat(1024), "]".repeat(1024));
                 let objects = format!("{}null{}", r#"{"a":"#.repeat(1024), "}".repeat(1024));
                 for document in [arrays, objects] {
-                    to_owned_value(&mut document.clone().into_bytes()).expect("valid JSON");
-                    let mut bytes = document.into_bytes();
-                    to_borrowed_value(&mut bytes).expect("valid JSON");
+                    to_owned_value(&mut document.into_bytes()).expect("valid JSON");
                 }
             })
             .expect("spawn a thread with a worker stack")
@@ -241,10 +176,6 @@ mod tests {
         for document in ["", "{", r#"{"a":}"#, "[1,]", "nul", r#"{"a":1}x"#] {
             assert!(
                 to_owned_value(&mut document.as_bytes().to_vec()).is_err(),
-                "{document}"
-            );
-            assert!(
-                to_borrowed_value(&mut document.as_bytes().to_vec()).is_err(),
                 "{document}"
             );
         }

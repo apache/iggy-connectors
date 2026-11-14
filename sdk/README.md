@@ -57,12 +57,12 @@ Moreover, it contains both, the `decoders` and `encoders` modules, implementing 
 
 The SDK provides decoders and encoders for JSON, raw bytes, text, Protocol Buffers, FlatBuffers, and Avro. Their supported conversions have format-specific limits; see below and the [transforms guide](https://iggy.apache.org/docs/connectors/transforms).
 
-JSON is parsed with `iggy_connector_sdk::json::to_owned_value` or `to_borrowed_value`. When an object repeats a key, the last value wins, as in serde_json and most JSON backends. The simd-json functions of the same names keep every copy in an object of up to 32 keys, so plugins parse JSON with the SDK functions as well. The workspace `clippy.toml` rejects the simd-json ones. A plugin built outside this repository can add the same rule to its own `clippy.toml`:
+JSON is parsed with `iggy_connector_sdk::json::to_owned_value`. When an object repeats a key, the last value wins, as in serde_json and most JSON backends. simd-json's `to_owned_value` and `to_borrowed_value` keep every copy in an object of up to 32 keys, so plugins parse JSON with the SDK function as well. The workspace `clippy.toml` rejects the simd-json ones. A plugin built outside this repository can add the same rule to its own `clippy.toml`:
 
 ```toml
 disallowed-methods = [
     { path = "simd_json::to_owned_value", reason = "use iggy_connector_sdk::json::to_owned_value" },
-    { path = "simd_json::to_borrowed_value", reason = "use iggy_connector_sdk::json::to_borrowed_value" },
+    { path = "simd_json::to_borrowed_value", reason = "use iggy_connector_sdk::json::to_owned_value" },
 ]
 ```
 

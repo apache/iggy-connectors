@@ -33,7 +33,7 @@ pub struct RabbitMqSourceConfig {
     pub batch_timeout: String,
     #[serde(default)]
     pub include_metadata: bool,
-    #[serde(default = "default_timeout_seconds")]
+    #[serde(default = "default_timeout_seconds", alias = "timeout_secs")]
     pub timeout_seconds: u64,
     #[serde(default)]
     pub verbose_logging: Option<bool>,

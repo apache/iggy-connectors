@@ -481,7 +481,7 @@ async fn given_empty_body_in_metadata_mode_when_delivered_should_preserve_empty_
     seed = seeds::connector_stream
 )]
 async fn given_empty_body_in_raw_mode_when_followed_by_valid_message_should_skip_empty_body(
-    harness: &TestHarness,
+    harness: &mut TestHarness,
     fixture: RabbitMqSourceFixture,
 ) {
     wait_for_running(harness).await;
@@ -495,6 +495,58 @@ async fn given_empty_body_in_raw_mode_when_followed_by_valid_message_should_skip
         .expect("RabbitMQ publish must succeed");
     let message = next_message(harness).await;
     assert_eq!(message.payload.as_ref(), b"after-empty");
+
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if fixture
+                .acknowledged_messages()
+                .await
+                .expect("RabbitMQ queue inspection must succeed")
+                .is_some_and(|count| count >= 1)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("RabbitMQ must acknowledge the valid delivery");
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("connectors runtime must stop");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if fixture
+                .consumer_count()
+                .await
+                .expect("RabbitMQ consumer inspection must succeed")
+                == 0
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("RabbitMQ source consumer must disconnect");
+
+    assert_eq!(
+        fixture
+            .unacknowledged_messages()
+            .await
+            .expect("RabbitMQ queue inspection must succeed"),
+        0,
+        "RabbitMQ must not leave the rejected empty delivery unacknowledged"
+    );
+    assert!(
+        !fixture
+            .get_ready_message()
+            .await
+            .expect("RabbitMQ queue inspection must succeed"),
+        "RabbitMQ must not requeue the rejected empty delivery"
+    );
 }
 
 async fn wait_for_running(harness: &TestHarness) {

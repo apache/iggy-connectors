@@ -41,6 +41,10 @@ static AMQP_MESSAGE_ID_HEADER_KEY: LazyLock<HeaderKey> = LazyLock::new(|| {
     HeaderKey::try_from("amqp.message_id").expect("AMQP message ID header key is valid")
 });
 
+// Each nested AMQP array or table adds two JSON containers to the envelope.
+// Keep encoded headers well below simd-json's 1,024-container parser limit.
+const MAX_HEADER_NESTING_DEPTH: usize = 400;
+
 pub fn encode_delivery(delivery: &Delivery) -> Result<Vec<u8>, serde_json::Error> {
     let mut properties = Map::new();
     for (name, value) in [
@@ -74,7 +78,8 @@ pub fn encode_delivery(delivery: &Delivery) -> Result<Vec<u8>, serde_json::Error
         .properties
         .headers()
         .as_ref()
-        .map(encode_table)
+        .map(|table| encode_table(table, 0))
+        .transpose()?
         .unwrap_or_else(|| Value::Object(Map::new()));
     let mut output = Vec::new();
     output.extend_from_slice(b"{\"body_base64\":\"");
@@ -102,57 +107,85 @@ pub fn encode_delivery(delivery: &Delivery) -> Result<Vec<u8>, serde_json::Error
     Ok(output)
 }
 
-pub fn encode_table(table: &FieldTable) -> Value {
-    let fields: Map<String, Value> = table
-        .inner()
-        .iter()
-        .map(|(key, value)| (key.as_str().to_owned(), encode_value(value)))
-        .collect();
-    Value::Object(fields)
+fn encode_table(table: &FieldTable, depth: usize) -> Result<Value, serde_json::Error> {
+    let mut fields = Map::new();
+    for (key, value) in table.inner() {
+        fields.insert(
+            key.as_str().to_owned(),
+            encode_value_at_depth(value, depth)?,
+        );
+    }
+    Ok(Value::Object(fields))
 }
 
-pub fn encode_value(value: &AMQPValue) -> Value {
+#[cfg(test)]
+fn encode_value(value: &AMQPValue) -> Result<Value, serde_json::Error> {
+    encode_value_at_depth(value, 0)
+}
+
+fn encode_value_at_depth(value: &AMQPValue, depth: usize) -> Result<Value, serde_json::Error> {
     match value {
-        AMQPValue::Boolean(value) => json!({"type": "boolean", "value": value}),
+        AMQPValue::Boolean(value) => Ok(json!({"type": "boolean", "value": value})),
         AMQPValue::ShortShortInt(value) => {
-            json!({"type": "short_short_int", "value": value.to_string()})
+            Ok(json!({"type": "short_short_int", "value": value.to_string()}))
         }
         AMQPValue::ShortShortUInt(value) => {
-            json!({"type": "short_short_uint", "value": value.to_string()})
+            Ok(json!({"type": "short_short_uint", "value": value.to_string()}))
         }
-        AMQPValue::ShortInt(value) => json!({"type": "short_int", "value": value.to_string()}),
-        AMQPValue::ShortUInt(value) => json!({"type": "short_uint", "value": value.to_string()}),
-        AMQPValue::LongInt(value) => json!({"type": "long_int", "value": value.to_string()}),
-        AMQPValue::LongUInt(value) => json!({"type": "long_uint", "value": value.to_string()}),
+        AMQPValue::ShortInt(value) => Ok(json!({"type": "short_int", "value": value.to_string()})),
+        AMQPValue::ShortUInt(value) => {
+            Ok(json!({"type": "short_uint", "value": value.to_string()}))
+        }
+        AMQPValue::LongInt(value) => Ok(json!({"type": "long_int", "value": value.to_string()})),
+        AMQPValue::LongUInt(value) => Ok(json!({"type": "long_uint", "value": value.to_string()})),
         AMQPValue::LongLongInt(value) => {
-            json!({"type": "long_long_int", "value": value.to_string()})
+            Ok(json!({"type": "long_long_int", "value": value.to_string()}))
         }
-        AMQPValue::Float(value) => {
-            json!({"type": "float", "value": if value.is_finite() { value.to_string() } else { format_float(*value as f64) }})
+        AMQPValue::Float(value) => Ok(
+            json!({"type": "float", "value": if value.is_finite() { value.to_string() } else { format_float(*value as f64) }}),
+        ),
+        AMQPValue::Double(value) => Ok(json!({"type": "double", "value": format_float(*value)})),
+        AMQPValue::DecimalValue(value) => Ok(
+            json!({"type": "decimal_value", "value": {"scale": value.scale, "value": value.value.to_string()}}),
+        ),
+        AMQPValue::ShortString(value) => {
+            Ok(json!({"type": "short_string", "value": value.as_str()}))
         }
-        AMQPValue::Double(value) => json!({"type": "double", "value": format_float(*value)}),
-        AMQPValue::DecimalValue(value) => {
-            json!({"type": "decimal_value", "value": {"scale": value.scale, "value": value.value.to_string()}})
-        }
-        AMQPValue::ShortString(value) => json!({"type": "short_string", "value": value.as_str()}),
         AMQPValue::LongString(value) => match std::str::from_utf8(value.as_bytes()) {
-            Ok(text) => json!({"type": "long_string", "value": text}),
-            Err(_) => {
-                json!({"type": "long_string", "value_base64": STANDARD.encode(value.as_bytes())})
-            }
+            Ok(text) => Ok(json!({"type": "long_string", "value": text})),
+            Err(_) => Ok(
+                json!({"type": "long_string", "value_base64": STANDARD.encode(value.as_bytes())}),
+            ),
         },
         AMQPValue::FieldArray(values) => {
-            json!({"type": "field_array", "value": values.as_slice().iter().map(encode_value).collect::<Vec<_>>()})
+            let next_depth = next_header_depth(depth)?;
+            let encoded = values
+                .as_slice()
+                .iter()
+                .map(|value| encode_value_at_depth(value, next_depth))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(json!({"type": "field_array", "value": encoded}))
         }
-        AMQPValue::Timestamp(value) => json!({"type": "timestamp", "value": value.to_string()}),
+        AMQPValue::Timestamp(value) => Ok(json!({"type": "timestamp", "value": value.to_string()})),
         AMQPValue::FieldTable(value) => {
-            json!({"type": "field_table", "value": encode_table(value)})
+            let next_depth = next_header_depth(depth)?;
+            Ok(json!({"type": "field_table", "value": encode_table(value, next_depth)?}))
         }
         AMQPValue::ByteArray(value) => {
-            json!({"type": "byte_array", "value_base64": STANDARD.encode(value.as_slice())})
+            Ok(json!({"type": "byte_array", "value_base64": STANDARD.encode(value.as_slice())}))
         }
-        AMQPValue::Void => json!({"type": "void", "value": null}),
+        AMQPValue::Void => Ok(json!({"type": "void", "value": null})),
     }
+}
+
+fn next_header_depth(depth: usize) -> Result<usize, serde_json::Error> {
+    if depth == MAX_HEADER_NESTING_DEPTH {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("AMQP header nesting exceeds {MAX_HEADER_NESTING_DEPTH} levels"),
+        )));
+    }
+    Ok(depth + 1)
 }
 
 fn format_float(value: f64) -> String {
@@ -232,7 +265,7 @@ fn raw_headers(
             warn!(
                 connector_id,
                 header = name,
-                "RabbitMQ source omitted a property from Iggy headers"
+                "RabbitMQ source omitted property {name} from Iggy headers"
             );
         } else {
             insert_string(&mut headers, &AMQP_MESSAGE_ID_HEADER_KEY, value)?;
@@ -536,22 +569,25 @@ mod envelope_tests {
             (AMQPValue::Void, json!({"type":"void","value":null})),
         ];
         for (input, expected) in vectors {
-            assert_eq!(encode_value(&input), expected);
+            assert_eq!(
+                encode_value(&input).expect("AMQP value must encode"),
+                expected
+            );
         }
     }
 
     #[test]
     fn given_non_finite_floats_should_use_documented_strings() {
         assert_eq!(
-            encode_value(&AMQPValue::Float(f32::NAN)),
+            encode_value(&AMQPValue::Float(f32::NAN)).expect("AMQP value must encode"),
             json!({"type":"float","value":"NaN"})
         );
         assert_eq!(
-            encode_value(&AMQPValue::Double(f64::INFINITY)),
+            encode_value(&AMQPValue::Double(f64::INFINITY)).expect("AMQP value must encode"),
             json!({"type":"double","value":"Infinity"})
         );
         assert_eq!(
-            encode_value(&AMQPValue::Double(f64::NEG_INFINITY)),
+            encode_value(&AMQPValue::Double(f64::NEG_INFINITY)).expect("AMQP value must encode"),
             json!({"type":"double","value":"-Infinity"})
         );
     }

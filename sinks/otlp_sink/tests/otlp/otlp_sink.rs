@@ -23,6 +23,7 @@ use crate::fixtures::{
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::{Identifier, MessageClient};
+use iggy_connector_testing::create_test_messages;
 use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -34,6 +35,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 const TEST_TOKEN_HEADER: &str = "Bearer iggy-test-token";
+// The resource attribute that `tests/otlp/log_record_config/otlp.toml` sets.
+const LOG_RECORD_SERVICE_NAME: &str = "iggy-otlp-sink-test";
 // Comfortably longer than every retry the sink config allows (3 attempts, 200 ms cap).
 const NO_RETRY_GRACE: Duration = Duration::from_millis(1_500);
 
@@ -334,6 +337,72 @@ async fn redirected_http_export_is_not_followed(
 
 /// Send three OTLP log requests produced by `service`, and check that the collector got
 /// every record, under that service's own resource.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/otlp/log_record.toml")),
+    seed = seeds::connector_stream
+)]
+async fn plain_json_messages_are_exported_as_log_records(
+    harness: &TestHarness,
+    fixture: OtlpHttpProtoLogsFixture,
+) {
+    let payloads: Vec<Vec<u8>> = create_test_messages(3)
+        .iter()
+        .map(|message| serde_json::to_vec(message).expect("serialize"))
+        .collect();
+    send_payloads(harness, payloads).await;
+
+    let exports = fixture
+        .collector()
+        .wait_for_log_records(3)
+        .await
+        .expect("collector received the log records");
+
+    let mut names = Vec::new();
+    let mut offsets = Vec::new();
+    for resource_logs in exports.iter().flat_map(|export| &export.resource_logs) {
+        assert_eq!(
+            service_name(resource_logs.resource.as_ref()),
+            Some(LOG_RECORD_SERVICE_NAME)
+        );
+        for record in resource_logs
+            .scope_logs
+            .iter()
+            .flat_map(|scope| &scope.log_records)
+        {
+            assert_eq!(
+                attribute(&record.attributes, "iggy.stream"),
+                Some(&any_value::Value::StringValue(
+                    seeds::names::STREAM.to_owned()
+                ))
+            );
+            assert_eq!(
+                attribute(&record.attributes, "iggy.topic"),
+                Some(&any_value::Value::StringValue(
+                    seeds::names::TOPIC.to_owned()
+                ))
+            );
+            assert!(record.time_unix_nano > 0);
+            let Some(any_value::Value::KvlistValue(body)) =
+                record.body.as_ref().and_then(|body| body.value.as_ref())
+            else {
+                panic!("a JSON message becomes a key-value body: {record:?}");
+            };
+            if let Some(any_value::Value::StringValue(name)) = attribute(&body.values, "name") {
+                names.push(name.clone());
+            }
+            if let Some(any_value::Value::IntValue(offset)) =
+                attribute(&record.attributes, "iggy.offset")
+            {
+                offsets.push(*offset);
+            }
+        }
+    }
+    names.sort();
+    assert_eq!(names, ["user_0", "user_1", "user_2"]);
+    offsets.sort();
+    assert_eq!(offsets, [0, 1, 2]);
+}
+
 async fn assert_logs_pass_through(
     harness: &TestHarness,
     collector: &OtelCollectorContainer,

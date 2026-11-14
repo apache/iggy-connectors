@@ -4,27 +4,58 @@ The OTLP sink exports logs from Iggy topics to any backend that speaks the OpenT
 
 ## What a message holds
 
-Each message on the consumed topics holds one protobuf `ExportLogsServiceRequest`, with the stream `schema` set to `raw`. This is the `otlp_proto` encoding of the OpenTelemetry Collector's Kafka exporter and receiver, so a topic written by a collector can be exported unchanged.
+The `encoding` key tells the sink what the messages on the consumed topics hold.
+
+| `encoding` | A message holds | Stream `schema` |
+| --- | --- | --- |
+| `otlp_proto` (default) | One protobuf `ExportLogsServiceRequest`, which the sink forwards as it is. | `raw` |
+| `log_record` | Anything. The sink wraps each message in one log record. | Any |
+
+### `otlp_proto`
+
+This is the `otlp_proto` encoding of the OpenTelemetry Collector's Kafka exporter and receiver, so a topic written by a collector can be exported unchanged.
 
 The sink checks that each message decodes, then forwards it as the bytes it arrived in. Resources, scopes and attributes are not rewritten, and fields this sink does not know still reach the receiver.
 
 A message is dropped and logged when it does not decode, when it holds no resource entry, or when one of its log records has a `trace_id` that is not 16 bytes or a `span_id` that is not 8 bytes. An absent ID is valid. The length is checked because a Collector rejects a whole request for one such ID, and a request packs many messages. The other messages of the batch are still exported.
+
+### `log_record`
+
+Use this encoding for topics that hold application data, such as JSON events or lines of text. Each message becomes one log record, and no message is dropped.
+
+| Log record field | Value |
+| --- | --- |
+| `body` | The payload. A JSON payload becomes a structured body: an object becomes a key-value list, an array stays an array, and strings, numbers and booleans keep their types. A text payload becomes a string. A binary payload becomes bytes, and with the `raw` schema every payload is binary. |
+| `time_unix_nano` | The origin timestamp of the message, or its append time when the producer set none. |
+| `observed_time_unix_nano` | The append time of the message. |
+| `attributes` | One per user header, and the Iggy coordinates of the message. |
+
+Each user header becomes an attribute. Its key is the [header name](../../sdk/README.md#user-header-names) that every sink uses. Its value keeps the type of the header: a string, a boolean, an integer, a float or bytes. A string value that is not valid UTF-8 becomes bytes.
+
+With `include_metadata`, which is the default, each record also has the attributes `iggy.stream`, `iggy.topic`, `iggy.partition_id`, `iggy.offset` and `iggy.message_id`, so a record can be traced back to its message. `iggy.message_id` is a string, because a message ID is 128 bits wide. A header with one of these names is then not exported, because the keys of OTLP attributes must be unique.
+
+An OTLP integer is 64 bits wide and signed. In a body and in an attribute, an integer outside of that range becomes its decimal text.
+
+Every record is exported under one resource, which holds the `resource_attributes`, and under the scope `iggy_connector_otlp_sink`. Set `service.name` there, because most backends name and group logs by it.
 
 ## Configuration
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `endpoint` | Required | The base URL, `http(s)://host:4318`, to which `/v1/logs` is appended after any path it has. A query string is kept. An endpoint that already ends with `/v1/logs` is rejected. |
+| `encoding` | `otlp_proto` | `otlp_proto` or `log_record`. See [What a message holds](#what-a-message-holds). |
 | `compression` | `none` | `none` or `gzip`. |
 | `headers` | none | Sent with every export as HTTP headers. Values are treated as secrets and never logged. Names are case-insensitive, so two names that differ only in case are rejected. `content-type` and `content-encoding` are rejected too, because the sink sets both. Set them in the connector's TOML file or through the HTTP config provider: a map cannot come from an environment variable. |
 | `timeout` | `10s` | Timeout of one attempt. Must be greater than zero. |
 | `max_retries` | `8` | Total attempts per request, including the first. `0` and `1` both mean a single attempt. With the default delays, 8 attempts wait about 45 s in total between them. A higher value holds a batch longer instead of losing it, for retryable failures only. See [Delivery](#delivery). |
 | `retry_delay` | `1s` | Backoff before the first retry. It doubles per retry, with ±20% jitter. |
 | `max_retry_delay` | `10s` | Upper bound on one backoff. When `retry_delay` is larger, every backoff is `max_retry_delay`. |
-| `max_request_bytes` | `4000000` | Upper bound on the encoded size of one request, below the 4 MiB limit most receivers use. Messages are packed whole into requests, so a single message larger than this is sent on its own. |
+| `max_request_bytes` | `4000000` | Upper bound on the encoded size of one request, below the 4 MiB limit most receivers use. Messages are packed whole into requests, so a single message larger than this is sent on its own. With `log_record`, a value that the resource and the scope fill before the first record is rejected. |
+| `resource_attributes` | none | `log_record` only. The attributes of the resource that every record is exported under, as strings. Set them where `headers` are set: a map cannot come from an environment variable. |
+| `include_metadata` | `true` | `log_record` only. Add the `iggy.*` attributes to each record. |
 | `verbose_logging` | `false` | Log each batch at `info` with the running counters, instead of at `debug`. |
 
-A key that is not in this table is rejected, so a misspelled key stops the connector at start instead of taking its default.
+A key that is not in this table is rejected, so a misspelled key stops the connector at start instead of taking its default. `resource_attributes` and `include_metadata` do nothing with `otlp_proto`, and the sink logs a warning when one of them is set.
 
 TLS is used when the endpoint scheme is `https`, verified against the system's root certificates. Client certificates (mTLS) are not supported.
 
@@ -42,6 +73,24 @@ compression = "gzip"
 
 [plugin_config.headers]
 authorization = "Bearer <YOUR_TOKEN_HERE>"
+```
+
+A topic of JSON events, exported as log records:
+
+```toml
+[[streams]]
+stream = "shop"
+topics = ["events"]
+schema = "json"
+batch_length = 500
+consumer_group = "otlp_sink"
+
+[plugin_config]
+endpoint = "https://otlp.example.com:4318"
+encoding = "log_record"
+
+[plugin_config.resource_attributes]
+"service.name" = "checkout"
 ```
 
 ## Delivery
@@ -75,7 +124,7 @@ The sink keeps these counters, logs them when it closes and, with `verbose_loggi
 | --- | --- |
 | `messages_sent` | Messages in requests the receiver accepted. |
 | `messages_failed` | Messages in requests that failed after every retry. |
-| `messages_dropped` | Messages that could not be decoded, that held no resource entry, or that held a `trace_id` or `span_id` of the wrong length. |
+| `messages_dropped` | Messages that could not be decoded, that held no resource entry, or that held a `trace_id` or `span_id` of the wrong length. Always zero with `log_record`. |
 | `batches_sent` / `batches_failed` | Export requests that succeeded or failed. |
 | `items_rejected` | Log records the receiver reported as rejected. |
 | `retries` | Retried attempts. |

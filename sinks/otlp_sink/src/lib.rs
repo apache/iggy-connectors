@@ -17,6 +17,7 @@
 
 mod batch;
 mod exporter;
+mod log_record;
 mod logs;
 
 use async_trait::async_trait;
@@ -26,10 +27,11 @@ use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
+use log_record::LogRecordTemplate;
 use reqwest::Url;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -60,6 +62,26 @@ pub enum Compression {
     Gzip,
 }
 
+/// What a message on the consumed topics holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Encoding {
+    /// One protobuf `ExportLogsServiceRequest`, forwarded as it is.
+    #[default]
+    OtlpProto,
+    /// Anything. The sink wraps each message in a log record.
+    LogRecord,
+}
+
+impl fmt::Display for Encoding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::OtlpProto => "otlp_proto",
+            Self::LogRecord => "log_record",
+        })
+    }
+}
+
 // `Deserialize` only. Nothing re-serializes a plugin config, and leaving `Serialize` off is
 // what keeps the header values, which carry API keys, unserializable.
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +90,7 @@ pub enum Compression {
 pub struct OtlpSinkConfig {
     /// The base URL, `http(s)://host:4318`, to which `/v1/logs` is appended.
     pub endpoint: String,
+    pub encoding: Option<Encoding>,
     pub compression: Option<Compression>,
     /// Sent with every export as HTTP headers. Values are secrets.
     pub headers: Option<HashMap<String, SecretString>>,
@@ -80,6 +103,11 @@ pub struct OtlpSinkConfig {
     /// Upper bound on one export request's encoded size. Messages are never split, so a
     /// single message above it is still sent, on its own.
     pub max_request_bytes: Option<usize>,
+    /// `log_record` only. Attributes of the resource that every record is exported under.
+    pub resource_attributes: Option<BTreeMap<String, String>>,
+    /// `log_record` only. Add the stream, topic, partition, offset and message ID to each
+    /// record as `iggy.*` attributes. Defaults to true.
+    pub include_metadata: Option<bool>,
     pub verbose_logging: Option<bool>,
 }
 
@@ -91,6 +119,9 @@ struct Settings {
     timeout: Duration,
     retry: RetryPolicy,
     max_request_bytes: usize,
+    encoding: Encoding,
+    /// Used with `Encoding::LogRecord` only.
+    template: LogRecordTemplate,
     verbose: bool,
 }
 
@@ -146,6 +177,31 @@ impl Settings {
             ));
         }
 
+        let encoding = config.encoding.unwrap_or_default();
+        let template = LogRecordTemplate::new(
+            config.resource_attributes.iter().flatten(),
+            config.include_metadata.unwrap_or(true),
+        );
+        match encoding {
+            Encoding::OtlpProto => {
+                if config.resource_attributes.is_some() || config.include_metadata.is_some() {
+                    warn!(
+                        "OTLP sink ID: {id} ignores resource_attributes and include_metadata, which apply to the log_record encoding only"
+                    );
+                }
+            }
+            // The resource and the scope are in every request, so a limit they fill alone
+            // would be exceeded by each of them.
+            Encoding::LogRecord => {
+                if max_request_bytes <= template.overhead {
+                    return Err(Error::InvalidConfigValue(format!(
+                        "max_request_bytes ({max_request_bytes}) leaves no room for a log record: a log_record request takes up to {} bytes before its first record",
+                        template.overhead
+                    )));
+                }
+            }
+        }
+
         let mut header_names = HashSet::new();
         for name in config.headers.iter().flatten().map(|(name, _)| name) {
             if RESERVED_HEADERS
@@ -173,6 +229,8 @@ impl Settings {
                 max_delay: max_retry_delay,
             },
             max_request_bytes,
+            encoding,
+            template,
             verbose: config.verbose_logging.unwrap_or(false),
         })
     }
@@ -427,9 +485,10 @@ impl Sink for OtlpSink {
             )
         })?;
         info!(
-            "Opened OTLP sink connector ID: {}, endpoint: {}",
+            "Opened OTLP sink connector ID: {}, endpoint: {}, encoding: {}",
             self.id,
-            endpoint_for_log(&opened.settings.endpoint)
+            endpoint_for_log(&opened.settings.endpoint),
+            opened.settings.encoding
         );
         self.opened = Some(opened);
         Ok(())
@@ -452,7 +511,17 @@ impl Sink for OtlpSink {
         })?;
 
         let received = messages.len();
-        let prepared = batch::pack_requests(messages, opened.settings.max_request_bytes);
+        let settings = &opened.settings;
+        let prepared = match settings.encoding {
+            Encoding::OtlpProto => batch::pack_requests(messages, settings.max_request_bytes),
+            Encoding::LogRecord => log_record::pack_log_records(
+                &settings.template,
+                topic_metadata,
+                &messages_metadata,
+                messages,
+                settings.max_request_bytes,
+            ),
+        };
         self.send_all(
             opened,
             prepared,
@@ -500,12 +569,13 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use prost::Message;
-    use wiremock::matchers::body_bytes;
+    use wiremock::matchers::{any, body_bytes};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_config() -> OtlpSinkConfig {
         OtlpSinkConfig {
             endpoint: "http://localhost:4318".to_owned(),
+            encoding: None,
             compression: None,
             headers: None,
             timeout: None,
@@ -513,6 +583,8 @@ mod tests {
             retry_delay: None,
             max_retry_delay: None,
             max_request_bytes: None,
+            resource_attributes: None,
+            include_metadata: None,
             verbose_logging: None,
         }
     }
@@ -580,6 +652,8 @@ mod tests {
         assert_eq!(settings.retry.base_delay, Duration::from_secs(1));
         assert_eq!(settings.retry.max_delay, Duration::from_secs(10));
         assert_eq!(settings.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES);
+        assert_eq!(settings.encoding, Encoding::OtlpProto);
+        assert!(settings.template.include_metadata);
     }
 
     #[test]
@@ -587,20 +661,34 @@ mod tests {
         let config: OtlpSinkConfig = toml::from_str(
             r#"
             endpoint = "https://otlp.example.com:4318"
+            encoding = "log_record"
             compression = "gzip"
             timeout = "5s"
             max_retries = 5
             retry_delay = "200ms"
             max_retry_delay = "3s"
             max_request_bytes = 1048576
+            include_metadata = false
             verbose_logging = true
 
             [headers]
             authorization = "Bearer secret-token"
+
+            [resource_attributes]
+            "service.name" = "checkout"
             "#,
         )
         .expect("valid config");
 
+        assert_eq!(config.encoding, Some(Encoding::LogRecord));
+        assert_eq!(config.include_metadata, Some(false));
+        assert_eq!(
+            config.resource_attributes,
+            Some(BTreeMap::from([(
+                "service.name".to_owned(),
+                "checkout".to_owned()
+            )]))
+        );
         assert_eq!(config.compression, Some(Compression::Gzip));
         assert_eq!(config.max_retries, Some(5));
         assert_eq!(config.max_request_bytes, Some(1_048_576));
@@ -666,6 +754,46 @@ mod tests {
         let mut sink = OtlpSink::new(1, config);
 
         assert!(matches!(open(&mut sink), Err(Error::InvalidConfigValue(_))));
+    }
+
+    #[test]
+    fn given_log_record_limit_without_room_for_a_record_should_fail_open() {
+        let overhead = LogRecordTemplate::new(&BTreeMap::new(), true).overhead;
+        let mut config = test_config();
+        config.encoding = Some(Encoding::LogRecord);
+        config.max_request_bytes = Some(overhead);
+        let mut too_small = OtlpSink::new(1, config.clone());
+        config.max_request_bytes = Some(overhead + 1);
+        let mut large_enough = OtlpSink::new(2, config);
+
+        assert!(matches!(
+            open(&mut too_small),
+            Err(Error::InvalidConfigValue(_))
+        ));
+        assert!(open(&mut large_enough).is_ok());
+    }
+
+    #[test]
+    fn given_otlp_proto_limit_below_log_record_overhead_should_open() {
+        let mut config = test_config();
+        config.max_request_bytes = Some(1);
+        let mut sink = OtlpSink::new(1, config);
+
+        assert!(open(&mut sink).is_ok());
+    }
+
+    #[test]
+    fn given_log_record_fields_with_otlp_proto_should_open_and_ignore_them() {
+        let mut config = test_config();
+        config.include_metadata = Some(false);
+        config.resource_attributes = Some(BTreeMap::from([(
+            "service.name".to_owned(),
+            "checkout".to_owned(),
+        )]));
+
+        let settings = Settings::resolve(1, &config).expect("ignored, not rejected");
+
+        assert_eq!(settings.encoding, Encoding::OtlpProto);
     }
 
     #[test]
@@ -842,6 +970,55 @@ mod tests {
         );
         let bodies: Vec<_> = received.iter().map(|request| &request.body).collect();
         assert_eq!(bodies, [&refused, &accepted]);
+    }
+
+    #[test]
+    fn given_log_record_encoding_should_export_a_message_as_a_log_record() {
+        let (result, received) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let server = MockServer::start().await;
+                Mock::given(any())
+                    .respond_with(ResponseTemplate::new(200))
+                    .mount(&server)
+                    .await;
+                let mut config = test_config();
+                config.endpoint = server.uri();
+                config.encoding = Some(Encoding::LogRecord);
+                config.resource_attributes = Some(BTreeMap::from([(
+                    "service.name".to_owned(),
+                    "checkout".to_owned(),
+                )]));
+                let mut sink = OtlpSink::new(1, config);
+                sink.open().await.expect("valid config");
+
+                // Not an export request: the `otlp_proto` encoding drops this message.
+                let mut message = raw_message(Vec::new());
+                message.payload = iggy_connector_sdk::Payload::Text("user signed in".to_owned());
+                let result = sink.consume(&topic(), raw_metadata(), vec![message]).await;
+                (result, server.received_requests().await.unwrap_or_default())
+            });
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(received.len(), 1);
+        let request = ExportLogsServiceRequest::decode(received[0].body.as_slice())
+            .expect("the body is an export request");
+        let resource_logs = &request.resource_logs[0];
+        let resource = resource_logs.resource.as_ref().expect("resource is set");
+        assert_eq!(resource.attributes[0].key, "service.name");
+        let record = &resource_logs.scope_logs[0].log_records[0];
+        assert_eq!(
+            record.body.as_ref().and_then(|body| body.value.as_ref()),
+            Some(&any_value::Value::StringValue("user signed in".to_owned()))
+        );
+        assert!(
+            record
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "iggy.stream"),
+            "{:?}",
+            record.attributes
+        );
     }
 
     #[test]

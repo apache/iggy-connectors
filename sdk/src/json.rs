@@ -59,7 +59,9 @@ fn keep_last_owned(root: &mut OwnedValue) {
                 );
             }
             OwnedValue::Object(fields) => {
-                if fields.is_vec() && repeats_a_key(|| fields.keys().map(String::as_str)) {
+                // Only an object on the vec backend can hold a repeated key, because simd-json
+                // inserts into a hash-backed one with a check.
+                if fields.is_vec() && repeats_a_key(fields.keys().map(String::as_str)) {
                     let mut unique =
                         owned::Object::with_capacity_and_hasher(fields.len(), Default::default());
                     for (key, field) in std::mem::take(&mut **fields) {
@@ -79,12 +81,26 @@ fn keep_last_owned(root: &mut OwnedValue) {
     }
 }
 
-/// Only an object on the vec backend can hold a repeated key, because simd-json inserts into a
-/// hash-backed one with a check. That is why the callers ask `is_vec` first.
-fn repeats_a_key<'k, I: Iterator<Item = &'k str>>(keys: impl Fn() -> I) -> bool {
-    keys()
-        .enumerate()
-        .any(|(i, key)| keys().take(i).any(|earlier| earlier == key))
+/// How many keys `repeats_a_key` sorts on the stack. A vec-backed object holds at most 32, the
+/// size of halfbrown's `HashMap`, which simd-json's object is. The size only affects speed.
+const SORTED_KEYS: usize = 32;
+
+/// Whether a key repeats. More keys than the buffer holds count as a repeat, so the object is
+/// rebuilt, which leaves it unchanged when no key repeats.
+fn repeats_a_key<'k>(keys: impl Iterator<Item = &'k str>) -> bool {
+    let mut sorted = [""; SORTED_KEYS];
+    let mut len = 0;
+    for key in keys {
+        let Some(slot) = sorted.get_mut(len) else {
+            return true;
+        };
+        *slot = key;
+        len += 1;
+    }
+    let sorted = &mut sorted[..len];
+    // Keys of different lengths compare as integers, so mixed keys rarely compare their bytes.
+    sorted.sort_unstable_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    sorted.windows(2).any(|pair| pair[0] == pair[1])
 }
 
 #[cfg(test)]
@@ -112,6 +128,29 @@ mod tests {
             );
             assert_eq!(owned.get_str("env"), Some("prod"), "{others}");
         }
+    }
+
+    fn keys(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("key_{i:02}")).collect()
+    }
+
+    #[test]
+    fn given_keys_within_the_sort_buffer_should_report_only_a_real_repeat() {
+        let mut keys = keys(SORTED_KEYS);
+        assert!(!repeats_a_key(keys.iter().map(String::as_str)));
+
+        keys[SORTED_KEYS - 1] = keys[0].clone();
+        assert!(repeats_a_key(keys.iter().map(String::as_str)));
+    }
+
+    // No parsed object reaches this case: a vec-backed object holds at most `SORTED_KEYS` keys.
+    #[test]
+    fn given_more_keys_than_the_sort_buffer_should_report_a_possible_repeat() {
+        let mut keys = keys(SORTED_KEYS + 1);
+        assert!(repeats_a_key(keys.iter().map(String::as_str)));
+
+        keys[SORTED_KEYS] = keys[0].clone();
+        assert!(repeats_a_key(keys.iter().map(String::as_str)));
     }
 
     #[test]

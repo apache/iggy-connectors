@@ -21,7 +21,7 @@ use base64::engine::general_purpose;
 use bytes::Bytes;
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
+    ConsumedMessage, Error, HeaderName, MessagesMetadata, Payload, Sink, TopicMetadata,
     convert::owned_value_into_serde_json, sink_connector,
 };
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
@@ -429,7 +429,7 @@ impl HttpSink {
                     } else {
                         serde_json::Value::String(v.to_string_value())
                     };
-                    Ok((k.to_string_value(), value))
+                    Ok((HeaderName(k).to_string(), value))
                 })
                 .collect::<Result<serde_json::Map<String, serde_json::Value>, Error>>()?;
             Some(map)
@@ -1305,6 +1305,7 @@ impl Sink for HttpSink {
 mod tests {
     use super::*;
     use iggy_connector_sdk::Schema;
+    use iggy_connector_testing::headers::{header_case_map, header_cases};
     use std::collections::BTreeMap;
 
     const FIELD_DATA: &str = "data";
@@ -1729,10 +1730,42 @@ mod tests {
             !iggy_headers.is_null(),
             "Expected iggy_headers in metadata when message has headers"
         );
-        assert!(
-            iggy_headers.get("x-correlation-id").is_some(),
+        assert_eq!(
+            iggy_headers.get("x-correlation-id"),
+            Some(&serde_json::json!("abc-123")),
             "Expected header key in iggy_headers, got: {iggy_headers}"
         );
+    }
+
+    #[test]
+    fn given_shared_header_cases_should_name_iggy_headers_by_header_name() {
+        let sink = given_sink_with_defaults();
+        let cases = header_cases();
+        let mut message = given_json_message(1, 0);
+        message.headers = Some(header_case_map());
+        let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
+
+        let envelope = sink
+            .build_envelope(
+                &message,
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                payload_json,
+            )
+            .unwrap();
+
+        let iggy_headers = envelope[FIELD_METADATA][FIELD_HEADERS]
+            .as_object()
+            .expect("iggy_headers is an object");
+        assert_eq!(iggy_headers.len(), cases.len());
+        for case in &cases {
+            assert_eq!(
+                iggy_headers.get(&case.expected_name),
+                Some(&serde_json::json!(case.label)),
+                "case {}",
+                case.label
+            );
+        }
     }
 
     #[test]

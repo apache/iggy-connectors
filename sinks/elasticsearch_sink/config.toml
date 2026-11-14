@@ -34,6 +34,7 @@ consumer_group = "elasticsearch_sink_cg"
 url = "http://localhost:9200"
 index = "iggy_messages"
 create_index_if_not_exists = true
+include_headers = true
 timeout_seconds = 30
 max_retries = 3
 retry_delay = "1s"

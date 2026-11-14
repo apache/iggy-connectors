@@ -90,6 +90,22 @@ and origin timestamps are microseconds; `iggy_ingested_at` uses wall-clock
 milliseconds. Disabling metadata leaves payload fields intact and still injects
 a missing primary key.
 
+With metadata enabled, a message with user headers also gets an `iggy_headers`
+object with one field per header, for example
+`{"trace-id": "abc", "~int32:1": "7"}`. A string key keeps its own name. A key
+of any other kind, or a string key that starts with `~`, gets a generated name
+such as `~int32:1`, `~raw:AQI` or `~string:~note`. A text or typed value is a
+plain string, so that you can filter on it. A raw value, or a string value that
+is not valid UTF-8, is `{"data": "<base64>", "iggy_header_encoding": "base64"}`.
+Raw values have the same shape as in the HTTP sink, which writes a string value
+that is not valid UTF-8 as lossy text instead.
+
+Upgrade note: earlier versions wrote no user headers. After an upgrade, documents
+with headers carry `iggy_headers` for the first time. If your index declares
+`filterableAttributes` or `searchableAttributes`, add `iggy_headers` fields
+there as needed. To keep documents without headers, set
+`include_metadata = false`, which also leaves out the other `iggy_*` fields.
+
 ## Delivery Semantics
 
 The connector runtime invokes `consume()` through an FFI callback whose status

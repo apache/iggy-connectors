@@ -18,9 +18,10 @@
 use crate::fixtures::{MeilisearchOps, MeilisearchSinkFixture, TEST_INDEX};
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
-use iggy_common::{Identifier, MessageClient};
+use iggy_common::{HeaderKey, HeaderValue, Identifier, MessageClient};
 use integration::harness::seeds;
 use integration::iggy_harness;
+use std::collections::BTreeMap;
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/meilisearch/sink.toml")),
@@ -77,5 +78,55 @@ async fn given_json_messages_when_sink_consumes_should_index_documents(
         documents
             .iter()
             .all(|document| document["iggy_id"].as_str().is_some())
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/meilisearch/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_message_with_user_headers_when_sink_consumes_should_index_them(
+    harness: &TestHarness,
+    fixture: MeilisearchSinkFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let headers = BTreeMap::from([
+        (
+            HeaderKey::try_from("a").expect("valid key"),
+            HeaderValue::try_from("b").expect("valid value"),
+        ),
+        (HeaderKey::from(1i32), HeaderValue::from(2i32)),
+    ]);
+    let mut messages = vec![
+        IggyMessage::builder()
+            .id(1)
+            .payload(Bytes::from(
+                serde_json::to_vec(&serde_json::json!({"name": "first"})).expect("serialize"),
+            ))
+            .user_headers(headers)
+            .build()
+            .expect("build message"),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send messages");
+
+    let documents = fixture
+        .wait_for_documents(TEST_INDEX, 1)
+        .await
+        .expect("wait for Meilisearch documents");
+
+    assert_eq!(
+        documents[0]["iggy_headers"],
+        serde_json::json!({"a": "b", "~int32:1": "2"})
     );
 }

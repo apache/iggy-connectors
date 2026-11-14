@@ -240,7 +240,7 @@ When adding a metric:
 Per-message drops in the batch loops are counted into a local `u64` and flushed once after the loop via `inc_errors_by_with_labels` / `inc_messages_filtered_with_labels` - one `Family` lookup per batch, not per message. One-shot drops outside a loop (e.g. `consumer.next()` Err) still call `inc_errors_with_labels` directly. Hot path uses pre-built `SinkLabels`/`SourceLabels`. `&str`-based wrappers are `#[cfg(test)]`-only.
 
 - `sink.rs::consume_messages` - `consumer.next()` Err
-- `sink.rs::process_messages` - decode, transform Err (drop-and-continue), missing required fields, payload conversion, header serialization (accumulated, flushed once per batch)
+- `sink.rs::process_messages` - user header decode (delivers the message without headers, or ends the batch under `InvalidMessages::Stop`), payload decode, transform Err (drop-and-continue), missing required fields, payload conversion, header serialization (accumulated, flushed once per batch)
 - `sink.rs::spawn_consume_tasks` task wrapper - bumps once on `consume_messages` Err
 - `source.rs::source_forwarding_loop` - payload decode, prepare (transform/encode) failure, Iggy send Err, state save Err
 - `source.rs::process_messages` - transform Err (logs + bumps `errors` + continue. does NOT propagate, so one bad payload doesn't flip the connector to permanent ERROR), transform encode failure, `build_iggy_message` failure

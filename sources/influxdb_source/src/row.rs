@@ -199,7 +199,7 @@ pub fn parse_jsonl_rows(data: &str) -> Result<Vec<Row>, Error> {
         scratch.extend_from_slice(trimmed.as_bytes());
         #[allow(
             clippy::disallowed_methods,
-            reason = "parse_object inserts every field into a map, which keeps the last value of a repeated key"
+            reason = "parse_object inserts every field into a map and converts nested values with serde_json::to_value, and both keep the last value of a repeated key"
         )]
         let obj: simd_json::BorrowedValue = simd_json::to_borrowed_value(&mut scratch)
             .map_err(|e| Error::InvalidRecordValue(format!("JSON parse error: {e}")))?;
@@ -403,6 +403,15 @@ mod tests {
         let jsonl = "{\"v\":1}\n\n{\"v\":2}\n";
         let rows = parse_jsonl_rows(jsonl).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn jsonl_repeated_key_keeps_its_last_value() {
+        let rows = parse_jsonl_rows(r#"{"a":1,"n":{"k":1,"k":2},"a":2}"#).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 2);
+        assert_eq!(rows[0].get("a"), Some(&serde_json::json!(2)));
+        assert_eq!(rows[0].get("n"), Some(&serde_json::json!({"k": 2})));
     }
 
     #[test]

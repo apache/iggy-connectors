@@ -59,8 +59,8 @@ jobs:
       - name: Check version consistency
         run: ./scripts/extract-version.sh --check
 
-  r-pin:
-    name: R pin
+  core-pin:
+    name: Core pin
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
@@ -73,8 +73,8 @@ jobs:
           read-cache: "false"
           free-disk-space: "false"
 
-      - name: Check the core versions pinned next to R
-        run: ./scripts/ci/check-r-pin.sh
+      - name: Check the core pin and the core versions
+        run: ./scripts/ci/check-core-pin.sh
 
   edge-image-catalog:
     name: Edge image catalog
@@ -108,7 +108,7 @@ jobs:
         run: echo "version=$(cat .github/config/hawkeye.version)" >> "$GITHUB_OUTPUT"
 
       - name: Install HawkEye
-        uses: taiki-e/install-action@v2.87.32
+        uses: taiki-e/install-action@v2.90.0
         with:
           tool: hawkeye@${{ steps.hawkeye-version.outputs.version }}
 
@@ -239,7 +239,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.51.1
+        uses: crate-ci/typos@v1.52.0
 
   summary:
     name: Common checks summary
@@ -247,7 +247,7 @@ jobs:
       [
         rust-versions,
         version-consistency,
-        r-pin,
+        core-pin,
         edge-image-catalog,
         license-headers,
         third-party-licenses,
@@ -293,13 +293,13 @@ jobs:
             echo "| ⏭️ Version Consistency | $VERSION_CONSISTENCY | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          R_PIN="${{ needs.r-pin.result }}"
-          if [ "$R_PIN" = "success" ]; then
-            echo "| ✅ R Pin | success | Core versions match the crates at R |" >> "$GITHUB_STEP_SUMMARY"
-          elif [ "$R_PIN" = "failure" ]; then
-            echo "| ❌ R Pin | failure | Core version or source mismatch (see job log) |" >> "$GITHUB_STEP_SUMMARY"
+          CORE_PIN="${{ needs.core-pin.result }}"
+          if [ "$CORE_PIN" = "success" ]; then
+            echo "| ✅ Core Pin | success | Core versions match the crates at the core pin |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$CORE_PIN" = "failure" ]; then
+            echo "| ❌ Core Pin | failure | Core version or source mismatch (see job log) |" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "| ⏭️ R Pin | $R_PIN | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ⏭️ Core Pin | $CORE_PIN | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           EDGE_IMAGE_CATALOG="${{ needs.edge-image-catalog.result }}"

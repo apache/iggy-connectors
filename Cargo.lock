@@ -2340,7 +2340,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "clock"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "iggy_common",
 ]
@@ -2683,7 +2683,7 @@ dependencies = [
 [[package]]
 name = "configs"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "configs_derive",
  "cpu_allocation",
@@ -2704,7 +2704,7 @@ dependencies = [
 [[package]]
 name = "configs_derive"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "darling 0.24.1",
  "proc-macro2",
@@ -2715,7 +2715,7 @@ dependencies = [
 [[package]]
 name = "consensus"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "bit-set",
  "blake3",
@@ -2732,6 +2732,18 @@ dependencies = [
  "server_common",
  "tracing",
  "twox-hash",
+]
+
+[[package]]
+name = "const-hex"
+version = "1.19.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e59eef12462b0f9b0a3620219be5d639afd79fe39dff0a42c3997061f9298b4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "proptest",
+ "serde_core",
 ]
 
 [[package]]
@@ -2849,7 +2861,7 @@ checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 [[package]]
 name = "cpu_allocation"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "nix",
  "serde",
@@ -4579,7 +4591,7 @@ dependencies = [
 [[package]]
 name = "harness_derive"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5193,7 +5205,7 @@ dependencies = [
 [[package]]
 name = "iggy"
 version = "0.12.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -5297,7 +5309,7 @@ dependencies = [
 [[package]]
 name = "iggy_binary_protocol"
 version = "0.12.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -5312,7 +5324,7 @@ dependencies = [
 [[package]]
 name = "iggy_common"
 version = "0.12.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "aes-gcm 0.11.1",
  "aes-gcm-siv",
@@ -5763,6 +5775,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_otlp_sink"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "ctor 1.0.13",
+ "dtor 1.0.6",
+ "flate2",
+ "http",
+ "humantime",
+ "iggy",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "iggy_connector_testing",
+ "integration",
+ "opentelemetry-proto",
+ "prost",
+ "reqwest 0.13.5",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "testcontainers-modules",
+ "tokio",
+ "toml 1.1.8+spec-1.1.0",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "iggy_connector_postgres_sink"
 version = "0.6.0"
 dependencies = [
@@ -6124,7 +6166,7 @@ checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 [[package]]
 name = "integration"
 version = "0.0.1"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -6132,6 +6174,7 @@ dependencies = [
  "cfg_aliases",
  "configs",
  "consensus",
+ "fs2",
  "futures",
  "harness_derive",
  "iggy",
@@ -6351,7 +6394,7 @@ dependencies = [
 [[package]]
 name = "journal"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "bytemuck",
  "compio",
@@ -6862,7 +6905,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "message_bus"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "ahash",
  "async-channel",
@@ -7616,9 +7659,12 @@ version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
 dependencies = [
+ "base64 0.22.1",
+ "const-hex",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost",
+ "serde",
  "tonic",
  "tonic-prost",
 ]
@@ -8498,6 +8544,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
+dependencies = [
+ "bitflags 2.13.2",
+ "chacha20",
+ "core_detect",
+ "num-traits",
+ "rand 0.10.3",
+ "rand_xorshift",
+ "regex-syntax",
+ "unarray",
+]
+
+[[package]]
 name = "prost"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8781,6 +8843,15 @@ name = "rand_pcg"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
 dependencies = [
  "rand_core 0.10.1",
 ]
@@ -9942,7 +10013,7 @@ dependencies = [
 [[package]]
 name = "server_common"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "aligned-vec",
  "argon2",
@@ -10685,7 +10756,7 @@ dependencies = [
 [[package]]
 name = "system_stats"
 version = "0.1.0"
-source = "git+https://github.com/apache/iggy?rev=d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8#d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8"
+source = "git+https://github.com/apache/iggy?rev=fe822af6bef32a2630f70688756618d2b3d060e5#fe822af6bef32a2630f70688756618d2b3d060e5"
 dependencies = [
  "cpu_allocation",
  "sysinfo 0.40.1",
@@ -11520,6 +11591,12 @@ dependencies = [
  "rand 0.10.3",
  "web-time",
 ]
+
+[[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
 name = "uncased"

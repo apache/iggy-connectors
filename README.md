@@ -2,7 +2,7 @@
 
 Connectors move data between [Apache Iggy](https://github.com/apache/iggy) streams and external systems. A source reads data from an external system and produces messages to an Iggy stream. A sink consumes messages from an Iggy stream and writes them to an external system. Each connector is a Rust plugin, and the connectors runtime loads the plugins and runs them.
 
-This repository holds the runtime, the plugin SDK, 17 sinks and 6 sources. The connectors started in apache/iggy and moved here with their git history. The Iggy server, the client SDKs, the CLI and the Web UI stay in apache/iggy.
+This repository holds the runtime, the plugin SDK, the sinks and the sources. The connectors started in apache/iggy and moved here with their git history. The Iggy server, the client SDKs, the CLI and the Web UI stay in apache/iggy.
 
 [Documentation](https://iggy.apache.org/docs/connectors/introduction) | [Apache Iggy](https://github.com/apache/iggy) | [Discussions](https://github.com/apache/iggy-connectors/discussions) | [Discord](https://discord.gg/apache-iggy) | [Docker image](https://hub.docker.com/r/apache/iggy-connect)
 
@@ -106,14 +106,14 @@ The Quickwit sink writes the records to the `events` index. The Quickwit UI at <
 | `sinks/<name>/`   | `iggy_connector_<name>`  | One sink plugin with its integration tests            |
 | `sources/<name>/` | `iggy_connector_<name>`  | One source plugin with its integration tests          |
 | `testing/`        | `iggy_connector_testing` | Test fixtures that several test targets share         |
-| `scripts/`        |                          | CI checks, the test server build and the R bump       |
+| `scripts/`        |                          | CI checks, test server build and the core pin bump    |
 | `.claude/skills/` |                          | Skills for AI agents, linked from `.agents/skills/`   |
 
 Only `iggy_connector_sdk` goes to crates.io. The runtime ships only as the Docker image, and the sinks and sources ship as source code.
 
 ## The core pin
 
-This repository builds against one commit of apache/iggy, called R. The root `Cargo.toml` holds R as the `rev` of each core crate that comes from git: `iggy`, `iggy_common`, `configs`, `configs_derive`, `system_stats` and the test crate `integration`. R is the last core release, unless a connector needs an unreleased core change, and `scripts/bump-r.sh` moves it.
+This repository builds against one commit of apache/iggy, called the core pin. The root `Cargo.toml` holds the core pin as the `rev` of each core crate that comes from git: `iggy`, `iggy_common`, `configs`, `configs_derive`, `system_stats` and the test crate `integration`. The core pin is the last core release, unless a connector needs an unreleased core change, and `scripts/bump-core-pin.sh` moves it.
 
 ## Build
 
@@ -132,7 +132,7 @@ Unit tests live in `src/` of each crate and need no services:
 cargo nextest run --workspace --lib --bins
 ```
 
-Integration tests live in `tests/` of each package. They need Docker, an Iggy server built at R, and fresh builds of the runtime and the plugins in `target/debug/`:
+Integration tests live in `tests/` of each package. They need Docker, an Iggy server built at the core pin, and fresh builds of the runtime and the plugins in `target/debug/`:
 
 ```bash
 ./scripts/build-test-server.sh
@@ -140,7 +140,7 @@ cargo build
 cargo nextest run -p iggy_connector_postgres_sink
 ```
 
-`scripts/build-test-server.sh` builds `iggy-server` from apache/iggy at R and copies it to `target/debug/iggy-server`. Run it again after R changes. The tests start that server and `target/debug/iggy-connectors`, but they never build them. After a change to the runtime or a plugin, run `cargo build` again.
+`scripts/build-test-server.sh` builds `iggy-server` from apache/iggy at the core pin and copies it to `target/debug/iggy-server`. Run it again after the core pin changes. The tests start that server and `target/debug/iggy-connectors`, but they never build them. After a change to the runtime or a plugin, run `cargo build` again.
 
 `cargo nextest run --workspace` runs all tests, as CI does. The Doris tests need `sudo sysctl -w vm.max_map_count=2000000` on Linux. Per-test logs go to `test_logs/`.
 
@@ -192,6 +192,7 @@ A `Sink` implementation uses the `sink_connector!` macro, which exposes the FFI 
 | [InfluxDB](sinks/influxdb_sink/README.md)           | InfluxDB V2 and V3, as line-protocol points                             |
 | [Meilisearch](sinks/meilisearch_sink/README.md)     | a Meilisearch index                                                     |
 | [MongoDB](sinks/mongodb_sink/README.md)             | a MongoDB collection                                                    |
+| [OTLP](sinks/otlp_sink/README.md)                   | OpenTelemetry backends, as OTLP log records over HTTP                   |
 | [PostgreSQL](sinks/postgres_sink/README.md)         | PostgreSQL tables                                                       |
 | [Quickwit](sinks/quickwit_sink/README.md)           | a Quickwit index                                                        |
 | [RabbitMQ](sinks/rabbitmq_sink/README.md)           | RabbitMQ exchanges, through AMQP 0.9.1                                  |

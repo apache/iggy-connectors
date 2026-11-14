@@ -23,7 +23,7 @@ use uuid;
 /// Helper function to create a test message with the given JSON payload
 pub fn create_test_message(json: &str) -> DecodedMessage {
     let mut payload = json.to_string().into_bytes();
-    let value = simd_json::to_owned_value(&mut payload).unwrap();
+    let value = crate::json::to_owned_value(&mut payload).unwrap();
     DecodedMessage {
         id: None,
         offset: None,

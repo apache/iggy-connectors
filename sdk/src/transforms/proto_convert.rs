@@ -548,7 +548,7 @@ impl ProtoConvert {
         match payload {
             Payload::Proto(proto_text) => {
                 let mut proto_bytes = proto_text.clone().into_bytes();
-                match simd_json::to_owned_value(&mut proto_bytes) {
+                match crate::json::to_owned_value(&mut proto_bytes) {
                     Ok(json_value) => {
                         if self.config.conversion_options.include_metadata {
                             let enriched_json = simd_json::json!({
@@ -668,7 +668,7 @@ impl ProtoConvert {
         match payload {
             Payload::Text(text) => {
                 let mut text_bytes = text.clone().into_bytes();
-                if let Ok(json_value) = simd_json::to_owned_value(&mut text_bytes) {
+                if let Ok(json_value) = crate::json::to_owned_value(&mut text_bytes) {
                     self.json_to_protobuf(Payload::Json(json_value))
                 } else {
                     Ok(Payload::Proto(text))
@@ -734,7 +734,7 @@ impl Transform for ProtoConvert {
             (Schema::Text, Schema::Json) => {
                 if let Payload::Text(text) = transformed_payload {
                     let mut text_bytes = text.into_bytes();
-                    let json_value = simd_json::to_owned_value(&mut text_bytes)
+                    let json_value = crate::json::to_owned_value(&mut text_bytes)
                         .map_err(|_| Error::InvalidJsonPayload)?;
                     Payload::Json(json_value)
                 } else {
@@ -752,7 +752,7 @@ impl Transform for ProtoConvert {
             }
             (Schema::Raw, Schema::Json) => {
                 if let Payload::Raw(mut data) = transformed_payload {
-                    let json_value = simd_json::to_owned_value(&mut data)
+                    let json_value = crate::json::to_owned_value(&mut data)
                         .map_err(|_| Error::InvalidJsonPayload)?;
                     Payload::Json(json_value)
                 } else {

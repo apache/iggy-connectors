@@ -263,7 +263,7 @@ impl AvroStreamEncoder {
 
     fn encode_text_to_avro(&self, text: String) -> Result<Vec<u8>, Error> {
         let mut text_bytes = text.into_bytes();
-        if let Ok(json_value) = simd_json::to_owned_value(&mut text_bytes) {
+        if let Ok(json_value) = crate::json::to_owned_value(&mut text_bytes) {
             return self.encode_json_to_avro(json_value);
         }
 
@@ -282,7 +282,7 @@ impl AvroStreamEncoder {
         match (payload, target_format) {
             (Payload::Avro(data), Schema::Json) => {
                 let mut data_copy = data.clone();
-                let json_value = simd_json::to_owned_value(&mut data_copy)
+                let json_value = crate::json::to_owned_value(&mut data_copy)
                     .unwrap_or_else(|_| simd_json::json!({ "avro_data_base64": base64::engine::general_purpose::STANDARD.encode(&data) }));
                 Ok(Payload::Json(json_value))
             }
@@ -304,7 +304,7 @@ impl AvroStreamEncoder {
 
             (Payload::Text(text), Schema::Json) => {
                 let mut text_bytes = text.into_bytes();
-                let json_value = simd_json::to_owned_value(&mut text_bytes)
+                let json_value = crate::json::to_owned_value(&mut text_bytes)
                     .map_err(|_| Error::InvalidJsonPayload)?;
                 Ok(Payload::Json(json_value))
             }
@@ -315,8 +315,8 @@ impl AvroStreamEncoder {
                 Ok(Payload::Text(text))
             }
             (Payload::Raw(mut data), Schema::Json) => {
-                let json_value =
-                    simd_json::to_owned_value(&mut data).map_err(|_| Error::InvalidJsonPayload)?;
+                let json_value = crate::json::to_owned_value(&mut data)
+                    .map_err(|_| Error::InvalidJsonPayload)?;
                 Ok(Payload::Json(json_value))
             }
 

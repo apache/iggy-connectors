@@ -987,7 +987,8 @@ mod tests {
             origin_timestamp: 0,
             headers,
             payload: Payload::Json(
-                simd_json::to_owned_value(&mut bytes).expect("test document is JSON"),
+                iggy_connector_sdk::json::to_owned_value(&mut bytes)
+                    .expect("test document is JSON"),
             ),
         }
     }

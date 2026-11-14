@@ -199,7 +199,7 @@ Each implemented in at least one in-tree plugin or runtime path.
 | `bytes::Bytes::from(body)`                                              | `sinks/{http,influxdb}_sink`                                                       | Cheap ref-counted body sharing across retries     |
 | `AtomicU64` counters                                                    | `sinks/mongodb_sink`                                                               | Lock-free per-message metric updates              |
 | `Payload::try_to_bytes(&self)`                                          | `sdk/src/lib.rs::Payload::try_to_bytes`                                            | Serialize `Payload::Json` no-clone                |
-| `simd_json::to_owned_value(&mut bytes)`                                 | `sdk/src/decoders/json.rs::JsonStreamDecoder::decode`                              | In-place JSON parse                               |
+| `iggy_connector_sdk::json::to_owned_value(&mut bytes)`                  | `sdk/src/decoders/json.rs::JsonStreamDecoder::decode`                              | In-place JSON parse                               |
 | Brief-lock fetch                                                        | `sources/postgres_source/src/lib.rs::poll_tables`                                  | Lock read -> drop -> I/O -> lock write            |
 | `is_transient_error(&e)` SQLSTATE mapping                               | `sinks/postgres_sink/src/lib.rs`                                                   | Driver errors -> retry vs `PermanentHttpError`    |
 | Two-constructor pattern (`new` lenient + `try_new` strict + `Default`)  | `sdk/src/decoders/avro.rs::AvroStreamDecoder`                                      | Stateful decoders/encoders where schema can fail  |

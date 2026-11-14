@@ -2104,7 +2104,7 @@ mod tests {
 
     fn simd_json_from_str(s: &str) -> simd_json::OwnedValue {
         let mut bytes = s.as_bytes().to_vec();
-        simd_json::to_owned_value(&mut bytes).expect("valid JSON for test")
+        iggy_connector_sdk::json::to_owned_value(&mut bytes).expect("valid JSON for test")
     }
 
     fn given_default_config() -> HttpSinkConfig {

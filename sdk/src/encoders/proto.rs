@@ -728,7 +728,7 @@ impl ProtoStreamEncoder {
 
             (Payload::Text(text), Schema::Json) => {
                 let mut text_bytes = text.into_bytes();
-                let json_value = simd_json::to_owned_value(&mut text_bytes)
+                let json_value = crate::json::to_owned_value(&mut text_bytes)
                     .map_err(|_| Error::InvalidJsonPayload)?;
                 Ok(Payload::Json(json_value))
             }
@@ -739,8 +739,8 @@ impl ProtoStreamEncoder {
                 Ok(Payload::Text(text))
             }
             (Payload::Raw(mut data), Schema::Json) => {
-                let json_value =
-                    simd_json::to_owned_value(&mut data).map_err(|_| Error::InvalidJsonPayload)?;
+                let json_value = crate::json::to_owned_value(&mut data)
+                    .map_err(|_| Error::InvalidJsonPayload)?;
                 Ok(Payload::Json(json_value))
             }
 
@@ -748,7 +748,7 @@ impl ProtoStreamEncoder {
             (Payload::Proto(text), Schema::Raw) => Ok(Payload::Raw(text.into_bytes())),
             (Payload::Proto(text), Schema::Json) => {
                 let mut text_bytes = text.into_bytes();
-                let json_value = simd_json::to_owned_value(&mut text_bytes)
+                let json_value = crate::json::to_owned_value(&mut text_bytes)
                     .map_err(|_| Error::InvalidJsonPayload)?;
                 Ok(Payload::Json(json_value))
             }
@@ -895,7 +895,7 @@ mod tests {
             .to_msg::<String>()
             .expect("unpack StringValue")
             .into_bytes();
-        let decoded_json = simd_json::to_owned_value(&mut json_bytes).expect("decode JSON");
+        let decoded_json = crate::json::to_owned_value(&mut json_bytes).expect("decode JSON");
         assert_eq!(
             decoded_json,
             simd_json::json!({
@@ -919,7 +919,7 @@ mod tests {
         let decoded_any = Any::decode(encoded_bytes.as_slice()).unwrap();
         let json_string = decoded_any.to_msg::<String>().expect("unpack StringValue");
         let mut json_bytes = json_string.into_bytes();
-        let json_value = simd_json::to_owned_value(&mut json_bytes).unwrap();
+        let json_value = crate::json::to_owned_value(&mut json_bytes).unwrap();
 
         if let simd_json::OwnedValue::Object(map) = json_value {
             assert!(map.contains_key("text"));
@@ -1028,7 +1028,7 @@ mod tests {
         let encoded_bytes = result.unwrap();
 
         let mut encoded_bytes_mut = encoded_bytes;
-        let decoded_json = simd_json::to_owned_value(&mut encoded_bytes_mut).unwrap();
+        let decoded_json = crate::json::to_owned_value(&mut encoded_bytes_mut).unwrap();
 
         if let simd_json::OwnedValue::Object(map) = decoded_json {
             assert_eq!(

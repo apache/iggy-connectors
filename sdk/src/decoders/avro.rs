@@ -161,7 +161,7 @@ impl AvroStreamDecoder {
             Error::CannotDecode(Schema::Avro)
         })?;
 
-        let json_value = simd_json::to_owned_value(&mut json_bytes).map_err(|e| {
+        let json_value = crate::json::to_owned_value(&mut json_bytes).map_err(|e| {
             error!("Failed to parse JSON into simd_json: {}", e);
             Error::CannotDecode(Schema::Avro)
         })?;

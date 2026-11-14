@@ -21,6 +21,7 @@ pub mod elasticsearch;
 pub mod floci;
 pub mod influxdb;
 pub mod influxdb_v3;
+pub mod mqtt;
 pub mod postgres;
 pub mod random_source_liveness;
 

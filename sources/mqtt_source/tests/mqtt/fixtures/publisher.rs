@@ -29,12 +29,6 @@ use std::time::Duration;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-pub(super) async fn can_connect(broker_url: &str, username: &str, password: &str) -> bool {
-    // MQTT 5 is sufficient for readiness. The source protocol matrix is tested
-    // by publish(), while this probe only checks broker availability and auth.
-    connect_mqtt5(broker_url, username, password).await.is_ok()
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Protocol {
     Mqtt311,

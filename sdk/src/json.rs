@@ -44,8 +44,8 @@ pub fn to_owned_value(json: &mut [u8]) -> simd_json::Result<OwnedValue> {
 }
 
 // Only containers are queued, so a document without nested objects or arrays never allocates
-// the list. An object is rebuilt with `insert`, which keeps the first position and the last
-// value, as simd-json does for an object of more than 32 keys.
+// the list. An object is rebuilt with `insert`, which keeps the first position of a repeated key
+// and its last value. The last value is what simd-json keeps in an object of more than 32 keys.
 fn keep_last_owned(root: &mut OwnedValue) {
     let mut pending = Vec::new();
     let mut next = Some(root);

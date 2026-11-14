@@ -20,20 +20,114 @@
 //! `simd_json::to_owned_value` and `simd_json::to_borrowed_value` keep every copy of a key that
 //! repeats in an object of up to 32 keys, and only the last value in a larger object. Readers
 //! then disagree: `get` returns the first copy, serde_json and most backends take the last, and
-//! Elasticsearch rejects the document. These functions parse through the serde path of
-//! simd-json instead, which keeps the last value of a repeated key in every object.
+//! Elasticsearch rejects the document. These functions parse with simd-json and then keep the
+//! last value of each repeated key.
+//!
+//! The serde path of simd-json keeps the last value too, but it recurses through several calls
+//! per nesting level. At the 1024 levels that simd-json accepts, a debug build needed 2.5 MiB of
+//! stack on that path and 640 KiB on the native one (aarch64 macOS), and a tokio worker thread
+//! has 2 MiB. The pass below walks the value with a list on the heap, so its stack use does not
+//! grow with depth. `given_json_at_the_simd_json_depth_limit_should_parse_within_a_tokio_worker_stack`
+//! guards this.
 
-use simd_json::{BorrowedValue, OwnedValue};
+use simd_json::{BorrowedValue, OwnedValue, borrowed, owned};
 
 /// Parse `json` in place. A key that repeats in an object keeps its last value.
 pub fn to_owned_value(json: &mut [u8]) -> simd_json::Result<OwnedValue> {
-    simd_json::serde::from_slice(json)
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the pass below removes repeated keys"
+    )]
+    let mut value = simd_json::to_owned_value(json)?;
+    keep_last_owned(&mut value);
+    Ok(value)
 }
 
 /// Parse `json` in place, borrowing its strings. A key that repeats in an object keeps its
 /// last value.
 pub fn to_borrowed_value(json: &mut [u8]) -> simd_json::Result<BorrowedValue<'_>> {
-    simd_json::serde::from_slice(json)
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the pass below removes repeated keys"
+    )]
+    let mut value = simd_json::to_borrowed_value(json)?;
+    keep_last_borrowed(&mut value);
+    Ok(value)
+}
+
+// Only containers are queued, so a document without nested objects or arrays never allocates
+// the list. An object is rebuilt with `insert`, which keeps the first position and the last
+// value, as simd-json does for an object of more than 32 keys.
+fn keep_last_owned(root: &mut OwnedValue) {
+    let mut pending = Vec::new();
+    let mut next = Some(root);
+    while let Some(value) = next {
+        match value {
+            OwnedValue::Array(items) => {
+                pending.extend(
+                    items.iter_mut().filter(|item| {
+                        matches!(item, OwnedValue::Array(_) | OwnedValue::Object(_))
+                    }),
+                );
+            }
+            OwnedValue::Object(fields) => {
+                if fields.is_vec() && repeats_a_key(|| fields.keys().map(String::as_str)) {
+                    let mut unique =
+                        owned::Object::with_capacity_and_hasher(fields.len(), Default::default());
+                    for (key, field) in std::mem::take(&mut **fields) {
+                        unique.insert(key, field);
+                    }
+                    **fields = unique;
+                }
+                pending.extend(
+                    fields.values_mut().filter(|field| {
+                        matches!(field, OwnedValue::Array(_) | OwnedValue::Object(_))
+                    }),
+                );
+            }
+            OwnedValue::Static(_) | OwnedValue::String(_) => {}
+        }
+        next = pending.pop();
+    }
+}
+
+fn keep_last_borrowed(root: &mut BorrowedValue<'_>) {
+    let mut pending = Vec::new();
+    let mut next = Some(root);
+    while let Some(value) = next {
+        match value {
+            BorrowedValue::Array(items) => {
+                pending.extend(items.iter_mut().filter(|item| {
+                    matches!(item, BorrowedValue::Array(_) | BorrowedValue::Object(_))
+                }));
+            }
+            BorrowedValue::Object(fields) => {
+                if fields.is_vec() && repeats_a_key(|| fields.keys().map(|key| key.as_ref())) {
+                    let mut unique = borrowed::Object::with_capacity_and_hasher(
+                        fields.len(),
+                        Default::default(),
+                    );
+                    for (key, field) in std::mem::take(&mut **fields) {
+                        unique.insert(key, field);
+                    }
+                    **fields = unique;
+                }
+                pending.extend(fields.values_mut().filter(|field| {
+                    matches!(field, BorrowedValue::Array(_) | BorrowedValue::Object(_))
+                }));
+            }
+            BorrowedValue::Static(_) | BorrowedValue::String(_) => {}
+        }
+        next = pending.pop();
+    }
+}
+
+/// Only an object on the vec backend can hold a repeated key, because simd-json inserts into a
+/// hash-backed one with a check. That is why the callers ask `is_vec` first.
+fn repeats_a_key<'k, I: Iterator<Item = &'k str>>(keys: impl Fn() -> I) -> bool {
+    keys()
+        .enumerate()
+        .any(|(i, key)| keys().take(i).any(|earlier| earlier == key))
 }
 
 #[cfg(test)]
@@ -72,20 +166,18 @@ mod tests {
 
     #[test]
     fn given_repeated_key_in_nested_objects_should_keep_the_last_value() {
-        let mut bytes = br#"{"outer":{"k":1,"k":2},"list":[{"k":3,"k":4}]}"#.to_vec();
+        let json = br#"{"outer":{"k":1,"k":2},"list":[{"k":3,"k":4}]}"#;
+        let expected = r#"{"outer":{"k":2},"list":[{"k":4}]}"#;
 
-        let value = to_owned_value(&mut bytes).expect("valid JSON");
+        let owned = to_owned_value(&mut json.to_vec()).expect("valid JSON");
+        let mut bytes = json.to_vec();
+        let borrowed = to_borrowed_value(&mut bytes).expect("valid JSON");
 
-        let outer = value.get("outer").expect("outer");
-        assert_eq!(outer.as_object().map(|o| o.len()), Some(1));
-        assert_eq!(outer.get_i64("k"), Some(2));
-        let item = value
-            .get("list")
-            .and_then(|list| list.as_array())
-            .and_then(|items| items.first())
-            .expect("list item");
-        assert_eq!(item.as_object().map(|o| o.len()), Some(1));
-        assert_eq!(item.get_i64("k"), Some(4));
+        assert_eq!(simd_json::to_string(&owned).expect("serialize"), expected);
+        assert_eq!(
+            simd_json::to_string(&borrowed).expect("serialize"),
+            expected
+        );
     }
 
     // Debug output names the variant, so `I64(1)` and `U64(1)` do not compare equal, and an
@@ -119,6 +211,28 @@ mod tests {
             let actual = to_borrowed_value(&mut actual_bytes).expect("valid JSON");
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{document}");
         }
+    }
+
+    /// The runtime and the plugins parse on tokio worker threads, which have 2 MiB of stack.
+    const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+    // simd-json refuses more than 1024 levels, so this is the deepest message that gets parsed.
+    #[test]
+    fn given_json_at_the_simd_json_depth_limit_should_parse_within_a_tokio_worker_stack() {
+        std::thread::Builder::new()
+            .stack_size(WORKER_STACK_BYTES)
+            .spawn(|| {
+                let arrays = format!("{}{}", "[".repeat(1024), "]".repeat(1024));
+                let objects = format!("{}null{}", r#"{"a":"#.repeat(1024), "}".repeat(1024));
+                for document in [arrays, objects] {
+                    to_owned_value(&mut document.clone().into_bytes()).expect("valid JSON");
+                    let mut bytes = document.into_bytes();
+                    to_borrowed_value(&mut bytes).expect("valid JSON");
+                }
+            })
+            .expect("spawn a thread with a worker stack")
+            .join()
+            .expect("the parse fits in a worker stack");
     }
 
     #[test]

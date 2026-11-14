@@ -35,6 +35,7 @@ members = [
     "sinks/rabbitmq_sink",
     "sinks/redshift_sink",
     "sinks/s3_sink",
+    "sinks/sink_template",
     "sinks/stdout_sink",
     "sinks/surrealdb_sink",
     "sources/elasticsearch_source",
@@ -43,6 +44,7 @@ members = [
     "sources/mqtt_source",
     "sources/postgres_source",
     "sources/random_source",
+    "sources/source_template",
     "testing",
 ]
 resolver = "3"

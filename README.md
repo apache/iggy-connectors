@@ -218,6 +218,10 @@ A source produces messages to an Iggy stream and topic. Configure one `[[streams
 
 A new connector implements the `Sink` or the `Source` trait. Read the [sink](sinks/README.md) or the [source](sources/README.md) documentation, and use the existing plugins in `sinks/` and `sources/` as examples. Add the new crate to the members of the root `Cargo.toml`.
 
+Starting from a blank crate re-solves the same framework plumbing every time: config validation, `SecretString` secrets, retry with a circuit breaker, and ACK/NACK cursor staging. Copy [`sinks/sink_template`](sinks/sink_template/README.md) or [`sources/source_template`](sources/source_template/README.md) instead.
+
+They are compiling, tested starting points with only the backend-specific calls marked `TODO(ConnectorDeveloper)`. The [authoring guide](docs/authoring-sinks-and-sources.md) has the full checklist and the review rules it is built from.
+
 ## Transformations
 
 Field transformations can change messages before a source sends them to a topic, or before a sink consumes them. The payload format decides which transformations apply. To add a transformation, implement the `Transform` trait in the SDK, add its `TransformType` variant and extend `transforms::from_config`. Each transform can have its own configuration.

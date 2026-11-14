@@ -24,11 +24,11 @@
 //! last value of each repeated key.
 //!
 //! The serde path of simd-json keeps the last value too, but it recurses through several calls
-//! per nesting level. At the 1024 levels that simd-json accepts, a debug build needed more than
-//! 2 MiB of stack on that path and less than 1 MiB on the native one, in every run on aarch64
-//! macOS, and a tokio worker thread has 2 MiB. The pass below walks the value with a list on the heap, so its stack use does not
-//! grow with depth. `given_json_at_the_simd_json_depth_limit_should_parse_within_a_tokio_worker_stack`
-//! guards this.
+//! per nesting level. For 1024 nested objects, the deepest that simd-json accepts, a debug build
+//! needed more than 2 MiB of stack on that path and less than 1 MiB on the native one, in every
+//! run on aarch64 macOS, and a tokio worker thread has 2 MiB. The pass below walks the value
+//! with a list on the heap, so its stack use does not grow with depth. This test guards it:
+//! `given_json_at_the_simd_json_depth_limit_should_parse_within_a_tokio_worker_stack`.
 
 use simd_json::{OwnedValue, owned};
 

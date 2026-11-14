@@ -319,21 +319,22 @@ fn prepare_dynamic(
     ),
     Error,
 > {
-    // Raw messages can carry only the source topic header. JSON messages may
-    // additionally contain the versioned MQTT 5 envelope used by mqtt_source.
+    // Any payload can carry a source topic in its headers. An MQTT 5 envelope
+    // can override that topic.
     let ConsumedMessage {
         headers,
         timestamp,
         payload,
         ..
     } = message;
+    let header_topic = headers
+        .as_ref()
+        .and_then(|headers| headers.get(&MQTT_TOPIC_HEADER_KEY))
+        .map(|value| value.to_string_value())
+        .filter(|topic| !topic.trim().is_empty());
     match payload {
         payload @ Payload::Raw(_) => {
-            let topic = headers
-                .as_ref()
-                .and_then(|headers| headers.get(&MQTT_TOPIC_HEADER_KEY))
-                .map(|value| value.to_string_value())
-                .filter(|topic| !topic.trim().is_empty())
+            let topic = header_topic
                 .map(PublicationTopic::Owned)
                 .unwrap_or_else(|| {
                     PublicationTopic::Shared(shared_fallback(batch_topic, fallback))
@@ -367,6 +368,7 @@ fn prepare_dynamic(
             let topic = envelope
                 .topic
                 .filter(|topic| !topic.trim().is_empty())
+                .or(header_topic)
                 .map(PublicationTopic::Owned)
                 .unwrap_or_else(|| {
                     PublicationTopic::Shared(shared_fallback(batch_topic, fallback))
@@ -389,7 +391,11 @@ fn prepare_dynamic(
             Ok((topic, payload, properties, expiry_deadline))
         }
         payload => Ok((
-            PublicationTopic::Shared(shared_fallback(batch_topic, fallback)),
+            header_topic
+                .map(PublicationTopic::Owned)
+                .unwrap_or_else(|| {
+                    PublicationTopic::Shared(shared_fallback(batch_topic, fallback))
+                }),
             payload.try_into_vec()?.into(),
             None,
             None,
@@ -580,13 +586,18 @@ mod tests {
         assert_eq!(publication.payload.as_ref(), [1, 2, 3]);
     }
 
-    #[test]
-    fn dynamic_raw_uses_header() {
+    fn message_with_topic_header(payload: Payload, topic: &str) -> ConsumedMessage {
         let key = HeaderKey::try_from(MQTT_TOPIC_HEADER).unwrap();
         let mut headers = BTreeMap::new();
-        headers.insert(key, HeaderValue::try_from("devices/living-room").unwrap());
-        let mut message = message(Payload::Raw(vec![1]));
+        headers.insert(key, HeaderValue::try_from(topic).unwrap());
+        let mut message = message(payload);
         message.headers = Some(headers);
+        message
+    }
+
+    #[test]
+    fn dynamic_raw_uses_header() {
+        let message = message_with_topic_header(Payload::Raw(vec![1]), "devices/living-room");
         let publication = prepare_publication(
             message,
             &metadata(),
@@ -598,6 +609,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(publication.topic.as_str(), "devices/living-room");
+    }
+
+    #[test]
+    fn dynamic_json_without_envelope_uses_header() {
+        let payload = serde_json::json!({"value": 1});
+        let mut bytes = serde_json::to_vec(&payload).unwrap();
+        let json = simd_json::to_owned_value(&mut bytes).unwrap();
+
+        let publication = prepare_publication(
+            message_with_topic_header(Payload::Json(json), "devices/json"),
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            Some("fallback/{stream}/{topic}"),
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap();
+
+        assert_eq!(publication.topic.as_str(), "devices/json");
     }
 
     #[test]
@@ -659,7 +690,7 @@ mod tests {
         let mut bytes = serde_json::to_vec(&payload).unwrap();
         let json = simd_json::to_owned_value(&mut bytes).unwrap();
         let publication = prepare_publication(
-            message(Payload::Json(json)),
+            message_with_topic_header(Payload::Json(json), "devices/header-topic"),
             &metadata(),
             TopicMode::Dynamic,
             None,
@@ -922,7 +953,7 @@ mod tests {
         let json = simd_json::to_owned_value(&mut bytes).unwrap();
 
         let publication = prepare_publication(
-            message(Payload::Json(json)),
+            message_with_topic_header(Payload::Json(json), "devices/header-topic"),
             &metadata(),
             TopicMode::Dynamic,
             None,
@@ -932,6 +963,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(publication.topic.as_str(), "devices/header-topic");
         assert_eq!(
             publication
                 .properties

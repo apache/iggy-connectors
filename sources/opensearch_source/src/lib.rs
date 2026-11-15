@@ -58,9 +58,13 @@ const MAX_BATCH_SIZE: usize = 10_000;
 const DOCUMENT_ID_HEADER: &str = "opensearch.document_id";
 const INDEX_HEADER: &str = "opensearch.index";
 const MAX_HEADER_VALUE_LENGTH: usize = 255;
-// What OpenSearch reports for a document missing the sort field when it sorts last. The sort
-// asks for missing values first, so seeing this means that request option was not honored.
+// Sort value of a missing field when missing values sort last. The request asks for first,
+// so seeing this means OpenSearch ignored that option.
 const MISSING_LAST_SORT_VALUE: i64 = i64::MAX;
+// First sort value of a document without `timestamp_field`: the lowest long for date and numeric
+// fields, null for keyword and "-Infinity" for float.
+const MISSING_FIRST_SORT_VALUE: i64 = i64::MIN;
+const NEGATIVE_INFINITY_SORT_VALUE: &str = "-Infinity";
 
 static DOCUMENT_ID_HEADER_KEY: std::sync::LazyLock<HeaderKey> = std::sync::LazyLock::new(|| {
     HeaderKey::try_from(DOCUMENT_ID_HEADER).expect("document id header key is a valid literal")
@@ -78,8 +82,9 @@ struct State {
     #[serde(default)]
     poll_count: usize,
     /// Sort tuple of the newest published hit. Its first element is the watermark: the next
-    /// scan starts there instead of after the tuple, so a hit that became searchable late is
-    /// still found.
+    /// scan starts there instead of after the tuple, so a late-visible hit is still found.
+    /// Documents without `timestamp_field` have nothing to rescan, so the next scan resumes
+    /// right after this tuple.
     #[serde(default)]
     last_sort: Option<Vec<Value>>,
     #[serde(default)]
@@ -263,7 +268,7 @@ impl OpenSearchSource {
             .ok_or_else(|| Error::InvalidConfigValue("timestamp_field is required".to_string()))
     }
 
-    async fn create_client(&self) -> Result<OpenSearch, Error> {
+    fn create_client(&self) -> Result<OpenSearch, Error> {
         let url = Url::parse(&self.config.url).map_err(|error| {
             Error::InvalidConfigValue(format!("Invalid OpenSearch URL: {error}"))
         })?;
@@ -391,7 +396,11 @@ impl OpenSearchSource {
         };
         let watermark = last_sort.as_deref().and_then(<[Value]>::first);
         let published: HashSet<&HitKey> = watermark_hits.iter().collect();
-        let mut cursor = scan_cursor.or_else(|| watermark.map(restart_cursor));
+        let mut cursor = scan_cursor.or_else(|| match (&last_sort, watermark) {
+            (Some(tuple), Some(first)) if is_missing_value(first) => Some(tuple.clone()),
+            (_, Some(first)) => Some(restart_cursor(first)),
+            _ => None,
+        });
 
         let page = loop {
             let hits = self.fetch_hits(client, cursor.take()).await?;
@@ -403,31 +412,39 @@ impl OpenSearchSource {
             cursor = page.sorts.last().cloned();
         };
 
-        let moved = match page.fresh.last() {
+        let new_watermark = match page.fresh.last() {
             Some(&last) => {
                 let sort = page.sorts[last].clone();
-                let mut hits = if watermark == sort.first() {
-                    watermark_hits.clone()
-                } else {
+                // Documents without `timestamp_field` all share one sort value that a finer
+                // timestamp cannot split, so storing their keys would hit the cap for good.
+                // Keep none and resume after the exact tuple.
+                let hits = if sort.first().is_some_and(is_missing_value) {
                     Vec::new()
+                } else {
+                    let mut hits = if watermark == sort.first() {
+                        watermark_hits.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    hits.extend(
+                        page.fresh
+                            .iter()
+                            .filter(|&&position| page.sorts[position].first() == sort.first())
+                            .map(|&position| page.keys[position].clone()),
+                    );
+                    if hits.len() > MAX_WATERMARK_HITS {
+                        return Err(Error::SchemaMismatch(format!(
+                            "more than {MAX_WATERMARK_HITS} documents share one value of the sort \
+                             field; use a timestamp_field with a finer resolution"
+                        )));
+                    }
+                    hits
                 };
-                hits.extend(
-                    page.fresh
-                        .iter()
-                        .filter(|&&position| page.sorts[position].first() == sort.first())
-                        .map(|&position| page.keys[position].clone()),
-                );
-                if hits.len() > MAX_WATERMARK_HITS {
-                    return Err(Error::SchemaMismatch(format!(
-                        "more than {MAX_WATERMARK_HITS} documents share one value of the sort \
-                         field; use a timestamp_field with a finer resolution"
-                    )));
-                }
                 Some((sort, hits))
             }
             None => None,
         };
-        let (last_sort, watermark_hits) = moved.unzip();
+        let (last_sort, watermark_hits) = new_watermark.unzip();
 
         Ok(SearchOutcome {
             scan_cursor: if page.full {
@@ -496,16 +513,14 @@ impl OpenSearchSource {
                 .map(std::mem::take)
             else {
                 return Err(Error::SchemaMismatch(format!(
-                    "OpenSearch hit {:?} has no sort tuple; the cursor cannot move past it \
-                     without risking skipped documents",
+                    "OpenSearch hit {:?} has no sort tuple",
                     hit.get("_id").and_then(Value::as_str)
                 )));
             };
 
             if sort.first().and_then(Value::as_i64) == Some(MISSING_LAST_SORT_VALUE) {
                 return Err(Error::SchemaMismatch(format!(
-                    "OpenSearch hit {:?} sorted on the missing-value sentinel; a cursor there \
-                     would skip every document indexed later",
+                    "OpenSearch hit {:?} sorted on i64::MAX, the missing-last sort value",
                     hit.get("_id").and_then(Value::as_str)
                 )));
             }
@@ -522,7 +537,7 @@ impl OpenSearchSource {
                         connector_id = self.id,
                         hit_id = key.id,
                         hit_index = key.index,
-                        "Skipping OpenSearch hit without _source; it has no body to publish"
+                        "Skipping OpenSearch hit without _source"
                     ),
                 }
             }
@@ -578,10 +593,8 @@ impl OpenSearchSource {
             last_poll_timestamp,
         } = outcome;
         let produced_count = messages.len();
-        // A moved cursor waits for the batch result so a Nack can undo it, including a page
-        // whose hits were all skipped for lacking `_source`. A poll that found nothing new to
-        // publish or skip has no cursor to protect, so its counters commit directly and need no
-        // copy of the state.
+        // A moved watermark waits for the Ack so a Nack can undo it, even when every hit lacked
+        // `_source`. A poll with nothing new commits its counters directly.
         let (persisted_state, total_documents_published) = if last_sort.is_some() {
             let mut candidate = self.state.lock().await.clone();
             candidate.record_poll(produced_count, last_poll_timestamp, scan_cursor);
@@ -642,17 +655,12 @@ impl OpenSearchSource {
     }
 
     async fn handle_poll_error(&self, error: Error) -> Result<ProducedMessages, Error> {
-        // Only cluster-side trouble opens the breaker. A permanent error (bad query, missing
-        // sort tuple) is a configuration or mapping problem that skipping polls cannot fix,
-        // and an open breaker would hide it behind a quiet empty batch.
+        // Only cluster-side errors open the breaker. A permanent one is a config or mapping
+        // problem that pausing cannot fix, and an open breaker would hide it behind empty batches.
         if matches!(error, Error::Connection(_) | Error::HttpRequestFailed(_)) {
             self.circuit_breaker.record_failure().await;
         }
-        let mut state = self.state.lock().await;
-        // error_count accumulates in State and is captured by the next finalize_poll call
-        // (success path).
-        state.error_count += 1;
-        drop(state);
+        self.state.lock().await.error_count += 1;
         error!(
             "{CONNECTOR_NAME} connector ID: {} poll failed: {error}",
             self.id
@@ -661,8 +669,8 @@ impl OpenSearchSource {
     }
 }
 
-// Sorting on any other field type would fail or load the field into heap, and a field that is
-// missing from one matched index gives its documents no tie-break at all.
+// Any other type fails the sort or loads the field into heap, and a field missing from one
+// matched index leaves its documents without a tie-breaker.
 fn ensure_keyword_with_doc_values(mappings: &Value, field: &str) -> Result<(), Error> {
     let Some(indices) = mappings.as_object() else {
         return Ok(());
@@ -708,10 +716,7 @@ fn hit_key(
         sort.get(TIEBREAKER_SORT_POSITION)
     };
     let id = value.and_then(Value::as_str).ok_or_else(|| {
-        Error::SchemaMismatch(format!(
-            "OpenSearch hit has no {tiebreaker_field} value; it cannot be told apart from \
-             published documents"
-        ))
+        Error::SchemaMismatch(format!("OpenSearch hit has no {tiebreaker_field} value"))
     })?;
     let index = hit
         .get("_index")
@@ -721,6 +726,15 @@ fn hit_key(
         index: index.to_owned(),
         id: id.to_owned(),
     })
+}
+
+fn is_missing_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text == NEGATIVE_INFINITY_SORT_VALUE,
+        Value::Number(number) => number.as_i64() == Some(MISSING_FIRST_SORT_VALUE),
+        _ => false,
+    }
 }
 
 // Lowest possible tuple at the watermark, so the scan sees every hit with that sort value.
@@ -791,10 +805,10 @@ fn restore_state(
             (restored, None)
         }
         None => {
-            // Starting fresh would re-publish the whole index, so refuse to open and let the
-            // operator repair or delete the state instead of silently resetting the cursor.
+            // Starting fresh would republish the whole index, so refuse to open and let the
+            // operator repair or delete the state.
             let cause = "persisted state exists but could not be deserialized. \
-                         Refusing to start to prevent silent cursor reset."
+                         Refusing to start to avoid resetting the watermark."
                 .to_string();
             error!("{CONNECTOR_NAME} ID {id}: {cause}");
             (fresh(), Some(cause))
@@ -812,6 +826,14 @@ fn config_fingerprint(config: &OpenSearchSourceConfig) -> String {
 }
 
 fn validate_open_config(config: &OpenSearchSourceConfig) -> Result<(), Error> {
+    // An empty name would make the existence check hit the cluster root and every search cover
+    // all indices.
+    if config.index.trim().is_empty() {
+        return Err(Error::InvalidConfigValue(
+            "index must not be empty".to_string(),
+        ));
+    }
+
     if config.timestamp_field.as_deref().is_none_or(str::is_empty) {
         return Err(Error::InvalidConfigValue(
             "timestamp_field is required for incremental OpenSearch polling".to_string(),
@@ -869,8 +891,8 @@ fn redacted_url(url: &str) -> String {
     }
 }
 
-/// Stable 128-bit message id so a consumer can drop a document replayed after a NACK or a
-/// lost state save. Length-prefixed parts keep distinct (index, id) pairs from aliasing.
+/// Stable 128-bit id, so a consumer can drop a document replayed after a NACK or a lost state
+/// save. The length prefixes keep different (index, id) pairs apart.
 fn message_id(index: &str, document_id: &str) -> u128 {
     let mut hasher = blake3::Hasher::new();
     for part in [index, document_id] {
@@ -882,9 +904,8 @@ fn message_id(index: &str, document_id: &str) -> u128 {
     u128::from_le_bytes(id)
 }
 
-/// The hashed message id cannot be mapped back to the document, so the original `_id` and
-/// concrete `_index` travel as headers. A value over the header limit is omitted, the message
-/// id remains.
+/// The hashed id cannot be mapped back to the document, so `_id` and the concrete `_index`
+/// travel as headers. Values over the limit are omitted.
 fn document_headers(
     connector_id: u32,
     index: Option<&str>,
@@ -927,13 +948,11 @@ fn parse_document_timestamp(value: &Value) -> Option<DateTime<Utc>> {
             .map(|timestamp| timestamp.with_timezone(&Utc)),
         Value::Number(number) => {
             let raw = number.as_i64()?;
-            // Values above 1e12 are already milliseconds (Unix epoch seconds won't reach
-            // 1e12 until year 33658). Values at or below are treated as seconds and
-            // multiplied by 1000.
-            let millis = if !(-1_000_000_000_000..=1_000_000_000_000).contains(&raw) {
-                raw
-            } else {
+            // Epoch seconds stay below 1e12 until the year 33658, so smaller magnitudes are seconds.
+            let millis = if (-1_000_000_000_000..=1_000_000_000_000).contains(&raw) {
                 raw.saturating_mul(1_000)
+            } else {
+                raw
             };
             DateTime::from_timestamp_millis(millis).map(|timestamp| timestamp.with_timezone(&Utc))
         }
@@ -941,9 +960,8 @@ fn parse_document_timestamp(value: &Value) -> Option<DateTime<Utc>> {
     }
 }
 
-#[async_trait]
-impl Source for OpenSearchSource {
-    async fn open(&mut self) -> Result<(), Error> {
+impl OpenSearchSource {
+    async fn open_checked(&mut self) -> Result<(), Error> {
         if let Some(ref cause) = self.state_restore_error {
             return Err(Error::InitError(format!("state restore failed: {cause}")));
         }
@@ -957,7 +975,7 @@ impl Source for OpenSearchSource {
             self.config.index
         );
 
-        let client = self.create_client().await?;
+        let client = self.create_client()?;
 
         self.check_index_exists_with_retry(&client).await?;
         self.check_tiebreaker_mapping(&client).await?;
@@ -982,6 +1000,23 @@ impl Source for OpenSearchSource {
             self.id
         );
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Source for OpenSearchSource {
+    async fn open(&mut self) -> Result<(), Error> {
+        let opened = self.open_checked().await;
+        // The SDK's `open` shim returns 0 or 1 and drops the `Err` payload, and the runtime
+        // reports only "Plugin initialization failed", so this line is the only place an
+        // operator can read why the connector did not start.
+        if let Err(error) = &opened {
+            error!(
+                "Failed to open {CONNECTOR_NAME} connector ID: {}: {error}",
+                self.id
+            );
+        }
+        opened
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
@@ -1034,7 +1069,8 @@ impl Source for OpenSearchSource {
     async fn close(&mut self) -> Result<(), Error> {
         let state = self.state.lock().await;
         info!(
-            "OpenSearch source connector with ID: {} is closing. Stats: {} total documents published, {} polls executed, {} errors",
+            "OpenSearch source connector with ID: {} is closing. Stats: {} documents published, \
+             {} polls, {} errors",
             self.id, state.total_documents_published, state.poll_count, state.error_count
         );
         drop(state);
@@ -1279,6 +1315,28 @@ mod tests {
         config.password = Some(SecretString::from("secret"));
 
         validate_open_config(&config).expect("credentials set together");
+    }
+
+    #[test]
+    fn given_empty_index_when_validate_should_fail() {
+        for index in ["", "   "] {
+            let mut config = test_config();
+            config.index = index.to_string();
+
+            let error = validate_open_config(&config).expect_err("empty index");
+
+            assert!(matches!(error, Error::InvalidConfigValue(_)), "{index:?}");
+        }
+    }
+
+    #[test]
+    fn given_missing_sort_values_when_checked_should_be_recognized() {
+        assert!(is_missing_value(&json!(i64::MIN)));
+        assert!(is_missing_value(&Value::Null));
+        assert!(is_missing_value(&json!("-Infinity")));
+        assert!(!is_missing_value(&json!(1_704_067_200_000_i64)));
+        assert!(!is_missing_value(&json!("2024-01-01T00:00:00Z")));
+        assert!(!is_missing_value(&json!(i64::MAX)));
     }
 
     #[test]

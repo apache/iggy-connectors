@@ -195,7 +195,7 @@ async fn given_empty_search_when_poll_should_count_empty_poll_and_stage_nothing(
 }
 
 #[tokio::test]
-async fn given_page_shorter_than_batch_when_polling_again_should_restart_at_the_watermark() {
+async fn given_short_page_when_polling_again_should_restart_at_watermark() {
     let request_count = Arc::new(AtomicUsize::new(0));
     let captured_bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let count = request_count.clone();
@@ -810,11 +810,10 @@ async fn given_poll_when_search_sent_should_request_safe_pagination() {
 }
 
 #[tokio::test]
-async fn given_hit_sorted_on_missing_value_sentinel_when_poll_should_fail_without_advancing_cursor()
-{
-    let mut sentinel = search_hit("doc-1", "2024-01-01T00:00:00Z", json!({}));
-    sentinel["sort"] = json!([i64::MAX, "doc-1", TEST_INDEX]);
-    let body = search_response(vec![sentinel]).to_string();
+async fn given_hit_sorted_on_missing_last_value_when_poll_should_fail_without_moving_watermark() {
+    let mut missing_last = search_hit("doc-1", "2024-01-01T00:00:00Z", json!({}));
+    missing_last["sort"] = json!([i64::MAX, "doc-1", TEST_INDEX]);
+    let body = search_response(vec![missing_last]).to_string();
     let app = mock_router(StatusCode::OK, move |_| {
         let body = body.clone();
         async move { (StatusCode::OK, body) }
@@ -823,7 +822,10 @@ async fn given_hit_sorted_on_missing_value_sentinel_when_poll_should_fail_withou
     let mut source = OpenSearchSource::new(1, base_config(&base), None);
     source.open().await.unwrap();
 
-    let error = source.poll().await.expect_err("sentinel sort must fail");
+    let error = source
+        .poll()
+        .await
+        .expect_err("missing-last sort value must fail");
 
     assert!(matches!(error, Error::SchemaMismatch(_)), "got {error:?}");
     assert!(source.test_last_sort().await.is_none());
@@ -1125,6 +1127,86 @@ async fn given_full_page_of_published_hits_when_polling_should_step_to_the_next_
     assert_eq!(bodies[1]["search_after"], json!([SAME_TIMESTAMP, "b"]));
     assert_eq!(bodies[2]["search_after"], restart_tuple());
     assert_eq!(bodies[3]["search_after"], json!([SAME_TIMESTAMP, "b"]));
+}
+
+fn missing_timestamp_hit(doc_id: &str) -> Value {
+    json!({
+        "_index": TEST_INDEX,
+        "_id": doc_id,
+        "_source": { "id": 1 },
+        "sort": [i64::MIN, doc_id]
+    })
+}
+
+#[tokio::test]
+async fn given_missing_timestamps_when_polling_again_should_resume_after_last_tuple() {
+    let (app, bodies) = scripted_router(vec![
+        search_response(vec![missing_timestamp_hit("a"), missing_timestamp_hit("b")]),
+        search_response(vec![]),
+    ]);
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+
+    let first = source.poll().await.expect("first poll");
+    assert_eq!(first.messages.len(), 2);
+    ack(&source).await;
+    assert!(source.state.lock().await.watermark_hits.is_empty());
+    source.poll().await.expect("second poll");
+
+    assert_eq!(
+        bodies.lock().await[1]["search_after"],
+        json!([i64::MIN, "b"])
+    );
+}
+
+#[tokio::test]
+async fn given_missing_timestamps_over_hit_cap_when_polling_should_not_fail() {
+    let first_page: Vec<Value> = (0..MAX_WATERMARK_HITS)
+        .map(|index| missing_timestamp_hit(&format!("d{index:05}")))
+        .collect();
+    let (app, _) = scripted_router(vec![
+        search_response(first_page),
+        search_response(vec![missing_timestamp_hit("d99999")]),
+    ]);
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.batch_size = Some(MAX_WATERMARK_HITS);
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    let first = source.poll().await.expect("first poll");
+    assert_eq!(first.messages.len(), MAX_WATERMARK_HITS);
+    ack(&source).await;
+    let second = source
+        .poll()
+        .await
+        .expect("a document past the cap must not fail the poll");
+
+    assert_eq!(second.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn given_dated_document_after_missing_ones_should_move_watermark() {
+    let (app, _) = scripted_router(vec![
+        search_response(vec![missing_timestamp_hit("a")]),
+        search_response(vec![same_timestamp_hit("z")]),
+    ]);
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+    source.poll().await.expect("poll of missing documents");
+    ack(&source).await;
+
+    source.poll().await.expect("poll of a dated document");
+    ack(&source).await;
+
+    let state = source.state.lock().await;
+    assert_eq!(
+        state.last_sort.as_deref().and_then(<[Value]>::first),
+        Some(&json!(SAME_TIMESTAMP))
+    );
+    assert_eq!(state.watermark_hits.len(), 1);
 }
 
 #[tokio::test]

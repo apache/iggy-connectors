@@ -53,6 +53,16 @@ timestamp_field = "@timestamp"
 # circuit_breaker_threshold = 5
 # circuit_breaker_cool_down = "60s"
 
-# Optional: restrict which documents are polled (defaults to match_all).
+# Optional: restrict which documents are polled (defaults to match_all). Each example below is
+# a whole query: to use more than one, combine them in the `filter` list of a `bool` query.
 # [plugin_config.query]
 # match = { "log.level" = "error" }
+#
+# Keep future-dated documents out of the scan: one would move the watermark past every
+# document indexed before the clock reaches it (date and date_nanos fields only).
+# [plugin_config.query.range."@timestamp"]
+# lte = "now"
+#
+# Leave out documents that have no timestamp at all:
+# [plugin_config.query.exists]
+# field = "@timestamp"

@@ -5792,12 +5792,17 @@ dependencies = [
  "reqwest-middleware",
  "reqwest-retry",
  "rmp-serde",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serial_test",
  "testcontainers",
  "tokio",
  "tracing",
  "uuid",
- ]
- 
+ "wiremock",
+]
+
 [[package]]
 name = "iggy_connector_otlp_sink"
 version = "0.1.0"

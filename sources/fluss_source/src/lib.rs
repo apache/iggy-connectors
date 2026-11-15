@@ -962,7 +962,7 @@ mod tests {
     use super::*;
     use fluss::metadata::{DataTypes, TableBucket};
     use fluss::record::{ArrowReader, ChangeType, RowAppendRecordBatchBuilder, ScanRecord};
-    use fluss::row::GenericRow;
+    use fluss::row::{Date, GenericRow};
     use serde_json::Value;
     use std::sync::Arc;
 
@@ -1003,19 +1003,49 @@ mod tests {
     /// Records for a table with a single `id` column, decoded from Arrow the way the scanner
     /// hands them over.
     fn scan_records(bucket: i32, first_offset: i64, ids: &[i32]) -> ScanRecords {
+        scan_records_in(&[(bucket, first_offset, ids.to_vec())])
+    }
+
+    /// The same records spread over several buckets, each given as its id, the offset of its
+    /// first row and the ids of its rows.
+    fn scan_records_in(buckets: &[(i32, i64, Vec<i32>)]) -> ScanRecords {
         let row_type = RowType::new(vec![field("id")]);
+        let records = buckets
+            .iter()
+            .map(|(bucket, first_offset, ids)| {
+                let rows: Vec<GenericRow> = ids
+                    .iter()
+                    .map(|id| {
+                        let mut row = GenericRow::new(1);
+                        row.set_field(0, *id);
+                        row
+                    })
+                    .collect();
+                (
+                    TableBucket::new(1, *bucket),
+                    bucket_records(&row_type, *first_offset, &rows),
+                )
+            })
+            .collect();
+        ScanRecords::new(records)
+    }
+
+    fn bucket_records(
+        row_type: &RowType,
+        first_offset: i64,
+        rows: &[GenericRow<'_>],
+    ) -> Vec<ScanRecord> {
         let mut builder =
-            RowAppendRecordBatchBuilder::new(&row_type).expect("Failed to create batch builder");
-        for id in ids {
-            let mut row = GenericRow::new(1);
-            row.set_field(0, *id);
-            builder.append(&row).expect("Failed to append row");
+            RowAppendRecordBatchBuilder::new(row_type).expect("Failed to create batch builder");
+        for row in rows {
+            builder.append(row).expect("Failed to append row");
         }
         let batch = builder
             .build_arrow_record_batch()
             .expect("Failed to build record batch");
-        let reader = ArrowReader::new(batch, Arc::new(row_type)).expect("Failed to read batch");
-        let records = (0..ids.len())
+        let reader =
+            ArrowReader::new(batch, Arc::new(row_type.clone())).expect("Failed to read batch");
+        (0..rows.len())
             .map(|row_id| {
                 ScanRecord::new(
                     reader.read(row_id),
@@ -1024,8 +1054,7 @@ mod tests {
                     ChangeType::AppendOnly,
                 )
             })
-            .collect();
-        ScanRecords::new(HashMap::from([(TableBucket::new(1, bucket), records)]))
+            .collect()
     }
 
     fn events_table(table_id: i64) -> TableIdentity {
@@ -1861,5 +1890,332 @@ mod tests {
             assert_eq!(persisted.messages_produced, 42);
             assert_eq!(candidate.rows_skipped, 3);
         });
+    }
+
+    #[test]
+    fn given_poll_before_open_should_fail() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+
+        let Err(error) = runtime.block_on(source.poll()) else {
+            panic!("A source that was never opened should not poll");
+        };
+
+        assert!(
+            matches!(&error, Error::InitError(message) if message.contains("before it was opened")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn given_batch_result_when_nothing_is_staged_should_change_nothing() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 42)], 42);
+            source.start_offsets_unsaved.store(true, Ordering::Release);
+
+            for result in [SourceBatchResult::Ack, SourceBatchResult::Nack] {
+                source
+                    .on_batch_result(result)
+                    .await
+                    .expect("The batch result should be applied");
+
+                let state = source.state.lock().await;
+                assert_eq!(state.bucket_offsets, HashMap::from([(0, 42)]));
+                assert_eq!(state.messages_produced, 42);
+                assert!(source.replay.lock().await.is_none());
+                assert!(source.start_offsets_unsaved.load(Ordering::Acquire));
+            }
+        });
+    }
+
+    #[test]
+    fn given_batch_rejected_several_times_should_send_the_same_rows_each_time() {
+        let (source, _) = source_with_id_column(true);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 10)], 10);
+            let summary = |messages: &[ProducedMessage]| {
+                messages
+                    .iter()
+                    .map(|message| (message.id, message.payload.clone()))
+                    .collect::<Vec<_>>()
+            };
+
+            let (rejected, _) = source
+                .build_batch(scan_records(0, 10, &[1, 2, 3]))
+                .await
+                .expect("The batch should build");
+            for _ in 0..3 {
+                source
+                    .on_batch_result(SourceBatchResult::Nack)
+                    .await
+                    .expect("NACK should be applied");
+                let replayed = source
+                    .poll()
+                    .await
+                    .expect("The rejected rows should be polled again");
+                assert_eq!(summary(&replayed.messages), summary(&rejected));
+                let committed = source.state.lock().await;
+                assert_eq!(committed.bucket_offsets.get(&0), Some(&10));
+                assert_eq!(committed.messages_produced, 10);
+            }
+
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+            let committed = source.state.lock().await;
+            assert_eq!(committed.bucket_offsets.get(&0), Some(&13));
+            assert_eq!(committed.messages_produced, 13);
+            assert!(source.replay.lock().await.is_none());
+        });
+    }
+
+    #[test]
+    fn given_rows_of_several_buckets_should_stage_the_next_offset_of_each() {
+        let (source, _) = source_with_id_column(true);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 10), (1, 20), (2, 30)], 0);
+
+            let (messages, persisted) = source
+                .build_batch(scan_records_in(&[
+                    (0, 10, vec![1, 2]),
+                    (2, 30, vec![3, 4, 5]),
+                ]))
+                .await
+                .expect("The batch should build");
+
+            let positions: HashSet<(i64, i64)> = messages
+                .iter()
+                .map(|message| {
+                    let payload: Value = serde_json::from_slice(&message.payload)
+                        .expect("The payload should be JSON");
+                    let bucket = payload[METADATA_BUCKET]
+                        .as_i64()
+                        .expect("The bucket should be a number");
+                    let offset = payload[METADATA_OFFSET]
+                        .as_i64()
+                        .expect("The offset should be a number");
+                    assert_eq!(message.id, Some(message_id(bucket as i32, offset)));
+                    (bucket, offset)
+                })
+                .collect();
+            assert_eq!(
+                positions,
+                HashSet::from([(0, 10), (0, 11), (2, 30), (2, 31), (2, 32)])
+            );
+            let persisted = persisted
+                .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                .expect("A batch with rows should carry state");
+            assert_eq!(
+                persisted.bucket_offsets,
+                HashMap::from([(0, 12), (1, 20), (2, 33)])
+            );
+            assert_eq!(persisted.messages_produced, 5);
+        });
+    }
+
+    #[test]
+    fn given_row_that_cannot_be_converted_between_good_rows_should_skip_only_that_row() {
+        let row_type = RowType::new(vec![
+            field("id"),
+            DataField::new("day", DataTypes::date(), None),
+        ]);
+        let mut source = FlussSource::new(1, test_config(), None);
+        source.columns = row_type
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(position, field)| mapping::Column::new(position, field.clone()))
+            .collect();
+        let rows: Vec<GenericRow> = [(0, 19_782), (1, i32::MAX), (2, 19_783)]
+            .into_iter()
+            .map(|(id, days)| {
+                let mut row = GenericRow::new(2);
+                row.set_field(0, id);
+                row.set_field(1, Date::new(days));
+                row
+            })
+            .collect();
+        let records = ScanRecords::new(HashMap::from([(
+            TableBucket::new(1, 0),
+            bucket_records(&row_type, 5, &rows),
+        )]));
+
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 5)], 5);
+
+            let (messages, persisted) = source
+                .build_batch(records)
+                .await
+                .expect("The batch should build");
+
+            let ids: Vec<Option<u128>> = messages.iter().map(|message| message.id).collect();
+            assert_eq!(
+                ids,
+                vec![Some(message_id(0, 5)), Some(message_id(0, 7))],
+                "The rows around the unconvertible one should be kept"
+            );
+            let persisted = persisted
+                .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                .expect("A batch with rows should carry state");
+            assert_eq!(persisted.bucket_offsets, HashMap::from([(0, 8)]));
+            assert_eq!(persisted.messages_produced, 7);
+
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+            assert_eq!(source.state.lock().await.rows_skipped, 1);
+        });
+    }
+
+    /// Each of these would otherwise start over from `starting_offset`.
+    #[test]
+    fn given_state_that_does_not_fit_the_layout_should_refuse_to_open() {
+        let mut complete = state_with(&[(0, 42)], 500);
+        complete.table = Some(events_table(3));
+        let complete = rmp_serde::to_vec(&complete).expect("Failed to serialize state");
+        let without_table = rmp_serde::to_vec(&(HashMap::from([(0i32, 42i64)]), 500u64))
+            .expect("Failed to serialize state");
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to build runtime");
+
+        for (case, bytes) in [
+            ("empty", Vec::new()),
+            ("cut short", complete[..complete.len() / 2].to_vec()),
+            ("without the table", without_table),
+        ] {
+            let mut source = FlussSource::new(1, test_config(), Some(ConnectorState(bytes)));
+
+            let error = runtime
+                .block_on(source.open())
+                .expect_err("A state that does not decode should keep the source from opening");
+
+            assert!(
+                matches!(&error, Error::InitError(message) if message.contains("cannot be decoded")),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_largest_bucket_and_offset_should_keep_both_in_the_message_id() {
+        let id = message_id(i32::MAX, i64::MAX);
+
+        assert_eq!(id >> 127, 1);
+        assert_eq!((id >> 64) as u32, i32::MAX as u32);
+        assert_eq!(id as u64, i64::MAX as u64);
+        assert_ne!(message_id(1, 0), message_id(0, i64::MAX));
+    }
+
+    #[test]
+    fn given_timestamp_too_large_for_nanoseconds_should_leave_the_origin_timestamp_unset() {
+        let largest = (u64::MAX / NANOS_PER_MILLI) as i64;
+
+        assert_eq!(
+            origin_timestamp_nanos(largest),
+            Some(largest as u64 * NANOS_PER_MILLI)
+        );
+        assert_eq!(origin_timestamp_nanos(largest + 1), None);
+        assert_eq!(origin_timestamp_nanos(i64::MAX), None);
+        assert_eq!(origin_timestamp_nanos(i64::MIN), None);
+    }
+
+    /// The shipped configurations are what users copy, so each has to pass the same checks as
+    /// a configuration the runtime hands over.
+    #[test]
+    fn given_shipped_configurations_should_deserialize_and_validate() {
+        for (name, raw) in [
+            ("config.toml", include_str!("../config.toml")),
+            (
+                "example_config/fluss_source.toml",
+                include_str!("../../../runtime/example_config/connectors/fluss_source.toml"),
+            ),
+        ] {
+            let document: toml::Value =
+                toml::from_str(raw).unwrap_or_else(|error| panic!("{name} must parse: {error}"));
+            let plugin_config = document
+                .get("plugin_config")
+                .unwrap_or_else(|| panic!("{name} must carry a plugin_config table"))
+                .clone();
+            let config: FlussSourceConfig = plugin_config
+                .try_into()
+                .unwrap_or_else(|error| panic!("{name} plugin_config must deserialize: {error}"));
+
+            FlussSource::new(1, config, None)
+                .validate_config()
+                .unwrap_or_else(|error| panic!("{name} must pass validation: {error}"));
+        }
+    }
+
+    fn connection_settings() -> Value {
+        serde_json::json!({
+            "bootstrap_servers": "localhost:9123",
+            "database": "analytics",
+            "table": "events",
+        })
+    }
+
+    #[test]
+    fn given_only_the_connection_settings_should_use_the_defaults() {
+        let config: FlussSourceConfig = serde_json::from_value(connection_settings())
+            .expect("The connection settings alone should deserialize");
+
+        let source = FlussSource::new(1, config, None);
+
+        assert_eq!(source.poll_interval, DEFAULT_POLL_INTERVAL);
+        assert_eq!(source.poll_timeout, DEFAULT_POLL_TIMEOUT);
+        assert_eq!(
+            source.max_poll_records,
+            Config::default().scanner_log_max_poll_records
+        );
+        assert!(!source.include_metadata);
+        assert!(!source.client_config().is_sasl_enabled());
+        assert!(matches!(
+            source.validate_config(),
+            Ok(StartingOffset::Earliest)
+        ));
+    }
+
+    #[test]
+    fn given_missing_connection_setting_should_fail_to_deserialize() {
+        for missing in ["bootstrap_servers", "database", "table"] {
+            let mut config = connection_settings();
+            config
+                .as_object_mut()
+                .expect("The settings should be an object")
+                .remove(missing);
+
+            assert!(
+                serde_json::from_value::<FlussSourceConfig>(config).is_err(),
+                "{missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_setting_of_the_wrong_type_should_fail_to_deserialize() {
+        for (setting, value) in [
+            ("starting_offset", serde_json::json!(1.5)),
+            ("starting_offset", serde_json::json!(true)),
+            ("starting_offset", serde_json::json!(u64::MAX)),
+            ("batch_size", serde_json::json!(-1)),
+            ("batch_size", serde_json::json!("many")),
+            ("batch_size", serde_json::json!(u64::MAX)),
+            ("columns", serde_json::json!("id")),
+            ("include_metadata", serde_json::json!("yes")),
+        ] {
+            let mut config = connection_settings();
+            config[setting] = value.clone();
+
+            assert!(
+                serde_json::from_value::<FlussSourceConfig>(config).is_err(),
+                "{setting} = {value}"
+            );
+        }
     }
 }

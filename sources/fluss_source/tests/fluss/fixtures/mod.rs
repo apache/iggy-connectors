@@ -19,7 +19,13 @@ mod container;
 mod source;
 
 pub use source::{
-    FlussSourceAllTypesFixture, FlussSourceFixture, FlussSourceLatestFixture,
-    FlussSourceProjectedFixture, FlussSourceReservedColumnFixture, FlussSourceSlowPollFixture,
-    FlussSourceTieredProjectionFixture, FlussSourceUnconvertibleRowFixture,
+    FlussSourceAllTypesFixture, FlussSourceBucketsFixture, FlussSourceExplicitOffsetFixture,
+    FlussSourceFixture, FlussSourceLatestFixture, FlussSourceMissingTableFixture,
+    FlussSourceOffsetPastTheEndFixture, FlussSourceOutageFixture,
+    FlussSourcePartitionedTableFixture, FlussSourcePrimaryKeyTableFixture,
+    FlussSourceProjectedFixture, FlussSourceQuickPollFixture, FlussSourceRawStreamFixture,
+    FlussSourceReservedColumnFixture, FlussSourceSaslFixture, FlussSourceSlowPollFixture,
+    FlussSourceSmallBatchFixture, FlussSourceTieredProjectionFixture,
+    FlussSourceUnconvertibleRowFixture, FlussSourceUnreachableFixture,
+    FlussSourceWrongPasswordFixture,
 };

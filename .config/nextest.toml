@@ -25,3 +25,16 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 
 [profile.ci]
 retries = 3
+
+# The OpenSearch tests share one reusable container (fixed name
+# `iggy-test-opensearch`, ReuseDirective::Always). Serializing the group lets
+# the first test create it and the rest attach by name, instead of racing to
+# create the same name concurrently (Docker 409 Conflict) or hammering a single
+# freshly-started instance with concurrent requests before it has stabilized.
+# Per-test isolation comes from a unique index per fixture, not a fresh container.
+[test-groups.opensearch]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(iggy_connector_opensearch_sink) and binary(opensearch)'
+test-group = "opensearch"

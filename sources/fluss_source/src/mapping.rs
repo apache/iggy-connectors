@@ -251,8 +251,9 @@ mod tests {
     use super::*;
     use base64::Engine;
     use fluss::metadata::DataTypes;
-    use fluss::row::{Date, Decimal, GenericRow, Time, TimestampLtz, TimestampNtz};
+    use fluss::row::{Date, Datum, Decimal, GenericRow, Time, TimestampLtz, TimestampNtz};
     use serde_json::Value;
+    use std::ops::Range;
 
     fn field(name: &str, data_type: DataType) -> DataField {
         DataField::new(name, data_type, None)
@@ -497,5 +498,325 @@ mod tests {
         assert_eq!(object["nan"], Value::Null);
         assert_eq!(object["infinite"], Value::Null);
         assert_eq!(object["finite"], Value::from(2.5));
+    }
+
+    #[test]
+    fn given_integer_extremes_when_mapped_should_keep_every_digit() {
+        let fields = vec![
+            field("tiny_min", DataTypes::tinyint()),
+            field("tiny_max", DataTypes::tinyint()),
+            field("small_min", DataTypes::smallint()),
+            field("small_max", DataTypes::smallint()),
+            field("int_min", DataTypes::int()),
+            field("int_max", DataTypes::int()),
+            field("big_min", DataTypes::bigint()),
+            field("big_max", DataTypes::bigint()),
+        ];
+        let mut row = GenericRow::new(8);
+        row.set_field(0, i8::MIN);
+        row.set_field(1, i8::MAX);
+        row.set_field(2, i16::MIN);
+        row.set_field(3, i16::MAX);
+        row.set_field(4, i32::MIN);
+        row.set_field(5, i32::MAX);
+        row.set_field(6, i64::MIN);
+        row.set_field(7, i64::MAX);
+
+        let payload = serde_json::to_string(&JsonRow::new(&row, &columns(&fields), &[]))
+            .expect("Failed to map row");
+
+        assert_eq!(
+            payload,
+            r#"{"tiny_min":-128,"tiny_max":127,"small_min":-32768,"small_max":32767,"int_min":-2147483648,"int_max":2147483647,"big_min":-9223372036854775808,"big_max":9223372036854775807}"#
+        );
+    }
+
+    #[test]
+    fn given_text_that_needs_escaping_when_mapped_should_come_back_unchanged() {
+        let values = [
+            "",
+            "quote \" and backslash \\",
+            "line\nbreak\ttab\rreturn",
+            "\u{0001}\u{001f}\u{007f}",
+            "한글 🚀 é",
+            "</script>",
+        ];
+        let mut fields: Vec<DataField> = (0..values.len())
+            .map(|index| field(&format!("text_{index}"), DataTypes::string()))
+            .collect();
+        fields.push(field("quo\"ted\\name", DataTypes::string()));
+        let mut row = GenericRow::new(fields.len());
+        for (index, value) in values.iter().enumerate() {
+            row.set_field(index, *value);
+        }
+        row.set_field(values.len(), "under an escaped name");
+
+        let object = to_json(&row, &fields);
+
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(object[format!("text_{index}")], Value::from(*value));
+        }
+        assert_eq!(
+            object["quo\"ted\\name"],
+            Value::from("under an escaped name")
+        );
+    }
+
+    #[test]
+    fn given_empty_bytes_when_mapped_should_produce_an_empty_string() {
+        let fields = vec![field("blob", DataTypes::bytes())];
+        let mut row = GenericRow::new(1);
+        row.set_field(0, [0u8; 0].as_slice());
+
+        let object = to_json(&row, &fields);
+
+        assert_eq!(object["blob"], Value::from(""));
+    }
+
+    #[test]
+    fn given_decimals_at_the_edges_when_mapped_should_write_every_digit() {
+        // 38 digits do not fit an i64, so these take the client's unscaled-bytes form.
+        let wide: i128 = 12_345_678_901_234_567_890_123_456_789_123_456_789;
+        let fields = vec![
+            field("zero", DataTypes::decimal(10, 2)),
+            field("negative", DataTypes::decimal(10, 2)),
+            field("whole", DataTypes::decimal(10, 0)),
+            field("trailing_zeros", DataTypes::decimal(10, 2)),
+            field("wide", DataTypes::decimal(38, 9)),
+            field("wide_negative", DataTypes::decimal(38, 9)),
+        ];
+        let compact = |unscaled, scale| {
+            Decimal::from_unscaled_long(unscaled, 10, scale).expect("Failed to build decimal")
+        };
+        let mut row = GenericRow::new(6);
+        row.set_field(0, compact(0, 2));
+        row.set_field(1, compact(-12_345, 2));
+        row.set_field(2, compact(42, 0));
+        row.set_field(3, compact(100, 2));
+        row.set_field(
+            4,
+            Decimal::from_unscaled_bytes(&wide.to_be_bytes(), 38, 9)
+                .expect("Failed to build decimal"),
+        );
+        row.set_field(
+            5,
+            Decimal::from_unscaled_bytes(&(-wide).to_be_bytes(), 38, 9)
+                .expect("Failed to build decimal"),
+        );
+
+        let object = to_json(&row, &fields);
+
+        assert_eq!(object["zero"], Value::from("0.00"));
+        assert_eq!(object["negative"], Value::from("-123.45"));
+        assert_eq!(object["whole"], Value::from("42"));
+        assert_eq!(object["trailing_zeros"], Value::from("1.00"));
+        assert_eq!(
+            object["wide"],
+            Value::from("12345678901234567890123456789.123456789")
+        );
+        assert_eq!(
+            object["wide_negative"],
+            Value::from("-12345678901234567890123456789.123456789")
+        );
+    }
+
+    #[test]
+    fn given_temporal_values_at_the_edges_when_mapped_should_format_them() {
+        let fields = vec![
+            field("epoch_day", DataTypes::date()),
+            field("day_before_epoch", DataTypes::date()),
+            field("midnight", DataTypes::time_with_precision(3)),
+            field("last_millisecond", DataTypes::time_with_precision(3)),
+            field("whole_second", DataTypes::timestamp_with_precision(0)),
+            field(
+                "ltz_before_epoch",
+                DataTypes::timestamp_ltz_with_precision(3),
+            ),
+            field("ltz_whole_second", DataTypes::timestamp_ltz()),
+        ];
+        let mut row = GenericRow::new(7);
+        row.set_field(0, Date::new(0));
+        row.set_field(1, Date::new(-1));
+        row.set_field(2, Time::new(0));
+        row.set_field(3, Time::new(86_399_999));
+        row.set_field(4, TimestampNtz::new(1_700_000_000_000));
+        row.set_field(5, TimestampLtz::new(-1));
+        row.set_field(6, TimestampLtz::new(1_700_000_000_000));
+
+        let object = to_json(&row, &fields);
+
+        assert_eq!(object["epoch_day"], Value::from("1970-01-01"));
+        assert_eq!(object["day_before_epoch"], Value::from("1969-12-31"));
+        assert_eq!(object["midnight"], Value::from("00:00:00"));
+        assert_eq!(object["last_millisecond"], Value::from("23:59:59.999"));
+        assert_eq!(object["whole_second"], Value::from("2023-11-14 22:13:20"));
+        assert_eq!(
+            object["ltz_before_epoch"],
+            Value::from("1969-12-31T23:59:59.999+00:00")
+        );
+        assert_eq!(
+            object["ltz_whole_second"],
+            Value::from("2023-11-14T22:13:20+00:00")
+        );
+    }
+
+    #[test]
+    fn given_time_outside_a_day_should_fail_naming_the_column() {
+        let fields = vec![field("opened_at", DataTypes::time_with_precision(3))];
+
+        for millis in [-1, 86_400_000, i32::MAX, i32::MIN] {
+            let mut row = GenericRow::new(1);
+            row.set_field(0, Time::new(millis));
+
+            let error = serde_json::to_vec(&JsonRow::new(&row, &columns(&fields), &[]))
+                .expect_err("A time outside a day should fail");
+
+            assert!(
+                error.to_string().contains("'opened_at'"),
+                "{millis}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_timestamp_beyond_what_can_be_formatted_should_fail_naming_the_column() {
+        let fields = vec![
+            field("created_at", DataTypes::timestamp()),
+            field("seen_at", DataTypes::timestamp_ltz()),
+        ];
+
+        for millis in [i64::MAX, i64::MIN] {
+            let mut local = GenericRow::new(2);
+            local.set_field(0, TimestampNtz::new(millis));
+            local.set_field(1, TimestampLtz::new(0));
+            let error = serde_json::to_vec(&JsonRow::new(&local, &columns(&fields), &[]))
+                .expect_err("A timestamp chrono cannot hold should fail");
+            assert!(
+                error.to_string().contains("'created_at'"),
+                "{millis}: {error}"
+            );
+
+            let mut instant = GenericRow::new(2);
+            instant.set_field(0, TimestampNtz::new(0));
+            instant.set_field(1, TimestampLtz::new(millis));
+            let error = serde_json::to_vec(&JsonRow::new(&instant, &columns(&fields), &[]))
+                .expect_err("A timestamp chrono cannot hold should fail");
+            assert!(error.to_string().contains("'seen_at'"), "{millis}: {error}");
+        }
+    }
+
+    /// Repeats exactly and needs no dependency.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// One value in sixteen comes from the whole range of the type, the rest from `sane`.
+        fn pick(&mut self, sane: Range<i64>) -> i64 {
+            let raw = self.next() as i64;
+            if self.next().is_multiple_of(16) {
+                raw
+            } else {
+                sane.start + raw.rem_euclid(sane.end - sane.start)
+            }
+        }
+
+        fn text(&mut self) -> String {
+            let length = self.next() % 12;
+            (0..length)
+                .filter_map(|_| char::from_u32((self.next() % 0x3000) as u32))
+                .collect()
+        }
+    }
+
+    /// A row either maps to one JSON object holding every column, or fails on a temporal value
+    /// chrono cannot hold. It never panics and never writes something that is not JSON.
+    #[test]
+    fn given_arbitrary_scalar_values_when_mapped_should_produce_an_object_or_a_range_error() {
+        const ROWS: usize = 20_000;
+        let fields = vec![
+            field("bool_col", DataTypes::boolean()),
+            field("tinyint_col", DataTypes::tinyint()),
+            field("smallint_col", DataTypes::smallint()),
+            field("int_col", DataTypes::int()),
+            field("bigint_col", DataTypes::bigint()),
+            field("float_col", DataTypes::float()),
+            field("double_col", DataTypes::double()),
+            field("string_col", DataTypes::string()),
+            field("bytes_col", DataTypes::bytes()),
+            field("decimal_col", DataTypes::decimal(18, 4)),
+            field("date_col", DataTypes::date()),
+            field("time_col", DataTypes::time_with_precision(3)),
+            field("timestamp_col", DataTypes::timestamp()),
+            field("timestamp_ltz_col", DataTypes::timestamp_ltz()),
+        ];
+        let columns = columns(&fields);
+        let mut random = Xorshift(0x9E37_79B9_7F4A_7C15);
+        let (mut mapped, mut out_of_range) = (0, 0);
+
+        for _ in 0..ROWS {
+            let text = random.text();
+            let bytes = random.next().to_le_bytes();
+            let mut row = GenericRow::new(fields.len());
+            row.set_field(0, random.next().is_multiple_of(2));
+            row.set_field(1, random.next() as i8);
+            row.set_field(2, random.next() as i16);
+            row.set_field(3, random.next() as i32);
+            row.set_field(4, random.next() as i64);
+            row.set_field(5, f32::from_bits(random.next() as u32));
+            row.set_field(6, f64::from_bits(random.next()));
+            row.set_field(7, text.as_str());
+            row.set_field(8, &bytes[..(random.next() % 9) as usize]);
+            row.set_field(
+                9,
+                Decimal::from_unscaled_long(
+                    (random.next() as i64) % 1_000_000_000_000_000_000,
+                    18,
+                    4,
+                )
+                .expect("Failed to build decimal"),
+            );
+            row.set_field(10, Date::new(random.pick(-800_000..800_000) as i32));
+            row.set_field(11, Time::new(random.pick(0..86_400_000) as i32));
+            row.set_field(
+                12,
+                TimestampNtz::new(random.pick(-60_000_000_000_000..250_000_000_000_000)),
+            );
+            row.set_field(
+                13,
+                TimestampLtz::new(random.pick(-60_000_000_000_000..250_000_000_000_000)),
+            );
+            // A null in a random column, in about half of the rows.
+            let null_at = (random.next() % (fields.len() as u64 * 2)) as usize;
+            if null_at < fields.len() {
+                row.set_field(null_at, Datum::Null);
+            }
+
+            match serde_json::to_vec(&JsonRow::new(&row, &columns, &[])) {
+                Ok(payload) => {
+                    let object: Value =
+                        serde_json::from_slice(&payload).expect("The payload should be JSON");
+                    let object = object.as_object().expect("The payload should be an object");
+                    assert_eq!(object.len(), fields.len());
+                    mapped += 1;
+                }
+                Err(error) => {
+                    assert!(
+                        error.to_string().contains("outside the range"),
+                        "unexpected mapping error: {error}"
+                    );
+                    out_of_range += 1;
+                }
+            }
+        }
+
+        assert_eq!(mapped + out_of_range, ROWS);
+        assert!(mapped > ROWS / 2, "only {mapped} rows mapped");
+        assert!(out_of_range > 0, "no row reached the range check");
     }
 }

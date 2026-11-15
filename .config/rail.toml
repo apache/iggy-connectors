@@ -125,6 +125,12 @@ cargo_prerequisites = [
         { package = "iggy_connector_mqtt_source", target = { name = "iggy_connector_mqtt_source", kind = "cdylib" } },
     ] },
     { source_work = "cargo.test", when = [
+        { package = "iggy_connector_otlp_sink", target = { name = "otlp", kind = "test" } },
+    ], require = [
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy_connector_otlp_sink", target = { name = "iggy_connector_otlp_sink", kind = "cdylib" } },
+    ] },
+    { source_work = "cargo.test", when = [
         { package = "iggy_connector_postgres_sink", target = { name = "postgres", kind = "test" } },
     ], require = [
         { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },

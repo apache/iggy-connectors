@@ -645,9 +645,12 @@ impl<M: SinkMessages> Deliverer<'_, M> {
         let plugin_id = task.plugin_id;
         let TopicMetadata { stream, topic } = &task.topic_metadata;
         match stopped_read(self.messages, &error, plugin_id, &task.topic_metadata).await {
-            Some(StoppedRead::Abandoned(partition_id) | StoppedRead::Refused(partition_id)) => {
-                self.rewind(partition_id, PollingStrategy::next()).await
-            }
+            // Only a read that stores its offset can lose a range, so `Lost` does not occur here.
+            Some(
+                StoppedRead::Abandoned(partition_id)
+                | StoppedRead::Refused(partition_id)
+                | StoppedRead::Lost { partition_id, .. },
+            ) => self.rewind(partition_id, PollingStrategy::next()).await,
             Some(StoppedRead::Undecodable { partition_id, skip }) => {
                 let at = error
                     .offset
@@ -1396,13 +1399,8 @@ mod tests {
     async fn given_a_partition_with_a_new_history_when_read_should_stop_instead_of_skipping() {
         let plugin_id = plugin(&[], &[]);
         let mut log = FakeLog::json(&[(0, 3)]);
-        log.errors.push_back(ReadError {
-            partition_id: Some(0),
-            error: IggyError::HistoryUnavailable,
-            skip: None,
-            offset: None,
-            record: None,
-        });
+        log.errors
+            .push_back(ReadError::new(Some(0), IggyError::HistoryUnavailable));
 
         let result = deliver_all(plugin_id, &mut log, test_delivery()).await;
 

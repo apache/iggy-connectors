@@ -116,6 +116,15 @@ With `include_metadata = true` the table must contain these columns. A missing c
 | `iggy_id` | `STRING` | Message id, as a decimal string (it is a u128) |
 | `iggy_headers` | `JSON` or `STRING` | Headers, only with `include_headers = true`. Binary values are written as `{"data": "<base64>", "iggy_header_encoding": "base64"}` |
 
+In `iggy_headers`, a string header key keeps its own name. A string key that
+starts with `~` becomes `~string:<key>`, a string key that is not valid UTF-8
+becomes `~string_b64:<base64url>`, and a key of any other kind becomes
+`~<kind>:<value>`, for example `~int32:1` or `~raw:AQI`. Quote such names in a
+JSON path, for example `JSON_VALUE(iggy_headers, '$."~int32:1"')`. Earlier
+versions named a non-string key by its string form, so that `1` and `"1"`
+collided and raw keys used Rust Debug text. A string value that is not valid
+UTF-8 is written with replacement characters.
+
 ## Type Mapping
 
 | BigQuery | Accepted JSON values |

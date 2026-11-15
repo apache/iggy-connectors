@@ -18,13 +18,14 @@
 
 # End-to-end check that iggy_connector_sdk can be uploaded to a crates.io-like
 # registry. Spins up cargo-http-registry as a local alt-registry, publishes
-# the core crates that the SDK depends on from a copy of core at R, and then
-# publishes the SDK. Catches missing versions on dependencies and any other
-# manifest-level regression that only surfaces at `cargo publish` time.
+# the core crates that the SDK depends on from a copy of core at the core
+# pin, and then publishes the SDK. Catches missing versions on dependencies
+# and any other manifest-level regression that only surfaces at
+# `cargo publish` time.
 #
-# The core crates come from R, not from crates.io. So the check also works
-# while crates.io lacks the core versions at R, where a plain
-# `cargo publish --dry-run` fails.
+# The core crates come from the core pin, not from crates.io. So the check
+# also works while crates.io lacks the core versions at the core pin, where
+# a plain `cargo publish --dry-run` fails.
 #
 # This script is invoked both by developers (locally) and by CI. It must
 # leave the working tree untouched on exit, even on failure.
@@ -214,19 +215,19 @@ fi
 log "${SDK_CRATE} declares MSRV ${sdk_msrv}"
 
 # ---------------------------------------------------------------------------
-# 1. Copy core at R out of the cargo git checkout. The copy gets patched,
-#    and the checkout must stay pristine because builds read it.
+# 1. Copy core at the core pin out of the cargo git checkout. The copy gets
+#    patched, and the checkout must stay pristine because builds read it.
 # ---------------------------------------------------------------------------
-R="$(core_rev Cargo.toml)"
+CORE_REV="$(core_rev Cargo.toml)"
 iggy_manifest="$(cargo metadata --format-version 1 --locked |
-    jq -r --arg source "$(core_package_source "$R")" \
+    jq -r --arg source "$(core_package_source "$CORE_REV")" \
         '.packages[] | select(.name == "iggy" and .source == $source) | .manifest_path')"
 if [[ -z "$iggy_manifest" ]]; then
-    err "cargo metadata lists no iggy package at R $R"
+    err "cargo metadata lists no iggy package at the core pin $CORE_REV"
     exit 1
 fi
 core_root="$(dirname "$(cargo locate-project --workspace --message-format plain --manifest-path "$iggy_manifest")")"
-log "Copying core at R $R from $core_root"
+log "Copying core at the core pin $CORE_REV from $core_root"
 tar -C "$core_root" --exclude=./.git --exclude=./target -cf - . | tar -xf - -C "$CORE_COPY"
 
 # ---------------------------------------------------------------------------
@@ -320,6 +321,6 @@ for crate in "${CORE_CRATES[@]}" "$SDK_CRATE"; do
     fi
 done
 
-log "The core crates at R and ${SDK_CRATE} published successfully to ${REGISTRY_NAME}"
+log "The core crates at the core pin and ${SDK_CRATE} published successfully to ${REGISTRY_NAME}"
 log "Registry directory: $REGISTRY_DIR (will be cleaned up)"
 exit 0

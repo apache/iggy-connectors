@@ -28,7 +28,8 @@ The examples use the `iggy` database and `iggy`/`iggy` credentials. Create the
 `users` and `orders` tables using the SQL on the
 [Postgres source page](https://iggy.apache.org/docs/connectors/sources/postgres/).
 Save one connector entry in the runtime's connector directory and run the runtime
-from the root of this repository. Create its destination stream and topic before starting it.
+from the root of this repository. The runtime creates the destination stream and topic
+when they do not exist. An existing topic must use `durability = "persisted"`.
 
 ```toml
 type = "source"

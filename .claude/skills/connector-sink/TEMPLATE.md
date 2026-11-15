@@ -32,7 +32,7 @@ tracing            = { workspace = true }
 # + your client crate (reqwest, sqlx, mongodb, ...)
 ```
 
-Run `cargo sort --no-format --workspace` after edits.
+Run `cargo sort --no-format --grouped --workspace` after edits.
 
 ## src/lib.rs
 

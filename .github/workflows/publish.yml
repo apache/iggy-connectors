@@ -367,7 +367,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
-        uses: apache/iggy/.github/actions/utils/docker-login@d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8
+        uses: apache/iggy/.github/actions/utils/docker-login@fe822af6bef32a2630f70688756618d2b3d060e5
         with:
           username: ${{ env.DOCKERHUB_USER }}
           password: ${{ env.DOCKERHUB_TOKEN }}
@@ -420,7 +420,7 @@ jobs:
 
       - name: Tag Docker release (${{ matrix.key }})
         if: success() && inputs.skip_tag_creation == false && steps.ver.outputs.should_tag == 'true'
-        uses: apache/iggy/.github/actions/utils/create-git-tag@d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8
+        uses: apache/iggy/.github/actions/utils/create-git-tag@fe822af6bef32a2630f70688756618d2b3d060e5
         with:
           tag: ${{ steps.ver.outputs.tag }}
           commit: ${{ needs.validate.outputs.commit }}

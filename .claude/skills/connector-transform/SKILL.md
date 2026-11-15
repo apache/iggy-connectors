@@ -275,7 +275,7 @@ Returning `Err` from `transform()` stops the message and is logged. For non-fata
 
 ```text
 cargo fmt --all
-cargo sort --no-format --workspace
+cargo sort --no-format --grouped --workspace
 cargo clippy -p iggy_connector_sdk --all-targets --all-features -- -D warnings
 cargo nextest run -p iggy_connector_sdk --all-features
 ```

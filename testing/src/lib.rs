@@ -19,6 +19,7 @@
 
 pub mod elasticsearch;
 pub mod floci;
+pub mod headers;
 pub mod influxdb;
 pub mod influxdb_v3;
 pub mod postgres;

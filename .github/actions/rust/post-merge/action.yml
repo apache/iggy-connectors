@@ -125,7 +125,7 @@ runs:
     - name: Check if crate is already on crates.io
       id: already_published
       continue-on-error: true
-      uses: apache/iggy/.github/actions/utils/wait-for-crate@d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8
+      uses: apache/iggy/.github/actions/utils/wait-for-crate@fe822af6bef32a2630f70688756618d2b3d060e5
       with:
         package: ${{ inputs.package }}
         version: ${{ inputs.version }}
@@ -228,7 +228,7 @@ runs:
     # "already uploaded" false-negative class.
     - name: Verify crate landed on crates.io (CAS)
       if: steps.already_published.outcome == 'failure'
-      uses: apache/iggy/.github/actions/utils/wait-for-crate@d88da7b2ad1d9a9b2bccdda691454d3b7ba1cfb8
+      uses: apache/iggy/.github/actions/utils/wait-for-crate@fe822af6bef32a2630f70688756618d2b3d060e5
       with:
         package: ${{ inputs.package }}
         version: ${{ inputs.version }}

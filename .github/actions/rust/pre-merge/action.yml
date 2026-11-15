@@ -134,7 +134,7 @@ runs:
 
     - name: Cargo sort
       if: inputs.task == 'sort'
-      run: cargo sort --check --no-format --workspace
+      run: cargo sort --check --no-format --grouped --workspace
       shell: bash
 
     - name: Cargo machete
@@ -184,8 +184,8 @@ runs:
       run: cargo build --locked
       shell: bash
 
-    # The tests start iggy-server built from apache/iggy at R. Building it
-    # takes long, so the binary is cached by R.
+    # The tests start iggy-server built from apache/iggy at the core pin.
+    # Building it takes long, so the binary is cached by the core pin.
     - name: Locate test server
       id: test-server
       if: inputs.task == 'test-server' || inputs.task == 'test'

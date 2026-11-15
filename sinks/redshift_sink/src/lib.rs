@@ -53,6 +53,8 @@ pub struct RedshiftSink {
     pub id: u32,
     config: RedshiftSinkConfig,
     pool: Option<Pool<Postgres>>,
+    schema: Option<String>,
+    case_sensitive: bool,
     state: Mutex<State>,
     verbose: bool,
     bucket: Option<Box<Bucket>>,
@@ -70,6 +72,20 @@ impl Sink for RedshiftSink {
         self.config.validate()?;
 
         self.connect().await?;
+        let (current_schema, case_sensitive) = Self::load_catalog_context(self.get_pool()?).await?;
+        self.schema = Some(
+            self.config
+                .target_schema
+                .as_deref()
+                .map(|schema| normalize_identifier(schema, case_sensitive))
+                .or(current_schema)
+                .ok_or_else(|| {
+                    Error::InitError(
+                        "No current schema is available, set target_schema".to_string(),
+                    )
+                })?,
+        );
+        self.case_sensitive = case_sensitive;
         // Ensuring tables exist
         self.ensure_tables_exist().await?;
         // Checking for schema drift
@@ -123,6 +139,8 @@ impl RedshiftSink {
             id,
             config,
             pool: None,
+            schema: None,
+            case_sensitive: false,
             state: Mutex::new(State::default()),
             verbose,
             bucket: None,
@@ -204,8 +222,8 @@ impl RedshiftSink {
     async fn ensure_tables_exist(&self) -> Result<(), Error> {
         let pool = self.get_pool()?;
 
-        let target_table = quote_identifier(&self.config.target_table)?;
-        let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
+        let target_table = self.qualified_table(&self.config.target_table)?;
+        let staging_table = self.qualified_table(&staging_table_name(&self.config.target_table))?;
 
         let payload_type = self.payload_format().sql_type();
 
@@ -249,8 +267,9 @@ impl RedshiftSink {
         let include_metadata = self.config.include_metadata.unwrap_or(true);
         let include_checksum = self.config.include_checksum.unwrap_or(true);
         let include_origin_timestamp = self.config.include_origin_timestamp.unwrap_or(true);
-        let target_table = quote_identifier(&self.config.target_table)?;
-        let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
+        let target_table = self.qualified_table(&self.config.target_table)?;
+        let staging_table_name = staging_table_name(&self.config.target_table);
+        let staging_table = self.qualified_table(&staging_table_name)?;
         let payload_type = self.payload_format().sql_type();
         let pool = self.get_pool()?;
 
@@ -272,8 +291,13 @@ impl RedshiftSink {
         expected_cols.insert("payload", Self::normalize_type(payload_type));
         expected_cols.insert("created_at", "VARCHAR");
 
-        let target_cols = Self::load_columns(pool, &target_table).await?;
-        let staging_cols = Self::load_columns(pool, &staging_table).await?;
+        let schema = self.resolved_schema()?;
+        let target_catalog_name =
+            normalize_identifier(&self.config.target_table, self.case_sensitive);
+        let staging_catalog_name = normalize_identifier(&staging_table_name, self.case_sensitive);
+
+        let target_cols = Self::load_columns(pool, schema, &target_catalog_name).await?;
+        let staging_cols = Self::load_columns(pool, schema, &staging_catalog_name).await?;
 
         let mut mismatches = Self::diff_schema(&target_table, &target_cols, &expected_cols);
         mismatches.extend(Self::diff_schema(
@@ -292,6 +316,20 @@ impl RedshiftSink {
         }
 
         Ok(())
+    }
+
+    fn resolved_schema(&self) -> Result<&str, Error> {
+        self.schema
+            .as_deref()
+            .ok_or_else(|| Error::InitError("Target schema is not resolved".to_string()))
+    }
+
+    fn qualified_table(&self, table: &str) -> Result<String, Error> {
+        Ok(format!(
+            "{}.{}",
+            quote_identifier(self.resolved_schema()?)?,
+            quote_identifier(table)?
+        ))
     }
 
     fn diff_schema(
@@ -321,21 +359,25 @@ impl RedshiftSink {
 
     async fn load_columns(
         pool: &sqlx::PgPool,
+        schema: &str,
         table: &str,
     ) -> Result<BTreeMap<String, String>, Error> {
-        let query = format!(
-            "SELECT \"column\", type FROM pg_table_def WHERE tablename = '{}'",
-            table.replace('"', "")
-        );
-
-        let rows = sqlx::query(AssertSqlSafe(query))
-            .fetch_all(pool)
-            .await
-            .map_err(|e| Error::InitError(format!("Failed to read schema for '{table}': {e}")))?;
+        let rows = sqlx::query(
+            "SELECT column_name AS \"column\", data_type AS \"type\" \
+             FROM svv_columns \
+             WHERE table_schema = $1 AND table_name = $2",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            Error::InitError(format!("Failed to read schema for '{schema}.{table}': {e}"))
+        })?;
 
         if rows.is_empty() {
             return Err(Error::InitError(format!(
-                "Table '{table}' was not found or has no visible columns"
+                "Table '{schema}.{table}' was not found or has no visible columns"
             )));
         }
 
@@ -352,6 +394,31 @@ impl RedshiftSink {
                 ))
             })
             .collect()
+    }
+
+    async fn load_catalog_context(pool: &sqlx::PgPool) -> Result<(Option<String>, bool), Error> {
+        let row = sqlx::query(
+            "SELECT current_schema() AS schema_name, \
+             current_setting('enable_case_sensitive_identifier') AS case_sensitive",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| Error::InitError(format!("Failed to read Redshift settings: {e}")))?;
+
+        let schema = row
+            .try_get::<Option<String>, _>("schema_name")
+            .map_err(|e| Error::InitError(e.to_string()))?;
+        let case_sensitive = row
+            .try_get::<String, _>("case_sensitive")
+            .map_err(|e| Error::InitError(e.to_string()))?;
+
+        Ok((
+            schema,
+            matches!(
+                case_sensitive.to_ascii_lowercase().as_str(),
+                "true" | "on" | "1"
+            ),
+        ))
     }
 
     fn normalize_type(t: &str) -> &'static str {
@@ -512,7 +579,7 @@ impl RedshiftSink {
     async fn copy_parquet(&self, s3_path: &str, cols: &[&str]) -> Result<(), Error> {
         let max_retries = self.get_max_retries();
         let retry_delay = self.get_retry_delay();
-        let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
+        let staging_table = self.qualified_table(&staging_table_name(&self.config.target_table))?;
 
         let sql = self.build_copy_sql(&staging_table, s3_path, &cols.join(", "))?;
         let pool = self.get_pool()?;
@@ -541,8 +608,8 @@ impl RedshiftSink {
     async fn insert_into_target(&self, cols: &[&str]) -> Result<(), Error> {
         let max_retries = self.get_max_retries();
         let retry_delay = self.get_retry_delay();
-        let target_table = quote_identifier(&self.config.target_table)?;
-        let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
+        let target_table = self.qualified_table(&self.config.target_table)?;
+        let staging_table = self.qualified_table(&staging_table_name(&self.config.target_table))?;
         let sql = self.build_insert_sql(cols, &staging_table, &target_table);
 
         let pool = self.get_pool()?;
@@ -571,7 +638,7 @@ impl RedshiftSink {
     async fn staging_cleanup(&self) -> Result<(), Error> {
         let max_retries = self.get_max_retries();
         let retry_delay = self.get_retry_delay();
-        let staging_table = quote_identifier(&format!("staging_{}", self.config.target_table))?;
+        let staging_table = self.qualified_table(&staging_table_name(&self.config.target_table))?;
         let sql = self.build_truncate_sql(&staging_table);
         let pool = self.get_pool()?;
 
@@ -1064,6 +1131,18 @@ fn quote_identifier(name: &str) -> Result<String, Error> {
     Ok(format!("\"{escaped}\""))
 }
 
+fn staging_table_name(target_table: &str) -> String {
+    format!("staging_{target_table}")
+}
+
+fn normalize_identifier(identifier: &str, case_sensitive: bool) -> String {
+    if case_sensitive {
+        identifier.to_string()
+    } else {
+        identifier.to_ascii_lowercase()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1080,6 +1159,7 @@ mod tests {
     ) -> RedshiftSinkConfig {
         RedshiftSinkConfig {
             connection_string: SecretString::from("postgresql://localhost/db"),
+            target_schema: None,
             target_table: "messages".to_string(),
             batch_size: Some(100),
             max_connections: None,
@@ -1153,6 +1233,30 @@ mod tests {
     fn given_empty_target_table_should_error() {
         let mut config = test_config(false, false, false);
         config.target_table = String::new();
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_empty_target_schema_should_error() {
+        let mut config = test_config(false, false, false);
+        config.target_schema = Some(String::new());
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_whitespace_only_target_schema_should_error() {
+        let mut config = test_config(false, false, false);
+        config.target_schema = Some(" \t\n".to_string());
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_target_schema_with_surrounding_whitespace_should_error() {
+        let mut config = test_config(false, false, false);
+        config.target_schema = Some(" public".to_string());
 
         assert!(config.validate().is_err());
     }
@@ -1487,5 +1591,63 @@ mod tests {
     fn given_identifier_with_sql_injection_should_escape() {
         let result = quote_identifier("messages\"; DROP TABLE users; --").expect("Failed to quote");
         assert_eq!(result, "\"messages\"\"; DROP TABLE users; --\"");
+    }
+
+    #[test]
+    fn given_schema_and_quoted_table_should_quote_each_identifier() {
+        let mut sink = RedshiftSink::new(1, test_config(false, false, false));
+        sink.schema = Some("Data Schema".to_string());
+        let result = sink
+            .qualified_table("o'brien\"events")
+            .expect("Failed to quote table identifier");
+
+        assert_eq!(result, "\"Data Schema\".\"o'brien\"\"events\"");
+    }
+
+    #[test]
+    fn given_unresolved_schema_when_qualifying_table_should_error() {
+        let sink = RedshiftSink::new(1, test_config(false, false, false));
+
+        assert!(matches!(
+            sink.qualified_table("events"),
+            Err(Error::InitError(_))
+        ));
+    }
+
+    #[test]
+    fn given_case_insensitive_identifiers_should_fold_ascii_case() {
+        assert_eq!(
+            normalize_identifier("Events'O\"Brien", false),
+            "events'o\"brien"
+        );
+    }
+
+    #[test]
+    fn given_case_sensitive_identifiers_should_preserve_case() {
+        assert_eq!(normalize_identifier("Events", true), "Events");
+    }
+
+    #[test]
+    fn given_legacy_config_should_deserialize_without_target_schema() {
+        let mut value = serde_json::to_value(test_config(false, false, false))
+            .expect("Failed to serialize test configuration");
+        value
+            .as_object_mut()
+            .expect("Expected configuration object")
+            .remove("target_schema");
+        let config: RedshiftSinkConfig =
+            serde_json::from_value(value).expect("Legacy configuration must still deserialize");
+        assert!(config.target_schema.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_svv_columns_type_names_should_match_expected_schema() {
+        let expected = BTreeMap::from([("id", "VARCHAR"), ("payload", "VARBYTE")]);
+        let matching = BTreeMap::from([
+            ("id".to_string(), "character varying(40)".to_string()),
+            ("payload".to_string(), "binary varying".to_string()),
+        ]);
+        assert!(RedshiftSink::diff_schema("events", &matching, &expected).is_empty());
     }
 }

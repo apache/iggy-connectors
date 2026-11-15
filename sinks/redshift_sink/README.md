@@ -32,6 +32,7 @@ consumer_group = "redshift_sink"
 
 [plugin_config]
 connection_string = "postgresql://user:pass@localhost:5439/database"
+# target_schema = "public"
 target_table = "iggy_messages"
 batch_size = 100
 max_connections = 10
@@ -54,6 +55,7 @@ archive = true
 | Field | Required | Default | Description |
 | --- | --- | --- | --- |
 | `connection_string` | yes | — | Postgres-wire connection string used to reach the Redshift cluster and issue the `COPY` command. |
+| `target_schema` | no | current schema | Schema containing the target and staging tables. |
 | `target_table` | yes | — | Destination Redshift table that batches are copied into. |
 | `batch_size` | no | `100` | Number of messages buffered per Parquet file / `COPY` operation. |
 | `max_connections` | no | `5` | Size of the connection pool used against Redshift. |
@@ -74,6 +76,12 @@ archive = true
 | `archive` | no | `false` | See **Archiving Staged Files** below. |
 
 ## Staging via S3
+
+`target_table` is a single table name, not a schema-qualified SQL expression.
+Set `target_schema` separately to place both target and staging tables in an
+existing schema. When omitted, the connector uses the current schema.
+Names follow Redshift's `enable_case_sensitive_identifier` setting: ASCII
+letters fold to lowercase by default, including inside quoted identifiers.
 
 Redshift's `COPY` command loads from files, not from a live stream, so every
 batch is first written out as a Parquet file and uploaded to
@@ -160,20 +168,21 @@ CREATE TABLE IF NOT EXISTS {table_name} (
 **Redshift:**
 
 ```sql
-SELECT "column", type
-FROM pg_table_def
-WHERE tablename = 'target_table';
+SELECT column_name AS "column", data_type AS "type"
+FROM svv_columns
+WHERE table_schema = $1 AND table_name = $2;
 ```
 
 **pgwire test equivalent:**
 
 ```sql
-SELECT column_name, type
+SELECT column_name AS "column", data_type AS "type"
 FROM information_schema.columns
-WHERE table_name = 'target_table';
+WHERE table_schema = $1 AND table_name = $2;
 ```
 
-Substitutions: `pg_table_def` → `information_schema.columns`, `"column"` → `column_name`, `udt_name`* → `type`.
+Substitution: `svv_columns` → `information_schema.columns`. The schema and table
+names remain bound parameters in both environments.
 
 ## 4. S3 → staging load
 

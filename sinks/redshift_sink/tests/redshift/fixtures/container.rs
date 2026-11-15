@@ -48,6 +48,8 @@ pub const AWS_IAM_ROLE: &str = "arn:aws:iam::0123456789012:role/iggyRole";
 pub const ENV_SINK_CONNECTION_STRING: &str =
     "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_CONNECTION_STRING";
 pub const ENV_SINK_TARGET_TABLE: &str = "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_TARGET_TABLE";
+pub const ENV_SINK_TARGET_SCHEMA: &str =
+    "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_TARGET_SCHEMA";
 pub const ENV_SINK_PAYLOAD_FORMAT: &str =
     "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_PAYLOAD_FORMAT";
 pub const ENV_SINK_AWS_IAM_ROLE: &str = "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_AWS_IAM_ROLE";
@@ -136,6 +138,14 @@ impl RedshiftContainer {
         target_connection: String,
         s3_endpoint: String,
     ) -> Result<Self, TestBinaryError> {
+        Self::start_with_case_sensitivity(target_connection, s3_endpoint, false).await
+    }
+
+    pub async fn start_with_case_sensitivity(
+        target_connection: String,
+        s3_endpoint: String,
+        case_sensitive: bool,
+    ) -> Result<Self, TestBinaryError> {
         let s3_client = S3Client::new(
             STAGING_BUCKET,
             &s3_endpoint,
@@ -152,6 +162,7 @@ impl RedshiftContainer {
         let factory = Arc::new(RedshiftHandlerFactory {
             pg_dsn: target_connection,
             s3_client: Arc::new(s3_client),
+            case_sensitive,
         });
 
         let listener =

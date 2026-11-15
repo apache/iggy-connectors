@@ -24,6 +24,7 @@ use secrecy::{ExposeSecret, SecretString};
 pub struct RedshiftSinkConfig {
     #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
     pub connection_string: SecretString,
+    pub target_schema: Option<String>,
     pub target_table: String,
     pub batch_size: Option<u32>,
     pub max_connections: Option<u32>,
@@ -64,6 +65,14 @@ impl RedshiftSinkConfig {
 
         if self.target_table.is_empty() {
             errors.push_str(", target_table is empty\n");
+        }
+
+        if let Some(schema) = self.target_schema.as_deref() {
+            if schema.trim().is_empty() {
+                errors.push_str(", target_schema is empty\n");
+            } else if schema.trim() != schema {
+                errors.push_str(", target_schema has leading or trailing whitespace\n");
+            }
         }
 
         if self.s3_bucket.is_empty() {

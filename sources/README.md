@@ -279,7 +279,7 @@ While the final schema of messages (that will be appended to the Iggy stream), c
 
 Eventually, compile the source code and create a separate connector configuration file in the connectors directory (as specified in the main runtime `config.toml`). Make sure that `path` points to the existing plugin.
 
-And before starting the runtime, do not forget to create the specified stream and topic e.g. via Iggy CLI.
+The runtime creates the configured stream and topic when they do not exist, with `durability = "persisted"`. To create them yourself, for example with the Iggy CLI, give the topic that durability, because the runtime refuses a source topic without it:
 
 ```bash
 iggy --username iggy --password iggy stream create example_stream

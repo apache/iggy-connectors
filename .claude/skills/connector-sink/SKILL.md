@@ -62,7 +62,10 @@ for getting them to the external system reliably and efficiently.
 ### Headers
 
 - `message.headers: Option<BTreeMap<HeaderKey, HeaderValue>>`. Check `.is_empty()` before iterating - runtime treats empty as `None`.
-- For binary values use `v.as_raw()` + base64. for text use `v.to_string_value()`. See `http_sink::EncodedHeader`.
+- Name every header with `iggy_connector_sdk::HeaderName`, never with `to_string_value()`, which collides `1` with `"1"` and renders raw keys as Debug text. `HeaderName` gives each key one stable, unique name.
+- For a new sink that writes JSON, write the whole map with `iggy_connector_sdk::JsonHeaders` (`{data, data_encoding}` per value). For another value shape, take the text from `headers::HeaderData` and the base64 check from `headers::JsonHeaderValue::data_encoding`. See `meilisearch_sink::headers_document`.
+- Released sinks keep their documented value shape: binary values as `v.as_raw()` + base64 (`http_sink::EncodedHeader`), text as `v.to_string_value()`.
+- Test header naming with the shared cases in `testing/src/headers.rs` (`header_cases`, `header_case_map`). A sink that cannot write a case skips it by label, as RabbitMQ does with `LONG_RAW_KEY_CASE`.
 - `BTreeMap` for deterministic ordering. Don't collect into `HashMap`.
 
 ### Errors

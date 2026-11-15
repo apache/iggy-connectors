@@ -110,6 +110,12 @@ jobs:
           component: rust-connectors
           platform: ${{ matrix.platform }}
           dry_run: "true"
+          load: "true"
+
+      - name: Smoke check apache/iggy-connect
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: ./scripts/ci/runtime-image-smoke.sh "apache/iggy-connect:test-${PLATFORM##*/}"
 
   # Final status check
   finalize_pr:

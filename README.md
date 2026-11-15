@@ -192,6 +192,7 @@ A `Sink` implementation uses the `sink_connector!` macro, which exposes the FFI 
 | [InfluxDB](sinks/influxdb_sink/README.md)           | InfluxDB V2 and V3, as line-protocol points                             |
 | [Meilisearch](sinks/meilisearch_sink/README.md)     | a Meilisearch index                                                     |
 | [MongoDB](sinks/mongodb_sink/README.md)             | a MongoDB collection                                                    |
+| [OTLP](sinks/otlp_sink/README.md)                   | OpenTelemetry backends, as OTLP log records over HTTP                   |
 | [PostgreSQL](sinks/postgres_sink/README.md)         | PostgreSQL tables                                                       |
 | [Quickwit](sinks/quickwit_sink/README.md)           | a Quickwit index                                                        |
 | [RabbitMQ](sinks/rabbitmq_sink/README.md)           | RabbitMQ exchanges, through AMQP 0.9.1                                  |

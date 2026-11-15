@@ -55,6 +55,7 @@ ctor = { workspace = true }
 dtor = { workspace = true }
 iggy = { workspace = true }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
+iggy_connector_testing = { workspace = true }
 integration = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
 reqwest-middleware = { workspace = true }

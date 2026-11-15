@@ -18,9 +18,9 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_common::{HeaderKey, HeaderValue, IggyTimestamp, calculate_256};
+use iggy_common::{IggyTimestamp, calculate_256};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
+    ConsumedMessage, Error, JsonHeaders, MessagesMetadata, Payload, Sink, TopicMetadata,
     convert::owned_value_into_serde_json,
     retry::{is_transient_status, parse_duration, parse_retry_after, retry_backoff},
     sink_connector,
@@ -42,7 +42,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     future::Future,
     net::IpAddr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -54,8 +54,12 @@ use url::Url;
 
 sink_connector!(OpenSearchSink);
 
-const HEADER_DATA_TEMPLATE_NAME: &str = "iggy_headers_data_as_keyword";
 const HEADER_DATA_PATH_MATCH: &str = "iggy_headers.*.data";
+/// Name and `match_mapping_type` of each keyword template for header `data`.
+const HEADER_DATA_TEMPLATES: [(&str, &str); 2] = [
+    ("iggy_header_data", "string"),
+    ("iggy_header_data_date", "date"),
+];
 const DEFAULT_CREATE_INDEX_IF_NOT_EXISTS: bool = true;
 const DEFAULT_INCLUDE_METADATA: bool = true;
 const DEFAULT_BATCH_SIZE: usize = 1000;
@@ -65,7 +69,6 @@ const DEFAULT_MAX_RETRY_DELAY: &str = "5s";
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_MAX_OPEN_RETRIES: u32 = 5;
 const ENCODING_BASE64: &str = "base64";
-const ENCODING_UTF8: &str = "utf8";
 const GENERATED_ID_PREFIX: &str = "iggy_";
 const INDEX_ALREADY_EXISTS_ERROR: &str = "resource_already_exists_exception";
 
@@ -1337,52 +1340,37 @@ fn inject_metadata(
         upsert_metadata_field(id, document, field, value);
     }
 
-    match &message.headers {
-        Some(headers) if !headers.is_empty() => {
-            upsert_metadata_field(id, document, "iggy_headers", headers_to_json(headers));
-        }
+    match message
+        .headers
+        .as_ref()
+        .filter(|headers| !headers.is_empty())
+    {
+        Some(headers) => match serde_json::to_value(JsonHeaders(headers)) {
+            Ok(value) => upsert_metadata_field(id, document, "iggy_headers", value),
+            Err(error) => {
+                document.remove("iggy_headers");
+                warn!(
+                    "OpenSearch sink connector ID: {id}: indexing the message at offset {} without user headers: {error}",
+                    message.offset
+                );
+            }
+        },
         // A leftover payload value would pin `iggy_headers` to its own type on
         // first write, so later documents with real headers fail to index.
-        _ => {
+        None => {
             document.remove("iggy_headers");
         }
     }
 }
 
-/// `HeaderKey`/`HeaderValue` are structs, not strings, so `serde_json::to_value`
-/// on the map directly fails with "key must be a string", so the keys and raw
-/// binary values are converted explicitly instead.
-fn headers_to_json(headers: &BTreeMap<HeaderKey, HeaderValue>) -> Value {
-    let mut map = Map::new();
-    for (key, value) in headers {
-        // A per-kind shape would pin iggy_headers.<key> to text or object on
-        // first use, so the other kind then fails to index under that key.
-        let (data, encoding) = match value.as_raw() {
-            Ok(raw) => (general_purpose::STANDARD.encode(raw), ENCODING_BASE64),
-            Err(_) => (value.to_string_value(), ENCODING_UTF8),
-        };
-        // Keys such as 1 and "1" are distinct in Iggy but would share one JSON field name.
-        let mut field = key.to_string_value();
-        while map.contains_key(&field) {
-            field = format!("{field}~{}", key.kind());
-        }
-        map.insert(
-            field,
-            // Built directly rather than via `json!`: that macro routes
-            // through `Serialize`, which only ever sees `&str` and so
-            // must copy `data` again even though it's already owned here.
-            Value::Object(Map::from_iter([
-                ("data".to_string(), Value::String(data)),
-                (
-                    "data_encoding".to_string(),
-                    Value::String(encoding.to_string()),
-                ),
-            ])),
-        );
-    }
-    Value::Object(map)
-}
-
+/// Prepends the keyword templates for header `data` to
+/// `body.mappings.dynamic_templates`, except those whose name is there.
+///
+/// Each template names its `match_mapping_type`. Without one, a header key
+/// such as `x.data` expands to an object at `iggy_headers.x.data`, the
+/// template maps that object as keyword, and OpenSearch rejects the document.
+/// Date detection reports a date-like string as `date`, not `string`, so a
+/// `string` template alone misses those values.
 fn prepend_header_data_template(body: &mut Value) -> Result<(), Error> {
     let invalid =
         |detail: &str| Error::InvalidConfigValue(format!("OpenSearch index_mapping {detail}"));
@@ -1397,16 +1385,27 @@ fn prepend_header_data_template(body: &mut Value) -> Result<(), Error> {
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or_else(|| invalid("'mappings.dynamic_templates' must be an array"))?;
-    templates.insert(
-        0,
-        json!({
-            HEADER_DATA_TEMPLATE_NAME: {
-                "path_match": HEADER_DATA_PATH_MATCH,
-                "mapping": { "type": "keyword" }
-            }
-        }),
-    );
+    let missing: Vec<Value> = HEADER_DATA_TEMPLATES
+        .iter()
+        .filter(|(name, _)| {
+            !templates
+                .iter()
+                .any(|template| template.get(*name).is_some())
+        })
+        .map(|&(name, mapping_type)| header_data_template(name, mapping_type))
+        .collect();
+    templates.splice(0..0, missing);
     Ok(())
+}
+
+fn header_data_template(name: &str, mapping_type: &str) -> Value {
+    json!({
+        name: {
+            "path_match": HEADER_DATA_PATH_MATCH,
+            "match_mapping_type": mapping_type,
+            "mapping": { "type": "keyword" }
+        }
+    })
 }
 
 fn upsert_metadata_field(id: u32, document: &mut Map<String, Value>, field: &str, value: Value) {
@@ -1617,8 +1616,12 @@ fn is_loopback_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_common::{HeaderKey, HeaderValue};
     use iggy_connector_sdk::Schema;
+    use iggy_connector_sdk::headers::DATA_ENCODING_UTF8;
+    use iggy_connector_testing::headers::{header_case_map, header_cases};
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::atomic::AtomicU32;
     use wiremock::matchers::{body_bytes, body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1972,7 +1975,10 @@ mod tests {
 
         let headers = &prepared.document["iggy_headers"];
         assert_eq!(headers["x-correlation-id"]["data"], "abc-123");
-        assert_eq!(headers["x-correlation-id"]["data_encoding"], ENCODING_UTF8);
+        assert_eq!(
+            headers["x-correlation-id"]["data_encoding"],
+            DATA_ENCODING_UTF8
+        );
         assert_eq!(
             headers["x-raw"]["data"],
             general_purpose::STANDARD.encode([1u8, 2, 3])
@@ -1985,7 +1991,7 @@ mod tests {
     // shape or the second kind fails with a mapper_parsing_exception.
     #[test]
     fn given_string_and_raw_header_values_should_use_one_document_shape() {
-        let headers = headers_to_json(&BTreeMap::from([
+        let headers = serde_json::to_value(JsonHeaders(&BTreeMap::from([
             (
                 HeaderKey::try_from("x-text").unwrap(),
                 HeaderValue::try_from("plain").unwrap(),
@@ -1998,7 +2004,8 @@ mod tests {
                 HeaderKey::try_from("x-raw").unwrap(),
                 HeaderValue::try_from([1u8, 2, 3].as_slice()).unwrap(),
             ),
-        ]));
+        ])))
+        .expect("headers should serialize");
 
         let entries = headers.as_object().expect("headers should be an object");
         assert_eq!(entries.len(), 3);
@@ -2016,77 +2023,34 @@ mod tests {
                 "header '{key}' data is not a string"
             );
         }
-        assert_eq!(entries["x-text"]["data_encoding"], ENCODING_UTF8);
-        assert_eq!(entries["x-number"]["data_encoding"], ENCODING_UTF8);
+        assert_eq!(entries["x-text"]["data_encoding"], DATA_ENCODING_UTF8);
+        assert_eq!(entries["x-number"]["data_encoding"], DATA_ENCODING_UTF8);
         assert_eq!(entries["x-raw"]["data_encoding"], ENCODING_BASE64);
     }
 
     #[test]
-    fn given_keys_that_stringify_alike_should_keep_every_header() {
-        let headers = headers_to_json(&BTreeMap::from([
-            (
-                HeaderKey::from(1i32),
-                HeaderValue::try_from("integer").unwrap(),
-            ),
-            (
-                HeaderKey::from(1u32),
-                HeaderValue::try_from("unsigned").unwrap(),
-            ),
-            (
-                HeaderKey::try_from("1").unwrap(),
-                HeaderValue::try_from("string").unwrap(),
-            ),
-            (
-                HeaderKey::try_from([1u8, 2, 3].as_slice()).unwrap(),
-                HeaderValue::try_from("raw").unwrap(),
-            ),
-            (
-                HeaderKey::try_from(r#"b"\x01\x02\x03""#).unwrap(),
-                HeaderValue::try_from("text").unwrap(),
-            ),
-        ]));
+    fn given_shared_header_cases_should_write_expected_names() {
+        let sink = sink_with_config(base_config());
+        let cases = header_cases();
+        let mut message = message(Payload::Json(simd_json::json!({ "name": "Alice" })));
+        message.headers = Some(header_case_map());
 
-        let entries = headers.as_object().expect("headers should be an object");
-        assert_eq!(entries.len(), 5);
-        assert_eq!(entries["1"]["data"], "string");
-        assert_eq!(entries["1~int32"]["data"], "integer");
-        assert_eq!(entries["1~uint32"]["data"], "unsigned");
-        assert_eq!(entries[r#"b"\x01\x02\x03""#]["data"], "raw");
-        assert_eq!(entries[r#"b"\x01\x02\x03"~string"#]["data"], "text");
-    }
+        let prepared = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("prepare document");
 
-    #[test]
-    fn given_string_key_matching_the_suffixed_name_should_keep_every_header() {
-        let headers = headers_to_json(&BTreeMap::from([
-            (
-                HeaderKey::from(1i32),
-                HeaderValue::try_from("integer").unwrap(),
-            ),
-            (
-                HeaderKey::try_from("1").unwrap(),
-                HeaderValue::try_from("string").unwrap(),
-            ),
-            (
-                HeaderKey::try_from("1~int32").unwrap(),
-                HeaderValue::try_from("lookalike").unwrap(),
-            ),
-        ]));
-
-        let entries = headers.as_object().expect("headers should be an object");
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries["1"]["data"], "string");
-        assert_eq!(entries["1~int32"]["data"], "lookalike");
-        assert_eq!(entries["1~int32~int32"]["data"], "integer");
-    }
-
-    #[test]
-    fn given_typed_key_without_collision_should_use_its_plain_name() {
-        let headers = headers_to_json(&BTreeMap::from([(
-            HeaderKey::from(1i32),
-            HeaderValue::try_from("integer").unwrap(),
-        )]));
-
-        assert_eq!(headers["1"]["data"], "integer");
+        let headers = prepared.document["iggy_headers"]
+            .as_object()
+            .expect("headers should be an object");
+        assert_eq!(headers.len(), cases.len());
+        for case in &cases {
+            assert_eq!(
+                headers.get(&case.expected_name),
+                Some(&json!({ "data": case.label, "data_encoding": DATA_ENCODING_UTF8 })),
+                "case {}",
+                case.label
+            );
+        }
     }
 
     #[test]
@@ -3642,13 +3606,19 @@ mod tests {
         assert_eq!(error.failed, 4);
     }
 
-    fn header_template() -> Value {
-        json!({
-            HEADER_DATA_TEMPLATE_NAME: {
+    fn header_templates() -> Vec<Value> {
+        vec![
+            json!({ "iggy_header_data": {
                 "path_match": HEADER_DATA_PATH_MATCH,
+                "match_mapping_type": "string",
                 "mapping": { "type": "keyword" }
-            }
-        })
+            } }),
+            json!({ "iggy_header_data_date": {
+                "path_match": HEADER_DATA_PATH_MATCH,
+                "match_mapping_type": "date",
+                "mapping": { "type": "keyword" }
+            } }),
+        ]
     }
 
     #[test]
@@ -3659,7 +3629,7 @@ mod tests {
 
         assert_eq!(
             body,
-            Some(json!({ "mappings": { "dynamic_templates": [header_template()] } }))
+            Some(json!({ "mappings": { "dynamic_templates": header_templates() } }))
         );
     }
 
@@ -3686,7 +3656,7 @@ mod tests {
                 "settings": { "number_of_shards": 1 },
                 "mappings": {
                     "properties": { "count": { "type": "integer" } },
-                    "dynamic_templates": [header_template(), existing_template]
+                    "dynamic_templates": ([header_templates(), vec![existing_template]].concat())
                 }
             }))
         );
@@ -3745,7 +3715,7 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path(format!("/{}", sink.config.index)))
             .and(body_json(
-                json!({ "mappings": { "dynamic_templates": [header_template()] } }),
+                json!({ "mappings": { "dynamic_templates": header_templates() } }),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "acknowledged": true })))
             .expect(1)

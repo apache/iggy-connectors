@@ -151,31 +151,48 @@ exceed the precision JSON numbers can represent exactly), `iggy_timestamp`,
 `iggy_origin_timestamp`, `iggy_ingested_at`, and `iggy_headers` when the
 message carries headers.
 
-Each header becomes a field under `iggy_headers`, named after the header key.
-Every value uses the same shape, `{data: <string>, data_encoding: "utf8" |
-"base64"}`: raw binary values are base64-encoded, every other header kind is
-stringified and marked `utf8`. The shape is uniform on purpose. OpenSearch
-pins `iggy_headers.<key>` to whatever type the first indexed document uses, so
-a per-kind shape would make every later message using the other kind fail with
-a `mapper_parsing_exception` and be dropped.
-
-Non-string keys are named after their string form, so integer `1` is stored at
-`iggy_headers.1`. If keys in one message stringify alike, one keeps the name and
-each other gets a kind suffix such as `1~int32`, so a query for that key can
-miss that message.
-
-The sink also adds a dynamic template to the index it creates, mapping
-`iggy_headers.*.data` as `keyword`. Without it, OpenSearch's date detection
-would map the first date-like header value (such as `2024-01-01`) as `date`
-and reject every later ordinary string under the same key. The template is
-placed ahead of any `dynamic_templates` in `index_mapping`, and is skipped when
-`include_metadata = false`. An index that already exists keeps its mapping, so
-add the same template to it by hand:
+Each header becomes a field under `iggy_headers`. Every value uses the same
+shape, `{data: <string>, data_encoding: "utf8" | "base64"}`, so that one header
+keeps one field type across messages:
 
 ```json
-{ "iggy_headers_data_as_keyword": {
-    "path_match": "iggy_headers.*.data",
-    "mapping": { "type": "keyword" } } }
+"iggy_headers": {
+  "trace-id": {"data": "abc", "data_encoding": "utf8"},
+  "~int32:1": {"data": "7", "data_encoding": "utf8"}
+}
+```
+
+- A string key keeps its own name. A string key that starts with `~` becomes
+  `~string:<key>`, and a string key that is not valid UTF-8 becomes
+  `~string_b64:<base64url>`.
+- A key of any other kind becomes `~<kind>:<value>`, for example `~int32:1`,
+  `~bool:true`, `~float64:3ff8000000000000` (hex of the float bits) or
+  `~raw:AQI` (unpadded base64url). Integer `1` and string `"1"` never share a
+  name.
+- `data` holds a string value as text, a raw value or a string value that is
+  not valid UTF-8 as standard base64 (`data_encoding: "base64"`), and every
+  other value as decimal or `true` / `false` text.
+
+These are the names that every sink in this repository writes, as described
+in the SDK `headers` module.
+
+The sink also adds two dynamic templates to the index it creates, mapping
+`iggy_headers.*.data` as `keyword` for string and date-like values. Without
+them, OpenSearch's date detection would map the first date-like header value
+(such as `2024-01-01`) as `date` and reject every later ordinary string under
+the same key. Each template names its `match_mapping_type`, so that a header
+key such as `x.data`, whose object lands on the same path, is not mapped as
+`keyword` and rejected. The templates are placed ahead of any
+`dynamic_templates` in `index_mapping`, a template whose name is already there
+is not added again, and both are skipped when `include_metadata = false`. An
+index that already exists keeps its mapping, so add both templates to it by
+hand:
+
+```json
+[
+  {"iggy_header_data": {"path_match": "iggy_headers.*.data", "match_mapping_type": "string", "mapping": {"type": "keyword"}}},
+  {"iggy_header_data_date": {"path_match": "iggy_headers.*.data", "match_mapping_type": "date", "mapping": {"type": "keyword"}}}
+]
 ```
 
 Two hazards remain, both inherent to using header keys as field names:

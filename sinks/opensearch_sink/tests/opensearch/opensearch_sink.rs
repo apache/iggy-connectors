@@ -390,8 +390,8 @@ async fn given_date_like_header_value_when_later_value_is_text_should_index_both
     assert!(observed.contains(&"not a date"));
 }
 
-// Keys that stringify alike share one JSON field name, so the live server has
-// to accept the kind-suffixed name for both headers to survive.
+// Keys that stringify alike get distinct names, `1` and `~int32:1`, and the
+// live server has to accept both for both headers to survive.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/opensearch/sink.toml")),
     seed = seeds::connector_multi_topic_stream
@@ -444,5 +444,5 @@ async fn given_keys_that_stringify_alike_when_sink_consumes_should_index_both(
         .expect("search index");
     let headers = &documents["hits"]["hits"][0]["_source"]["iggy_headers"];
     assert_eq!(headers["1"]["data"], "from-string-key");
-    assert_eq!(headers["1~int32"]["data"], "from-integer-key");
+    assert_eq!(headers["~int32:1"]["data"], "from-integer-key");
 }

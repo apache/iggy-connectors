@@ -5786,6 +5786,7 @@ dependencies = [
  "iggy",
  "iggy_common",
  "iggy_connector_sdk",
+ "iggy_connector_testing",
  "integration",
  "opensearch",
  "reqwest 0.13.5",

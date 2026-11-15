@@ -89,7 +89,7 @@ With `include_metadata = true`, the table must contain these writable columns:
 | `iggy_id`           | `string`          | Full decimal u128 message ID                                    |
 | `iggy_headers`      | `object` or `any` | Only required with `include_headers = true`                     |
 
-Text headers become strings. Binary headers become `{"data":"<base64>","iggy_header_encoding":"base64"}`. Missing headers become an empty object. `messages_metadata.current_offset` is a poll high-water mark and is not used as the row offset or a batch identity.
+String header keys keep their names unless prefixed with `~` or non-UTF-8; other keys use `~<kind>:<value>` names such as `~int32:1`. Text and typed header values become strings, binary or non-UTF-8 values become `{"data":"<base64>","iggy_header_encoding":"base64"}`, and missing headers become an empty object. `messages_metadata.current_offset` is a poll high-water mark and is not used as the row offset or a batch identity.
 
 Example table for mapped mode:
 

@@ -6063,6 +6063,7 @@ dependencies = [
  "humantime",
  "iggy_common",
  "iggy_connector_sdk",
+ "iggy_connector_testing",
  "scopedb-client",
  "secrecy",
  "serde",

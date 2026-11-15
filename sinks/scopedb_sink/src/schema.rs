@@ -94,6 +94,10 @@ impl Layout {
                 ));
             }
             Some(data_type)
+        } else if writable.is_empty() {
+            return Err(Error::SchemaMismatch(
+                "target table has no writable columns".into(),
+            ));
         } else {
             None
         };
@@ -117,7 +121,17 @@ mod tests {
             "name":"events", "columns":[{"name":"payload","data_type":"string","expression":"'constant'"}]
         })).expect("valid catalog");
         assert!(matches!(
-            Layout::new(table, &settings),
+            Layout::new(table.clone(), &settings),
+            Err(Error::SchemaMismatch(_))
+        ));
+
+        let mapped_config: ScopeDBSinkConfig = toml::from_str(
+            "endpoint='http://localhost'\ntable='events'\nmode='mapped'\ninclude_metadata=false",
+        )
+        .expect("valid mapped config");
+        let mapped_settings = Settings::from_config(1, &mapped_config);
+        assert!(matches!(
+            Layout::new(table, &mapped_settings),
             Err(Error::SchemaMismatch(_))
         ));
     }

@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use iggy_common::{HeaderKey, HeaderValue};
+use iggy_common::{HeaderKey, HeaderKind, HeaderValue};
 use iggy_connector_scopedb_sink::{ScopeDBSink, WriteMode};
 use iggy_connector_sdk::{Error, Payload, Schema, Sink};
+use iggy_connector_testing::headers::{header_case_map, header_cases};
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -259,7 +259,8 @@ async fn given_message_metadata_when_writing_should_preserve_offsets_ids_and_hea
     config.include_headers = Some(true);
     let mut sink = ScopeDBSink::new(7, config);
     sink.open().await.expect("open sink");
-    let mut headers = BTreeMap::new();
+    let cases = header_cases();
+    let mut headers = header_case_map();
     headers.insert(
         HeaderKey::from_str("trace").expect("header key"),
         HeaderValue::from_str("abc").expect("text header"),
@@ -267,6 +268,10 @@ async fn given_message_metadata_when_writing_should_preserve_offsets_ids_and_hea
     headers.insert(
         HeaderKey::from_str("blob").expect("header key"),
         HeaderValue::try_from(&[255_u8, 0][..]).expect("binary header"),
+    );
+    headers.insert(
+        HeaderKey::from_str("lossy").expect("header key"),
+        HeaderValue::from_raw(HeaderKind::String, &[0xff, 0xfe]).expect("non-utf8 string header"),
     );
     let mut input = json_message(
         42,
@@ -282,8 +287,23 @@ async fn given_message_metadata_when_writing_should_preserve_offsets_ids_and_hea
     assert_eq!(row["iggy_partition_id"], 3);
     assert_eq!(row["iggy_id"], u128::MAX.to_string());
     assert_eq!(row["iggy_timestamp"], "2023-11-14T22:13:20.000001Z");
+    for case in &cases {
+        assert_eq!(
+            row["iggy_headers"].get(&case.expected_name),
+            Some(&json!(case.label)),
+            "case {}",
+            case.label
+        );
+    }
     assert_eq!(row["iggy_headers"]["trace"], "abc");
-    assert_eq!(row["iggy_headers"]["blob"]["data"], "/wA=");
+    assert_eq!(
+        row["iggy_headers"]["blob"],
+        json!({"data": "/wA=", "iggy_header_encoding": "base64"})
+    );
+    assert_eq!(
+        row["iggy_headers"]["lossy"],
+        json!({"data": "//4=", "iggy_header_encoding": "base64"})
+    );
     assert!(row.get("ignored").is_none());
 }
 
@@ -363,7 +383,20 @@ async fn given_invalid_numbers_when_writing_should_reject_before_network_io() {
             .is_err()
         );
     }
-    assert_eq!(sink.stats().rejected, 2);
+    for payload in [
+        Payload::Text(format!("{{\"id\":{}}}", u128::from(u64::MAX) + 1)),
+        Payload::Text(format!(
+            "{{\"attrs\":{{\"nested\":{}}}}}",
+            i128::from(i64::MIN) - 1
+        )),
+    ] {
+        assert!(matches!(
+            sink.consume(&topic(), metadata(Schema::Text), vec![message(1, payload)])
+                .await,
+            Err(Error::InvalidRecordValue(_))
+        ));
+    }
+    assert_eq!(sink.stats().rejected, 4);
     assert!(
         backend
             .state

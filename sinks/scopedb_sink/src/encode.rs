@@ -21,7 +21,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, SecondsFormat, Utc};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, TopicMetadata, owned_value_into_serde_json,
+    ConsumedMessage, Error, HeaderName, MessagesMetadata, Payload, TopicMetadata,
+    headers::{DATA_ENCODING_BASE64, HeaderData, JsonHeaderValue},
+    owned_value_into_serde_json,
 };
 use scopedb_client::DataType;
 use serde_json::value::{RawValue, to_raw_value};
@@ -37,13 +39,17 @@ pub(crate) fn row(
     layout: &Layout,
     settings: &Settings,
 ) -> Result<Box<RawValue>, Error> {
-    let message_offset = message.offset;
-    let message_timestamp = message.timestamp;
-    let message_id = message.id;
-    let message_headers = message.headers;
+    let ConsumedMessage {
+        id,
+        offset,
+        timestamp,
+        headers,
+        payload,
+        ..
+    } = message;
     let mut row = match settings.mode {
         WriteMode::Mapped => {
-            let value = json_payload(message.payload)?;
+            let value = json_payload(payload)?;
             let Value::Object(mut object) = value else {
                 return Err(Error::InvalidRecordValue(
                     "mapped payload must be a JSON object".into(),
@@ -55,11 +61,11 @@ pub(crate) fn row(
         WriteMode::Raw => {
             let value = match layout.raw_type {
                 Some(DataType::Binary) => {
-                    Value::String(BASE64.encode(payload_bytes(&message.payload)?.as_ref()))
+                    Value::String(BASE64.encode(payload_bytes(&payload)?.as_ref()))
                 }
-                Some(DataType::String) => Value::String(payload_string(message.payload)?),
+                Some(DataType::String) => Value::String(payload_string(payload)?),
                 Some(DataType::Object) => {
-                    let value = raw_json(message.payload)?;
+                    let value = raw_json(payload)?;
                     if !value.is_object() {
                         return Err(Error::InvalidRecordValue(
                             "object payload_column requires a JSON object".into(),
@@ -67,7 +73,7 @@ pub(crate) fn row(
                     }
                     value
                 }
-                Some(DataType::Any) => raw_json(message.payload)?,
+                Some(DataType::Any) => raw_json(payload)?,
                 _ => {
                     return Err(Error::SchemaMismatch(
                         "raw layout is not initialized".into(),
@@ -80,10 +86,10 @@ pub(crate) fn row(
         }
     };
     if settings.include_metadata {
-        let offset = i64::try_from(message_offset).map_err(|_| {
+        let offset = i64::try_from(offset).map_err(|_| {
             Error::InvalidRecordValue("iggy_offset exceeds the NDJSON signed integer limit".into())
         })?;
-        let micros = i64::try_from(message_timestamp)
+        let micros = i64::try_from(timestamp)
             .map_err(|_| Error::InvalidRecordValue("iggy_timestamp is out of range".into()))?;
         let timestamp = DateTime::<Utc>::from_timestamp_micros(micros)
             .ok_or_else(|| Error::InvalidRecordValue("iggy_timestamp is out of range".into()))?;
@@ -98,20 +104,22 @@ pub(crate) fn row(
             "iggy_timestamp".into(),
             Value::String(timestamp.to_rfc3339_opts(SecondsFormat::Micros, true)),
         );
-        row.insert("iggy_id".into(), Value::String(message_id.to_string()));
+        row.insert("iggy_id".into(), Value::String(id.to_string()));
     }
     if settings.include_headers {
-        let mut headers = Map::new();
-        if let Some(values) = &message_headers {
+        let mut encoded_headers = Map::new();
+        if let Some(values) = &headers {
             for (name, value) in values {
-                let encoded = match value.as_raw() {
-                    Ok(raw) => json!({"data":BASE64.encode(raw), "iggy_header_encoding":"base64"}),
-                    Err(_) => Value::String(value.to_string_value()),
+                let data = HeaderData(value).to_string();
+                let encoded = if JsonHeaderValue(value).data_encoding() == DATA_ENCODING_BASE64 {
+                    json!({"data": data, "iggy_header_encoding": DATA_ENCODING_BASE64})
+                } else {
+                    Value::String(data)
                 };
-                headers.insert(name.to_string_value(), encoded);
+                encoded_headers.insert(HeaderName(name).to_string(), encoded);
             }
         }
-        row.insert("iggy_headers".into(), Value::Object(headers));
+        row.insert("iggy_headers".into(), Value::Object(encoded_headers));
     }
     let row = Value::Object(row);
     validate_numbers(&row)?;

@@ -35,7 +35,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 source_connector!(FlussSource);
@@ -43,6 +43,7 @@ source_connector!(FlussSource);
 const CONNECTOR_NAME: &str = "Apache Fluss source";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_PAUSE_AFTER_FAILED_POLL: Duration = Duration::from_secs(1);
 const LOG_TABLE_TYPE: &str = "log";
 const JSON_PAYLOAD_FORMAT: &str = "json";
@@ -74,6 +75,8 @@ pub struct FlussSourceConfig {
     pub columns: Option<Vec<String>>,
     pub poll_interval: Option<String>,
     pub poll_timeout: Option<String>,
+    /// How long the cluster may take to answer, when the connector opens and while it reads.
+    pub request_timeout: Option<String>,
     pub batch_size: Option<u32>,
     /// Only `json` is accepted today. `arrow_ipc` needs the batch scanner and a different
     /// offset-tracking path, so it is rejected rather than quietly downgraded.
@@ -128,6 +131,15 @@ impl std::fmt::Display for TableIdentity {
             self.database, self.table, self.table_id
         )
     }
+}
+
+/// The scanner and the connection it reads through. The connection is kept for the check that
+/// the cluster still answers.
+struct Reader {
+    connection: FlussConnection,
+    scanner: LogScanner,
+    /// When the cluster last answered that check, or when the reader was made.
+    checked_at: Instant,
 }
 
 /// A batch handed to the runtime and not acknowledged yet, kept with the records it was built
@@ -204,6 +216,7 @@ pub struct FlussSource {
     table_path: TablePath,
     poll_interval: Duration,
     poll_timeout: Duration,
+    request_timeout: Duration,
     /// The most records one scanner poll returns, `batch_size` or the client default.
     max_poll_records: usize,
     include_metadata: bool,
@@ -212,7 +225,7 @@ pub struct FlussSource {
     /// resolve start offsets without it, since starting over from `latest` would skip whatever
     /// arrived after the last acknowledged batch.
     unreadable_state: bool,
-    scanner: Option<LogScanner>,
+    reader: Mutex<Option<Reader>>,
     columns: Vec<mapping::Column>,
     state: Mutex<State>,
     staged: Mutex<Option<StagedBatch>>,
@@ -226,6 +239,11 @@ pub struct FlussSource {
     /// collected, dropping them, so the next poll points it back at the committed offsets
     /// before reading again.
     rewind_required: AtomicBool,
+    /// Set when the cluster did not answer within `request_timeout`. fluss-rs 1.0 puts no
+    /// deadline on a request, so a connection that stays open without answering is never given
+    /// up: the scanner keeps waiting on it and every poll comes back empty. The next poll drops
+    /// the client and connects again at the committed offsets.
+    connection_lost: AtomicBool,
     /// Set when the last scanner poll returned `max_poll_records` records, so more are likely
     /// waiting and the next poll reads without waiting for `poll_interval`.
     full_batch_read: AtomicBool,
@@ -247,7 +265,11 @@ impl std::fmt::Debug for FlussSource {
             .field("poll_timeout", &self.poll_timeout)
             .field("include_metadata", &self.include_metadata)
             .field("columns", &self.columns.len())
-            .field("opened", &self.scanner.is_some())
+            .field("request_timeout", &self.request_timeout)
+            .field(
+                "opened",
+                &self.reader.try_lock().is_ok_and(|reader| reader.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -264,6 +286,12 @@ impl FlussSource {
             config.poll_timeout.as_deref(),
             DEFAULT_POLL_TIMEOUT,
             "poll_timeout",
+            id,
+        );
+        let request_timeout = parse_duration(
+            config.request_timeout.as_deref(),
+            DEFAULT_REQUEST_TIMEOUT,
+            "request_timeout",
             id,
         );
         let max_poll_records = config.batch_size.map_or_else(
@@ -293,16 +321,18 @@ impl FlussSource {
             table_path,
             poll_interval,
             poll_timeout,
+            request_timeout,
             max_poll_records,
             include_metadata,
             verbose_logging,
             unreadable_state,
-            scanner: None,
+            reader: Mutex::new(None),
             columns: Vec::new(),
             state: Mutex::new(restored_state.unwrap_or_default()),
             staged: Mutex::new(None),
             replay: Mutex::new(None),
             rewind_required: AtomicBool::new(false),
+            connection_lost: AtomicBool::new(false),
             full_batch_read: AtomicBool::new(false),
             start_offsets_unsaved: AtomicBool::new(false),
         }
@@ -310,13 +340,16 @@ impl FlussSource {
 
     /// After a failed poll `poll()` waits at least [`MIN_PAUSE_AFTER_FAILED_POLL`]. The SDK
     /// polls again as soon as `poll()` returns an error, so with a zero `poll_interval` an error
-    /// that repeats, such as an offset out of range, would be retried at network speed.
+    /// that repeats, such as an offset out of range or a cluster that cannot be reached again,
+    /// would be retried at network speed.
     ///
     /// After a full batch it reads again at once, since waiting `poll_interval` between full
     /// batches would cap the source at `batch_size` rows per interval. An idle table still
     /// waits on the server for up to `poll_timeout`.
     fn pause_before_poll(&self) -> Duration {
-        if self.rewind_required.load(Ordering::Acquire) {
+        if self.rewind_required.load(Ordering::Acquire)
+            || self.connection_lost.load(Ordering::Acquire)
+        {
             self.poll_interval.max(MIN_PAUSE_AFTER_FAILED_POLL)
         } else if self.full_batch_read.load(Ordering::Acquire) {
             Duration::ZERO
@@ -410,6 +443,13 @@ impl FlussSource {
         if self.poll_interval.is_zero() && self.poll_timeout.is_zero() {
             return Err(Error::InitError(format!(
                 "poll_interval and poll_timeout for {CONNECTOR_NAME} cannot both be zero"
+            )));
+        }
+
+        // A zero limit would count every request as unanswered.
+        if self.request_timeout.is_zero() {
+            return Err(Error::InitError(format!(
+                "request_timeout for {CONNECTOR_NAME} must be greater than 0"
             )));
         }
 
@@ -603,23 +643,49 @@ impl FlussSource {
         Ok(Some((candidate, persisted)))
     }
 
-    /// Reads the next records, first pointing the scanner back at the committed offsets if its
-    /// last poll failed. A failed poll can drop records it already collected, either when a later
-    /// fetch in the same poll fails or when sending the next fetches fails. The rewind is safe in
-    /// both cases: the scanner never fetches a bucket that still has buffered records, and sends
-    /// nothing between collecting them and failing, so no fetch is in flight for those buckets.
-    async fn read(&self, scanner: &LogScanner) -> Result<ScanRecords, Error> {
+    /// Reads the next records, first connecting again if the cluster stopped answering, and
+    /// pointing the scanner back at the committed offsets if its last poll failed. A failed poll
+    /// can drop records it already collected, either when a later fetch in the same poll fails
+    /// or when sending the next fetches fails. The rewind is safe in both cases: the scanner
+    /// never fetches a bucket that still has buffered records, and sends nothing between
+    /// collecting them and failing, so no fetch is in flight for those buckets.
+    async fn read(&self) -> Result<ScanRecords, Error> {
+        let mut reader = self.reader.lock().await;
+        if self.connection_lost.load(Ordering::Acquire) {
+            // Dropped before connecting, so a failed attempt does not leave the old client in
+            // place. Its fetch tasks stay parked on the silent connections.
+            *reader = None;
+            *reader = Some(self.connect_again().await?);
+            self.connection_lost.store(false, Ordering::Release);
+            self.rewind_required.store(false, Ordering::Release);
+            info!(
+                "{CONNECTOR_NAME} connector with ID: {} connected again and reads on from the \
+                 last acknowledged offsets",
+                self.id
+            );
+        }
+        let Some(reader) = reader.as_mut() else {
+            return Err(Error::InitError(format!(
+                "{CONNECTOR_NAME} connector with ID: {} polled before it was opened",
+                self.id
+            )));
+        };
+        self.ensure_cluster_answers(reader).await?;
+
         if self.rewind_required.load(Ordering::Acquire) {
             let committed = { self.state.lock().await.bucket_offsets.clone() };
-            scanner
-                .subscribe_buckets(&committed)
-                .await
-                .map_err(|error| {
-                    Error::Connection(format!(
-                        "failed to rewind the Apache Fluss scanner to the last acknowledged \
-                         offsets: {error}"
-                    ))
-                })?;
+            self.answered(
+                "the rewind of its scanner",
+                self.request_timeout,
+                reader.scanner.subscribe_buckets(&committed),
+            )
+            .await?
+            .map_err(|error| {
+                Error::Connection(format!(
+                    "failed to rewind the Apache Fluss scanner to the last acknowledged \
+                     offsets: {error}"
+                ))
+            })?;
             self.rewind_required.store(false, Ordering::Release);
             info!(
                 "{CONNECTOR_NAME} connector with ID: {} rewound its scanner to the last \
@@ -628,9 +694,118 @@ impl FlussSource {
             );
         }
 
-        scanner.poll(self.poll_timeout).await.map_err(|error| {
+        // An idle table answers after `poll_timeout`, so the limit starts where that ends.
+        self.answered(
+            "a poll",
+            self.poll_timeout + self.request_timeout,
+            reader.scanner.poll(self.poll_timeout),
+        )
+        .await?
+        .map_err(|error| {
             self.rewind_required.store(true, Ordering::Release);
             Error::Connection(format!("failed to poll Apache Fluss: {error}"))
+        })
+    }
+
+    /// Waits for `call` up to `limit`. Past it the cluster counts as lost, and the next poll
+    /// connects again.
+    async fn answered<T>(
+        &self,
+        request: &str,
+        limit: Duration,
+        call: impl Future<Output = T>,
+    ) -> Result<T, Error> {
+        timeout(limit, call).await.map_err(|_| {
+            self.connection_lost.store(true, Ordering::Release);
+            Error::Connection(format!(
+                "Apache Fluss did not answer {request} within {limit:?}, so the connector \
+                 connects again"
+            ))
+        })
+    }
+
+    /// Asks every bucket leader for its end offset once per `request_timeout`. The scanner
+    /// cannot tell an idle table from a connection that went silent, since both give empty
+    /// polls, and rows of one bucket can keep arriving while the leader of another is silent.
+    /// A request that fails was answered, or failed on a connection the client replaces by
+    /// itself, so only one that gets no answer counts.
+    async fn ensure_cluster_answers(&self, reader: &mut Reader) -> Result<(), Error> {
+        if reader.checked_at.elapsed() < self.request_timeout {
+            return Ok(());
+        }
+        let buckets: Vec<i32> = {
+            let state = self.state.lock().await;
+            state.bucket_offsets.keys().copied().collect()
+        };
+        let checked = self
+            .answered(
+                "a request for its end offsets",
+                self.request_timeout,
+                async {
+                    let admin = reader.connection.get_admin()?;
+                    admin
+                        .list_offsets(&self.table_path, &buckets, OffsetSpec::Latest)
+                        .await
+                },
+            )
+            .await?;
+        if let Err(error) = checked {
+            warn!(
+                "{CONNECTOR_NAME} connector with ID: {} could not read the end offsets of table \
+                 '{}': {error}",
+                self.id, self.table_path
+            );
+        }
+        reader.checked_at = Instant::now();
+        Ok(())
+    }
+
+    /// Builds a new client and subscribes it at the committed offsets. The columns chosen by
+    /// `open()` stay in use, so the table has to be the one it opened, with those columns still
+    /// in place. A column added since then stays out, as it does without a reconnect.
+    async fn connect_again(&self) -> Result<Reader, Error> {
+        let limit = self.request_timeout;
+        timeout(limit, self.connect_at_committed_offsets())
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::Connection(format!(
+                    "Apache Fluss did not answer within {limit:?} while the connector connected \
+                     again"
+                )))
+            })
+    }
+
+    async fn connect_at_committed_offsets(&self) -> Result<Reader, Error> {
+        let connection = FlussConnection::new(self.client_config())
+            .await
+            .map_err(connection_error)?;
+        let (committed, opened_table) = {
+            let state = self.state.lock().await;
+            (state.bucket_offsets.clone(), state.table.clone())
+        };
+        let scanner = {
+            let table = connection
+                .get_table(&self.table_path)
+                .await
+                .map_err(connection_error)?;
+            let table_info = table.get_table_info();
+            ensure_same_table(
+                opened_table.as_ref(),
+                &TableIdentity::new(&self.table_path, table_info.get_table_id()),
+            )?;
+            ensure_same_columns(&self.columns, table_info.get_row_type(), &self.table_path)?;
+            table.new_scan().create_log_scanner().map_err(|error| {
+                Error::Connection(format!("failed to create log scanner: {error}"))
+            })?
+        };
+        scanner
+            .subscribe_buckets(&committed)
+            .await
+            .map_err(connection_error)?;
+        Ok(Reader {
+            connection,
+            scanner,
+            checked_at: Instant::now(),
         })
     }
 
@@ -747,9 +922,12 @@ impl FlussSource {
             state.table = Some(table);
         }
 
-        // The scanner holds its own handles to the client, so the connection is not kept.
         self.columns = columns;
-        self.scanner = Some(scanner);
+        *self.reader.get_mut() = Some(Reader {
+            connection,
+            scanner,
+            checked_at: Instant::now(),
+        });
 
         info!(
             "Opened {CONNECTOR_NAME} connector with ID: {}, table: {}, buckets: {bucket_count}, \
@@ -766,7 +944,14 @@ impl FlussSource {
 #[async_trait]
 impl Source for FlussSource {
     async fn open(&mut self) -> Result<(), Error> {
-        let opened = self.open_inner().await;
+        // Without the limit a server that accepts the connection and never answers would keep
+        // `open()`, and with it the start of the whole runtime, waiting forever.
+        let limit = self.request_timeout;
+        let opened = timeout(limit, self.open_inner()).await.unwrap_or_else(|_| {
+            Err(Error::Connection(format!(
+                "Apache Fluss did not answer within {limit:?}"
+            )))
+        });
         // The SDK reports only whether `open` failed and the runtime records a generic
         // "Plugin initialization failed", so the reason reaches the operator through this log.
         if let Err(error) = &opened {
@@ -785,13 +970,7 @@ impl Source for FlussSource {
         let records = match replayed {
             Some(records) => records,
             None => {
-                let Some(scanner) = self.scanner.as_ref() else {
-                    return Err(Error::InitError(format!(
-                        "{CONNECTOR_NAME} connector with ID: {} polled before it was opened",
-                        self.id
-                    )));
-                };
-                let records = self.read(scanner).await?;
+                let records = self.read().await?;
                 self.full_batch_read
                     .store(records.count() >= self.max_poll_records, Ordering::Release);
                 records
@@ -858,8 +1037,8 @@ impl Source for FlussSource {
 
     async fn close(&mut self) -> Result<(), Error> {
         // `FlussConnection::close` only drains the writer client, which a source never creates,
-        // so dropping the scanner is what releases the client.
-        self.scanner = None;
+        // so dropping the scanner and the connection is what releases the client.
+        *self.reader.get_mut() = None;
         let state = self.state.lock().await;
         info!(
             "Closed {CONNECTOR_NAME} connector with ID: {}, total messages produced: {}, rows \
@@ -939,6 +1118,28 @@ fn ensure_same_table(saved: Option<&TableIdentity>, current: &TableIdentity) -> 
     }
 }
 
+/// Rows are decoded by the positions and types the columns had when the connector opened, so a
+/// scanner made later is only usable while each of them is still there.
+fn ensure_same_columns(
+    opened: &[mapping::Column],
+    current: &RowType,
+    table_path: &TablePath,
+) -> Result<(), Error> {
+    let fields = current.fields();
+    match opened.iter().find(|column| {
+        fields.get(column.position()).is_none_or(|field| {
+            field.name() != column.field().name() || field.data_type() != column.field().data_type()
+        })
+    }) {
+        Some(column) => Err(Error::InitError(format!(
+            "column '{}' of table '{table_path}' changed since the connector opened. Restart the \
+             connector to read the table as it is now",
+            column.field().name()
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// `include_metadata` writes its fields into the same object as the columns, so a column under
 /// the reserved prefix would be overwritten.
 fn ensure_no_metadata_collision<'a>(
@@ -964,7 +1165,12 @@ mod tests {
     use fluss::record::{ArrowReader, ChangeType, RowAppendRecordBatchBuilder, ScanRecord};
     use fluss::row::{Date, GenericRow};
     use serde_json::Value;
+    use std::net::TcpListener;
     use std::sync::Arc;
+    use std::thread;
+
+    /// Far past the request timeout under test, so a hang fails the test instead of stalling it.
+    const SILENT_SERVER_LIMIT: Duration = Duration::from_secs(30);
 
     fn test_config() -> FlussSourceConfig {
         FlussSourceConfig {
@@ -976,6 +1182,7 @@ mod tests {
             columns: None,
             poll_interval: Some("100ms".to_owned()),
             poll_timeout: Some("1s".to_owned()),
+            request_timeout: None,
             batch_size: Some(500),
             payload_format: None,
             include_metadata: None,
@@ -1679,6 +1886,17 @@ mod tests {
     }
 
     #[test]
+    fn given_lost_connection_when_poll_interval_is_zero_should_pause_before_connecting_again() {
+        let mut config = test_config();
+        config.poll_interval = Some("0s".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        source.connection_lost.store(true, Ordering::Release);
+
+        assert_eq!(source.pause_before_poll(), MIN_PAUSE_AFTER_FAILED_POLL);
+    }
+
+    #[test]
     fn given_failed_poll_when_poll_interval_is_longer_should_keep_it() {
         let mut config = test_config();
         config.poll_interval = Some("5s".to_owned());
@@ -1768,6 +1986,113 @@ mod tests {
             .expect_err("A tight poll loop should be rejected");
 
         assert!(matches!(error, Error::InitError(message) if message.contains("poll_timeout")));
+    }
+
+    #[test]
+    fn given_zero_request_timeout_should_be_rejected() {
+        let mut config = test_config();
+        config.request_timeout = Some("0s".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        let error = source
+            .validate_config()
+            .expect_err("A limit that no request can meet should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("request_timeout")));
+    }
+
+    #[test]
+    fn given_request_timeout_should_use_it_in_place_of_the_default() {
+        let mut config = test_config();
+        config.request_timeout = Some("45s".to_owned());
+
+        let source = FlussSource::new(1, config, None);
+
+        assert_eq!(source.request_timeout, Duration::from_secs(45));
+    }
+
+    /// The server takes the connection and reads the request, and never writes back.
+    #[test]
+    fn given_server_that_never_answers_should_fail_to_open_after_the_request_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to listen");
+        let port = listener
+            .local_addr()
+            .expect("Failed to read the listener's address")
+            .port();
+        thread::spawn(move || {
+            let mut connections = Vec::new();
+            while let Ok((connection, _)) = listener.accept() {
+                connections.push(connection);
+            }
+        });
+        let mut config = test_config();
+        config.bootstrap_servers = format!("127.0.0.1:{port}");
+        config.request_timeout = Some("300ms".to_owned());
+        let mut source = FlussSource::new(1, config, None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+
+        let opened = runtime.block_on(async { timeout(SILENT_SERVER_LIMIT, source.open()).await });
+
+        let Ok(Err(error)) = opened else {
+            panic!("open() should fail by itself, got {opened:?}");
+        };
+        assert!(
+            matches!(&error, Error::Connection(message) if message.contains("did not answer within 300ms")),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn opened_columns(fields: &[DataField]) -> Vec<mapping::Column> {
+        fields
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(position, field)| mapping::Column::new(position, field))
+            .collect()
+    }
+
+    #[test]
+    fn given_column_added_since_open_should_keep_the_opened_columns_usable() {
+        let table_path = TablePath::new("analytics", "events");
+        let opened = opened_columns(&[field("id"), field("amount")]);
+
+        for current in [
+            RowType::new(vec![field("id"), field("amount")]),
+            RowType::new(vec![field("id"), field("amount"), field("added")]),
+        ] {
+            ensure_same_columns(&opened, &current, &table_path)
+                .expect("The opened columns are still in place");
+        }
+    }
+
+    #[test]
+    fn given_opened_column_that_changed_should_refuse_the_new_scanner() {
+        let table_path = TablePath::new("analytics", "events");
+        let opened = opened_columns(&[field("id"), field("amount")]);
+
+        for (reason, current) in [
+            ("dropped", RowType::new(vec![field("id")])),
+            ("renamed", RowType::new(vec![field("id"), field("total")])),
+            (
+                "of another type",
+                RowType::new(vec![
+                    field("id"),
+                    DataField::new("amount", DataTypes::string(), None),
+                ]),
+            ),
+            (
+                "moved",
+                RowType::new(vec![field("added"), field("id"), field("amount")]),
+            ),
+        ] {
+            let error = ensure_same_columns(&opened, &current, &table_path)
+                .expect_err("A changed column should be refused");
+
+            assert!(
+                matches!(&error, Error::InitError(message) if message.contains("changed since the connector opened")),
+                "column {reason}: unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -2169,6 +2494,7 @@ mod tests {
 
         assert_eq!(source.poll_interval, DEFAULT_POLL_INTERVAL);
         assert_eq!(source.poll_timeout, DEFAULT_POLL_TIMEOUT);
+        assert_eq!(source.request_timeout, DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(
             source.max_poll_records,
             Config::default().scanner_log_max_poll_records

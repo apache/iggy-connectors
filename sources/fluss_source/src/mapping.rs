@@ -69,6 +69,10 @@ impl Column {
     pub(crate) fn field(&self) -> &DataField {
         &self.field
     }
+
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
 }
 
 impl<R: InternalRow + ?Sized> Serialize for JsonRow<'_, R> {

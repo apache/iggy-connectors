@@ -24,8 +24,8 @@ pub use source::{
     FlussSourceOffsetPastTheEndFixture, FlussSourceOutageFixture,
     FlussSourcePartitionedTableFixture, FlussSourcePrimaryKeyTableFixture,
     FlussSourceProjectedFixture, FlussSourceQuickPollFixture, FlussSourceRawStreamFixture,
-    FlussSourceReservedColumnFixture, FlussSourceSaslFixture, FlussSourceSlowPollFixture,
-    FlussSourceSmallBatchFixture, FlussSourceTieredProjectionFixture,
-    FlussSourceUnconvertibleRowFixture, FlussSourceUnreachableFixture,
-    FlussSourceWrongPasswordFixture,
+    FlussSourceReservedColumnFixture, FlussSourceSaslFixture, FlussSourceSilentBootstrapFixture,
+    FlussSourceSilentConnectionFixture, FlussSourceSlowPollFixture, FlussSourceSmallBatchFixture,
+    FlussSourceTieredProjectionFixture, FlussSourceUnconvertibleRowFixture,
+    FlussSourceUnreachableFixture, FlussSourceWrongPasswordFixture,
 };

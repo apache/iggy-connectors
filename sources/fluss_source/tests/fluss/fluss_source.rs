@@ -22,10 +22,10 @@ use crate::fixtures::{
     FlussSourceOffsetPastTheEndFixture, FlussSourceOutageFixture,
     FlussSourcePartitionedTableFixture, FlussSourcePrimaryKeyTableFixture,
     FlussSourceProjectedFixture, FlussSourceQuickPollFixture, FlussSourceRawStreamFixture,
-    FlussSourceReservedColumnFixture, FlussSourceSaslFixture, FlussSourceSlowPollFixture,
-    FlussSourceSmallBatchFixture, FlussSourceTieredProjectionFixture,
-    FlussSourceUnconvertibleRowFixture, FlussSourceUnreachableFixture,
-    FlussSourceWrongPasswordFixture,
+    FlussSourceReservedColumnFixture, FlussSourceSaslFixture, FlussSourceSilentBootstrapFixture,
+    FlussSourceSilentConnectionFixture, FlussSourceSlowPollFixture, FlussSourceSmallBatchFixture,
+    FlussSourceTieredProjectionFixture, FlussSourceUnconvertibleRowFixture,
+    FlussSourceUnreachableFixture, FlussSourceWrongPasswordFixture,
 };
 use iggy::prelude::IggyClient;
 use iggy_common::MessageClient;
@@ -72,6 +72,8 @@ const POLL_FAILURE: &str = "failed to poll Apache Fluss";
 const CLUSTER_UNREACHABLE: &str = "Unable to initialize cluster from bootstrap servers";
 const STATE_SAVE_FAILURE: &str = "Failed to save state for source connector";
 const NACK_LIMIT: &str = "consecutive NACK limit reached";
+const NO_ANSWER: &str = "Apache Fluss did not answer";
+const CONNECTED_AGAIN: &str = "connected again";
 const EARLIEST_OFFSET: i64 = -2;
 
 #[derive(Debug, Deserialize)]
@@ -830,6 +832,20 @@ async fn given_unreachable_cluster_should_fail_to_start_and_log_why(
     assert_fails_to_start(harness, "Apache Fluss client failure", UNREACHABLE_TIMEOUT).await;
 }
 
+/// fluss-rs 1.0 waits for the first answer without a limit, and the runtime opens its
+/// connectors before it serves its API, so the harness starting at all shows that `open()`
+/// came back.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/fluss/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_bootstrap_server_that_never_answers_should_fail_to_start_and_log_why(
+    harness: &TestHarness,
+    _fixture: FlussSourceSilentBootstrapFixture,
+) {
+    assert_fails_to_start(harness, NO_ANSWER, SOURCE_STATUS_TIMEOUT).await;
+}
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/fluss/source.toml")),
     seed = seeds::connector_stream
@@ -917,6 +933,60 @@ async fn given_cluster_outage_when_it_returns_should_resume_without_losing_rows(
         .expect("Failed to append rows");
     let received = into_records(drain_rows(&client, second_payloads.len(), RECOVERY_TIMEOUT).await);
     assert_rows_delivered(&received, &second_payloads, TEST_ROW_COUNT as i64);
+}
+
+/// The connections stay open and nothing comes back on them, as after a server that died
+/// without closing its sockets. The client never gives such a connection up by itself.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/fluss/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_connections_that_go_silent_should_connect_again_and_deliver_every_row_once(
+    harness: &TestHarness,
+    fixture: FlussSourceSilentConnectionFixture,
+) {
+    let first_payloads = numbered_payloads("before-silence", TEST_ROW_COUNT);
+    fixture
+        .append_rows(&first_payloads)
+        .await
+        .expect("Failed to append rows");
+    let client = harness.root_client().await.unwrap();
+    let received = poll_records(&client, first_payloads.len(), POLL_ATTEMPTS).await;
+    assert_rows_delivered(&received, &first_payloads, 0);
+    wait_for_saved_offset(&state_path(harness), 0, TEST_ROW_COUNT as i64).await;
+    let connections_before = fixture.source_connections();
+    assert!(
+        connections_before > 0,
+        "The source should read through the relay"
+    );
+
+    fixture.silence_source_connections();
+    let second_payloads = numbered_payloads("after-silence", TEST_ROW_COUNT);
+    fixture
+        .append_rows(&second_payloads)
+        .await
+        .expect("Failed to append rows");
+
+    wait_for_runtime_log(harness, NO_ANSWER, OUTAGE_TIMEOUT).await;
+    let received = drain_records_and_settle(&client, second_payloads.len(), RECOVERY_TIMEOUT).await;
+    assert_each_row_once(&received, &second_payloads);
+    let offsets: Vec<i64> = received.iter().map(|record| record.offset).collect();
+    let first_new_offset = TEST_ROW_COUNT as i64;
+    assert_eq!(
+        offsets,
+        (first_new_offset..first_new_offset + TEST_ROW_COUNT as i64).collect::<Vec<_>>(),
+        "The source should read on from the last acknowledged offset"
+    );
+    assert!(runtime_log(harness).contains(CONNECTED_AGAIN));
+    assert!(
+        fixture.source_connections() > connections_before,
+        "The rows should arrive on new connections"
+    );
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    wait_for_source_status(&Client::new(), &api_url, ConnectorStatus::Running).await;
 }
 
 /// The README says a column added after startup stays out of the output until the connector

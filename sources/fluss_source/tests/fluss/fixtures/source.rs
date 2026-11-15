@@ -18,9 +18,10 @@
 use super::container::{
     ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_BOOTSTRAP_SERVERS, ENV_SOURCE_COLUMNS, ENV_SOURCE_DATABASE,
     ENV_SOURCE_INCLUDE_METADATA, ENV_SOURCE_PATH, ENV_SOURCE_POLL_INTERVAL,
-    ENV_SOURCE_POLL_TIMEOUT, ENV_SOURCE_SASL_PASSWORD, ENV_SOURCE_SASL_USERNAME,
-    ENV_SOURCE_STARTING_OFFSET, ENV_SOURCE_STREAMS_0_SCHEMA, ENV_SOURCE_STREAMS_0_STREAM,
-    ENV_SOURCE_STREAMS_0_TOPIC, ENV_SOURCE_TABLE, FlussContainer, reserve_host_ports,
+    ENV_SOURCE_POLL_TIMEOUT, ENV_SOURCE_REQUEST_TIMEOUT, ENV_SOURCE_SASL_PASSWORD,
+    ENV_SOURCE_SASL_USERNAME, ENV_SOURCE_STARTING_OFFSET, ENV_SOURCE_STREAMS_0_SCHEMA,
+    ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC, ENV_SOURCE_TABLE, FlussContainer,
+    reserve_host_ports, start_silent_server,
 };
 use async_trait::async_trait;
 use fluss::client::FlussConnection;
@@ -48,6 +49,7 @@ const SLOW_POLL_INTERVAL: &str = "5s";
 const UNHURRIED_POLL_INTERVAL: &str = "2s";
 const NO_POLL_INTERVAL: &str = "0s";
 const QUICK_POLL_TIMEOUT: &str = "200ms";
+const SHORT_REQUEST_TIMEOUT: &str = "2s";
 const EXISTING_ROW_COUNT: usize = 3;
 const BUCKET_COUNT: i32 = 3;
 const SMALL_BATCH_SIZE: usize = 7;
@@ -517,7 +519,14 @@ impl TestFixture for FlussSourceOutageFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.inner.connectors_runtime_envs()
+        // Short, so the source asks for the end offsets several times while the cluster is
+        // down and those failed requests are part of what the test recovers from.
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(
+            ENV_SOURCE_REQUEST_TIMEOUT.to_string(),
+            SHORT_REQUEST_TIMEOUT.to_string(),
+        );
+        envs
     }
 }
 
@@ -901,6 +910,88 @@ impl TestFixture for FlussSourceUnreachableFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         source_envs(&self.bootstrap_servers)
+    }
+}
+
+/// Points the source at an address that takes its connection and never answers.
+pub struct FlussSourceSilentBootstrapFixture {
+    bootstrap_servers: String,
+}
+
+#[async_trait]
+impl TestFixture for FlussSourceSilentBootstrapFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            bootstrap_servers: start_silent_server()?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = source_envs(&self.bootstrap_servers);
+        envs.insert(
+            ENV_SOURCE_REQUEST_TIMEOUT.to_string(),
+            SHORT_REQUEST_TIMEOUT.to_string(),
+        );
+        envs
+    }
+}
+
+/// The source reaches the cluster through a relay, so a test can silence the connections it
+/// reads on. The fixture's own client goes to the cluster directly and keeps working.
+pub struct FlussSourceSilentConnectionFixture {
+    inner: FlussSourceFixture,
+}
+
+impl FlussSourceSilentConnectionFixture {
+    /// Leaves the connections of the source open and stops everything on them.
+    pub fn silence_source_connections(&self) {
+        if let Some(relay) = self.inner.container.relay() {
+            relay.silence_connections();
+        }
+    }
+
+    /// How many connections the source made so far.
+    pub fn source_connections(&self) -> u64 {
+        self.inner
+            .container
+            .relay()
+            .map_or(0, |relay| relay.connections())
+    }
+}
+
+impl Deref for FlussSourceSilentConnectionFixture {
+    type Target = FlussSourceFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl TestFixture for FlussSourceSilentConnectionFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let inner = FlussSourceFixture {
+            container: FlussContainer::start_behind_relay().await?,
+            sasl_user: None,
+        };
+        inner
+            .create_table_when_ready(events_schema, TableLayout::default())
+            .await?;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let bootstrap_servers = self
+            .inner
+            .container
+            .relayed_bootstrap_servers()
+            .unwrap_or(&self.inner.container.bootstrap_servers);
+        let mut envs = source_envs(bootstrap_servers);
+        envs.insert(
+            ENV_SOURCE_REQUEST_TIMEOUT.to_string(),
+            SHORT_REQUEST_TIMEOUT.to_string(),
+        );
+        envs
     }
 }
 

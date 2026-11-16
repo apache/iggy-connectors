@@ -128,6 +128,15 @@ disagree with new ones. The checksum, origin timestamp
 and headers have independent inclusion flags. `iggy_headers` is omitted when
 headers are absent or empty. Non-raw headers are strings, including numeric and
 boolean values; raw headers use `{"data":"AQID","iggy_header_encoding":"base64"}`.
+A string value that is not valid UTF-8 is written with replacement characters.
+
+A string header key keeps its own name. A string key that starts with `~`
+becomes `~string:<key>`, a string key that is not valid UTF-8 becomes
+`~string_b64:<base64url>`, and a key of any other kind becomes
+`~<kind>:<value>`, for example `~int32:1` or `~raw:AQI`. Quote such names in
+SurrealQL, for example ``iggy_headers.`~int32:1` ``. Earlier versions named a
+non-string key by its string form, so that `1` and `"1"` collided and raw keys
+used Rust Debug text.
 
 Partition IDs, offsets, timestamps and checksums are strings. Timestamps retain
 Iggy's microsecond values. Record keys encode stream/topic UTF-8 bytes as hex,

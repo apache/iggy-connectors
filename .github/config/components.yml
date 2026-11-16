@@ -95,5 +95,6 @@ components:
       - "sdk/**"
       - ".dockerignore"
       - ".github/actions/utils/docker-buildx/**"
+      - "scripts/ci/runtime-image-smoke.sh"
     tasks:
       - "build-image"

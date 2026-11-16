@@ -78,8 +78,9 @@ The [README of the Iggy Rust client SDK](https://github.com/apache/iggy/blob/mas
 ## Sink delivery guarantees
 
 A sink delivers at most once by default: the offset of a poll is stored when the
-server answers it, so a batch that the plugin fails to write is lost. A
-`[delivery]` table makes a sink deliver at least once:
+server answers it, so a batch that the plugin fails to write is lost. A message
+whose user headers do not decode goes to the plugin without its user headers and
+counts an error. A `[delivery]` table makes a sink deliver at least once:
 
 ```toml
 [delivery]
@@ -129,8 +130,11 @@ At least once, the runtime behaves as follows:
   it as delivered.
 - A message that the runtime cannot decode, transform or serialize also stops
   the sink, unless `invalid_messages = "skip"`, which skips it with an error
-  count and its offset in the log. A message that a transform filters counts as
-  delivered.
+  count and its offset in the log. A message whose user headers do not decode,
+  for example a header kind that this runtime does not know, also stops the
+  sink. With `invalid_messages = "skip"`, the runtime delivers it without its
+  user headers and counts an error. A message that a transform filters counts
+  as delivered.
 - A partition whose next message no longer exists, after a new partition
   history, stops the sink instead of skipping ahead. Move the stored offset to
   resume.

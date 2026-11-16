@@ -192,11 +192,13 @@ A `Sink` implementation uses the `sink_connector!` macro, which exposes the FFI 
 | [InfluxDB](sinks/influxdb_sink/README.md)           | InfluxDB V2 and V3, as line-protocol points                             |
 | [Meilisearch](sinks/meilisearch_sink/README.md)     | a Meilisearch index                                                     |
 | [MongoDB](sinks/mongodb_sink/README.md)             | a MongoDB collection                                                    |
+| [OTLP](sinks/otlp_sink/README.md)                   | OpenTelemetry backends, as OTLP log records over HTTP                   |
 | [PostgreSQL](sinks/postgres_sink/README.md)         | PostgreSQL tables                                                       |
 | [Quickwit](sinks/quickwit_sink/README.md)           | a Quickwit index                                                        |
 | [RabbitMQ](sinks/rabbitmq_sink/README.md)           | RabbitMQ exchanges, through AMQP 0.9.1                                  |
 | [Amazon Redshift](sinks/redshift_sink/README.md)    | Redshift tables, with Parquet files in S3 as the staging area           |
 | [Amazon S3](sinks/s3_sink/README.md)                | Amazon S3 and S3-compatible stores (MinIO, R2, B2, DigitalOcean Spaces) |
+| [ScopeDB](sinks/scopedb_sink/README.md)             | ScopeDB tables, with mapped columns or raw payloads                     |
 | [Stdout](sinks/stdout_sink/README.md)               | the standard output, for debugging and development                      |
 | [SurrealDB](sinks/surrealdb_sink/README.md)         | SurrealDB, with deterministic record IDs for an idempotent replay       |
 

@@ -129,7 +129,9 @@ Each line:
 ```
 
 Both JSON formats wrap the payload under `payload`, including when metadata is disabled. JSON values retain their shape; text variants become strings, and Proto variants become the JSON document they hold when the text parses as JSON (the descriptor-less `proto_convert` fallback) or a string otherwise. Valid JSON raw bytes are parsed; other raw bytes, Avro and FlatBuffer variants become base64 strings without an encoding tag.
-Metadata timestamps use UTC second precision; IDs, checksums and origin timestamps are omitted. Headers are independent of metadata: strings remain strings, raw values become base64, booleans remain booleans, supported numeric values become JSON numbers, and other values use strings.
+Metadata timestamps use UTC second precision; IDs, checksums and origin timestamps are omitted. Headers are independent of metadata: strings remain strings, raw values become base64, booleans remain booleans, supported numeric values become JSON numbers, and other values use strings. A string value that is not valid UTF-8 is written with replacement characters.
+
+A string header key keeps its own name. A string key that starts with `~` becomes `~string:<key>`, a string key that is not valid UTF-8 becomes `~string_b64:<base64url>`, and a key of any other kind becomes `~<kind>:<value>`, for example `~int32:1` or `~raw:AQI`. Earlier versions wrote every non-string key as `""`, so that only the last one survived. Generated names in base64url can differ only by case, so readers that fold case, such as Athena, can merge them.
 
 Raw output concatenates payload bytes without delimiters and ignores both inclusion flags. Use `schema = "raw"` without payload-changing transforms to preserve original bytes; JSON decoding followed by raw output can reserialize the payload.
 

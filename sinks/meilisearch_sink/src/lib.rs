@@ -17,10 +17,11 @@
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
-use iggy_common::IggyTimestamp;
+use iggy_common::{HeaderKey, HeaderValue, IggyTimestamp};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
+    ConsumedMessage, Error, HeaderName, MessagesMetadata, Payload, Sink, TopicMetadata,
     convert::owned_value_into_serde_json,
+    headers::{DATA_ENCODING_BASE64, HeaderData, JsonHeaderValue},
     retry::{parse_duration, retry_backoff},
     sink_connector,
 };
@@ -37,7 +38,7 @@ use meilisearch_sdk::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::{cmp, future::Future, net::IpAddr, time::Duration};
+use std::{cmp, collections::BTreeMap, future::Future, net::IpAddr, time::Duration};
 use tokio::{
     sync::Mutex,
     time::{Instant, sleep},
@@ -438,10 +439,8 @@ impl MeilisearchSink {
                 "iggy_ingested_at",
                 Value::from(IggyTimestamp::now().as_millis() as i64),
             );
-            if let Some(headers) = &headers
-                && let Ok(headers_value) = serde_json::to_value(headers)
-            {
-                upsert_metadata_field(&mut document, "iggy_headers", headers_value);
+            if let Some(headers) = headers.as_ref().filter(|headers| !headers.is_empty()) {
+                upsert_metadata_field(&mut document, "iggy_headers", headers_document(headers));
             }
         }
 
@@ -929,6 +928,26 @@ fn generated_document_id_from_parts(
     Ok(format!("iggy_{encoded}"))
 }
 
+/// User headers as one object, named by `HeaderName`. A text or typed value is
+/// a plain string, so that Meilisearch can filter on it. A raw value, or a
+/// string value that is not valid UTF-8, is `{"data", "iggy_header_encoding"}`
+/// with standard base64, the same shape as the HTTP sink.
+fn headers_document(headers: &BTreeMap<HeaderKey, HeaderValue>) -> Value {
+    let object = headers
+        .iter()
+        .map(|(key, value)| {
+            let data = HeaderData(value).to_string();
+            let value = if JsonHeaderValue(value).data_encoding() == DATA_ENCODING_BASE64 {
+                json!({"data": data, "iggy_header_encoding": ENCODING_BASE64})
+            } else {
+                Value::String(data)
+            };
+            (HeaderName(key).to_string(), value)
+        })
+        .collect();
+    Value::Object(object)
+}
+
 fn upsert_metadata_field(object: &mut Map<String, Value>, field: &str, value: Value) {
     if object.insert(field.to_string(), value).is_some() {
         debug!(
@@ -1104,6 +1123,7 @@ fn map_sdk_error(error: MeilisearchSdkError) -> Error {
 mod tests {
     use super::*;
     use iggy_connector_sdk::Schema;
+    use iggy_connector_testing::headers::{header_case_map, header_cases};
 
     fn topic_metadata() -> TopicMetadata {
         TopicMetadata {
@@ -1312,6 +1332,94 @@ mod tests {
         assert_eq!(document["iggy_offset"], 11);
         assert_eq!(document["iggy_stream"], "orders.stream");
         assert_eq!(document["iggy_checksum"], "12");
+    }
+
+    #[test]
+    fn writes_shared_header_cases_under_their_names() {
+        let sink = sink_with_config(base_config());
+        let cases = header_cases();
+        let mut message = message(Payload::Json(simd_json::json!({"name": "Alice"})));
+        message.headers = Some(header_case_map());
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("prepare document");
+
+        let headers = document["iggy_headers"]
+            .as_object()
+            .expect("headers are an object");
+        assert_eq!(headers.len(), cases.len());
+        for case in &cases {
+            assert_eq!(
+                headers.get(&case.expected_name),
+                Some(&Value::String(case.label.to_string())),
+                "case {}",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn omits_headers_for_an_empty_header_map() {
+        let sink = sink_with_config(base_config());
+        let mut message = message(Payload::Json(simd_json::json!({"name": "Alice"})));
+        message.headers = Some(BTreeMap::new());
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("prepare document");
+
+        assert!(document.get("iggy_headers").is_none());
+    }
+
+    #[test]
+    fn writes_binary_header_values_as_base64_objects() {
+        let sink = sink_with_config(base_config());
+        let mut message = message(Payload::Json(simd_json::json!({"name": "Alice"})));
+        message.headers = Some(BTreeMap::from([
+            (
+                HeaderKey::try_from("raw").expect("valid key"),
+                HeaderValue::from_raw(iggy_common::HeaderKind::Raw, &[0xfb, 0xff])
+                    .expect("valid value"),
+            ),
+            (
+                HeaderKey::try_from("lossy").expect("valid key"),
+                HeaderValue::from_raw(iggy_common::HeaderKind::String, &[0xff, 0xfe])
+                    .expect("valid value"),
+            ),
+            (
+                HeaderKey::try_from("count").expect("valid key"),
+                HeaderValue::from(3i64),
+            ),
+        ]));
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("prepare document");
+
+        assert_eq!(
+            document["iggy_headers"],
+            json!({
+                "raw": {"data": "+/8=", "iggy_header_encoding": "base64"},
+                "lossy": {"data": "//4=", "iggy_header_encoding": "base64"},
+                "count": "3"
+            })
+        );
+    }
+
+    #[test]
+    fn omits_headers_when_include_metadata_is_false() {
+        let mut config = base_config();
+        config.include_metadata = Some(false);
+        let sink = sink_with_config(config);
+        let mut message = message(Payload::Json(simd_json::json!({"name": "Alice"})));
+        message.headers = Some(header_case_map());
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("prepare document");
+
+        assert!(document.get("iggy_headers").is_none());
     }
 
     #[test]

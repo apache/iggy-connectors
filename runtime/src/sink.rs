@@ -33,19 +33,19 @@ use bytes::Bytes;
 use dlopen2::wrapper::Container;
 use futures::{Stream, StreamExt};
 use iggy::prelude::{
-    Checkpoint, Client, CommitPolicy, IggyClient, IggyConsumer, IggyConsumerState, IggyDuration,
-    IggyError, IggyMessage, NonZeroIggyDuration, PollOptions, PollingStrategy, ReadError,
-    UserClient,
+    Checkpoint, Client, CommitPolicy, HeaderKey, HeaderValue, IggyClient, IggyConsumer,
+    IggyConsumerState, IggyDuration, IggyError, IggyMessage, NonZeroIggyDuration, PollOptions,
+    PollingStrategy, ReadError, UserClient,
 };
 use iggy_connector_sdk::decoders::avro::{AvroConfig, AvroStreamDecoder};
 use iggy_connector_sdk::{
-    DecodedMessage, MessagesMetadata, RawMessage, RawMessages, ReceivedMessage, Schema,
-    StreamDecoder, TopicMetadata,
+    DecodedMessage, MessagesMetadata, RawMessage, RawMessages, Schema, StreamDecoder,
+    TopicMetadata,
     sink::{ConsumeCallback, SinkCallStatus},
     transforms::Transform,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     pin::Pin,
     str::FromStr,
@@ -984,17 +984,7 @@ pub(crate) async fn process_messages(
 ) -> Result<SinkBatchTiming, RuntimeError> {
     let batch_offset = messages.first().map_or(0, |message| message.header.offset);
     let stop_on_invalid = policy == BatchPolicy::AtLeastOnce(InvalidMessages::Stop);
-    let received = messages.into_iter().map(|message| ReceivedMessage {
-        id: message.header.id,
-        offset: message.header.offset,
-        checksum: message.header.checksum,
-        timestamp: message.header.timestamp,
-        origin_timestamp: message.header.origin_timestamp,
-        headers: message.user_headers_map().unwrap_or(None),
-        payload: message.payload.into(),
-    });
-
-    let count = received.len();
+    let count = messages.len();
     // Per-message drops are accumulated and flushed once after the loops to
     // avoid a Family lookup per message under decode/transform/error storms.
     let mut error_count = 0u64;
@@ -1005,18 +995,25 @@ pub(crate) async fn process_messages(
     // stage="decode" / stage="prepare" labels mean the same as the source's.
     let decode_start = Instant::now();
     let mut decoded = Vec::with_capacity(count);
-    for message in received {
-        let payload = match decoder.decode(message.payload) {
+    for message in messages {
+        // Read before the payload moves out, but acted on only after the payload decodes: a
+        // message whose payload fails is dropped anyway, and counting its headers too would
+        // count one message twice.
+        let headers = user_headers(&message);
+        let IggyMessage {
+            header, payload, ..
+        } = message;
+        let payload = match decoder.decode(payload.into()) {
             Ok(payload) => payload,
             Err(error) => {
                 error!(
                     "Failed to decode message payload (id: {}, offset: {}) for sink connector with ID: {plugin_id}. {error}",
-                    message.id, message.offset
+                    header.id, header.offset
                 );
                 error_count += 1;
                 if stop_on_invalid {
                     failure = Some(BatchFailure::invalid(
-                        message.offset,
+                        header.offset,
                         format!("The payload does not decode: {error}"),
                     ));
                     break;
@@ -1024,13 +1021,32 @@ pub(crate) async fn process_messages(
                 continue;
             }
         };
+        let headers = match headers {
+            Ok(headers) => headers,
+            Err(reason) => {
+                // Core already warned about a failed wire check without naming the connector.
+                error!(
+                    "Failed to decode user headers (id: {}, offset: {}) for sink connector with ID: {plugin_id}. {reason}",
+                    header.id, header.offset
+                );
+                error_count += 1;
+                if stop_on_invalid {
+                    failure = Some(BatchFailure::invalid(
+                        header.offset,
+                        format!("The user headers do not decode: {reason}"),
+                    ));
+                    break;
+                }
+                None
+            }
+        };
         decoded.push(DecodedMessage {
-            id: Some(message.id),
-            offset: Some(message.offset),
-            checksum: Some(message.checksum),
-            timestamp: Some(message.timestamp),
-            origin_timestamp: Some(message.origin_timestamp),
-            headers: message.headers,
+            id: Some(header.id),
+            offset: Some(header.offset),
+            checksum: Some(header.checksum),
+            timestamp: Some(header.timestamp),
+            origin_timestamp: Some(header.origin_timestamp),
+            headers,
             payload,
         });
     }
@@ -1242,6 +1258,21 @@ impl BatchFailure {
     }
 }
 
+/// The user headers of `message`, or why they do not decode.
+///
+/// `IggyMessage::user_headers_map` returns `Ok(None)` both for a message without headers and
+/// for headers that fail the wire check, so a declared length tells the two apart.
+fn user_headers(message: &IggyMessage) -> Result<Option<BTreeMap<HeaderKey, HeaderValue>>, String> {
+    match message.user_headers_map() {
+        Ok(None) if message.header.user_headers_length > 0 => Err(format!(
+            "{} bytes of user headers fail the wire check",
+            message.header.user_headers_length
+        )),
+        Ok(headers) => Ok(headers),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Checks the fields a transform may have cleared and serializes the headers, logging the
 /// reason for a message that cannot be handed over.
 fn to_raw_message(
@@ -1374,6 +1405,8 @@ mod tests {
         messages_schema: Schema,
         payloads: Vec<Vec<u8>>,
         offsets: Vec<u64>,
+        /// Postcard-encoded user headers per message, empty when a message has none.
+        headers: Vec<Vec<u8>>,
     }
 
     /// Runs the stub sink fails, keyed by plugin id and matched on the run's
@@ -1407,6 +1440,11 @@ mod tests {
             metadata_schema: metadata.schema,
             messages_schema: raw.schema,
             offsets: raw.messages.iter().map(|message| message.offset).collect(),
+            headers: raw
+                .messages
+                .iter()
+                .map(|message| message.headers.clone())
+                .collect(),
             payloads: raw
                 .messages
                 .into_iter()
@@ -1604,6 +1642,25 @@ mod tests {
         transforms: Vec<Arc<dyn Transform>>,
         messages: Vec<IggyMessage>,
     ) -> (SinkBatchTiming, Arc<Metrics>) {
+        run_with_policy(
+            plugin_id,
+            consume,
+            decoder,
+            transforms,
+            messages,
+            BatchPolicy::AtMostOnce,
+        )
+        .await
+    }
+
+    async fn run_with_policy(
+        plugin_id: u32,
+        consume: ConsumeCallback,
+        decoder: Arc<dyn StreamDecoder>,
+        transforms: Vec<Arc<dyn Transform>>,
+        messages: Vec<IggyMessage>,
+        policy: BatchPolicy,
+    ) -> (SinkBatchTiming, Arc<Metrics>) {
         let metrics = Arc::new(Metrics::init());
         let labels = SinkLabels::new("test_sink");
         let topic_metadata = TopicMetadata {
@@ -1624,7 +1681,7 @@ mod tests {
             &consume,
             &transforms,
             &decoder,
-            BatchPolicy::AtMostOnce,
+            policy,
             &metrics,
             &labels,
         )
@@ -2247,6 +2304,148 @@ mod tests {
             3,
             "one error per failed run"
         );
+    }
+
+    /// A message whose user headers pass the wire check but carry the unknown kind code 99,
+    /// which the domain decode rejects.
+    fn message_with_unknown_header_kind(offset: u64) -> IggyMessage {
+        let headers = vec![99, 1, 0, 0, 0, b'a', 2, 1, 0, 0, 0, b'b'];
+        with_raw_user_headers(test_message(offset, br#"{"id":1}"#.to_vec()), headers)
+    }
+
+    /// A message whose user headers fail the wire check: kind code 0 is reserved.
+    fn message_with_malformed_headers(offset: u64) -> IggyMessage {
+        with_raw_user_headers(test_message(offset, br#"{"id":1}"#.to_vec()), vec![0])
+    }
+
+    fn with_raw_user_headers(mut message: IggyMessage, headers: Vec<u8>) -> IggyMessage {
+        message.header.user_headers_length = headers.len() as u32;
+        message.user_headers = Some(headers.into());
+        message
+    }
+
+    fn valid_headers() -> BTreeMap<HeaderKey, HeaderValue> {
+        BTreeMap::from([(
+            HeaderKey::try_from("a").expect("valid key"),
+            HeaderValue::try_from("b").expect("valid value"),
+        )])
+    }
+
+    fn message_with_valid_headers(offset: u64) -> IggyMessage {
+        let mut message = IggyMessage::builder()
+            .id(u128::from(offset) + 1)
+            .payload(Bytes::from_static(br#"{"id":1}"#))
+            .user_headers(valid_headers())
+            .build()
+            .expect("valid message");
+        message.header.offset = offset;
+        message
+    }
+
+    /// The user headers that the stub sink received, one entry per message.
+    fn delivered_headers(batch: &ConsumedBatch) -> Vec<Option<BTreeMap<HeaderKey, HeaderValue>>> {
+        batch
+            .headers
+            .iter()
+            .map(|bytes| {
+                (!bytes.is_empty())
+                    .then(|| postcard::from_bytes(bytes).expect("headers deserialize"))
+            })
+            .collect()
+    }
+
+    fn undecodable_header_batch() -> Vec<IggyMessage> {
+        vec![
+            message_with_valid_headers(0),
+            message_with_unknown_header_kind(1),
+            message_with_malformed_headers(2),
+        ]
+    }
+
+    #[tokio::test]
+    async fn given_undecodable_user_headers_when_processed_should_deliver_without_them_and_count() {
+        for policy in [
+            BatchPolicy::AtMostOnce,
+            BatchPolicy::AtLeastOnce(InvalidMessages::Skip),
+        ] {
+            let plugin_id = next_plugin_id();
+
+            let (timing, metrics) = run_with_policy(
+                plugin_id,
+                capturing_consume,
+                Schema::Json.decoder(),
+                Vec::new(),
+                undecodable_header_batch(),
+                policy,
+            )
+            .await;
+            let batches = captured(plugin_id);
+
+            assert_eq!(timing.failure, None, "{policy:?}");
+            assert_eq!(batches.len(), 1, "{policy:?}");
+            assert_eq!(batches[0].offsets, vec![0, 1, 2], "{policy:?}");
+            assert_eq!(
+                delivered_headers(&batches[0]),
+                vec![Some(valid_headers()), None, None],
+                "{policy:?}"
+            );
+            assert_eq!(
+                metrics.get_errors("test_sink", ConnectorType::Sink),
+                2,
+                "{policy:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_undecodable_headers_and_payload_when_processed_should_count_one_error() {
+        let plugin_id = next_plugin_id();
+        let mut message = message_with_unknown_header_kind(0);
+        message.payload = Bytes::from_static(b"not json");
+        message.header.payload_length = message.payload.len() as u32;
+
+        let (_, metrics) = run_with(
+            plugin_id,
+            capturing_consume,
+            Schema::Json.decoder(),
+            Vec::new(),
+            vec![message],
+        )
+        .await;
+
+        assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 1);
+        assert!(captured(plugin_id)[0].offsets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_undecodable_user_headers_when_policy_stops_should_end_the_batch_at_the_message()
+    {
+        // Each batch has its first undecodable message at offset 1: an unknown kind code,
+        // then headers that fail the wire check.
+        for messages in [
+            undecodable_header_batch(),
+            vec![
+                test_message(0, br#"{"id":1}"#.to_vec()),
+                message_with_malformed_headers(1),
+            ],
+        ] {
+            let plugin_id = next_plugin_id();
+
+            let (timing, metrics) = run_with_policy(
+                plugin_id,
+                capturing_consume,
+                Schema::Json.decoder(),
+                Vec::new(),
+                messages,
+                BatchPolicy::AtLeastOnce(InvalidMessages::Stop),
+            )
+            .await;
+
+            let failure = timing.failure.expect("the batch must stop");
+            assert_eq!(failure.offset, 1);
+            assert!(captured(plugin_id).is_empty(), "nothing reaches the plugin");
+            assert_eq!(metrics.get_errors("test_sink", ConnectorType::Sink), 1);
+        }
     }
 
     #[tokio::test]

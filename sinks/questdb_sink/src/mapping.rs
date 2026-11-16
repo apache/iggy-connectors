@@ -16,12 +16,12 @@
 // under the License.
 
 use std::borrow::Cow;
+use std::fmt::{self, Write};
+use std::iter;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-
-use iggy_connector_sdk::{ConsumedMessage, Payload};
+use iggy_connector_sdk::headers::{DATA_ENCODING_BASE64, HeaderData, JsonHeaderValue};
+use iggy_connector_sdk::{ConsumedMessage, HeaderName, Payload};
 use questdb::ingress::{Buffer, ColumnName, TimestampMicros, TimestampNanos};
 use simd_json::OwnedValue;
 use simd_json::prelude::{ValueAsArray, ValueAsObject};
@@ -138,6 +138,10 @@ impl TimestampUnit {
 /// from as an ordinary rejection.
 pub(crate) const MAX_NAME_LEN: usize = 127;
 
+/// The longest symbol value, in bytes, that the client encodes. It matches
+/// the client's own limit for a symbol dictionary entry.
+const MAX_SYMBOL_LEN: usize = 1 << 20;
+
 /// How many metadata columns the connector can write itself. The array in
 /// [`Mapping::reserved_columns_with_flags`] is typed with this length, so the
 /// two cannot disagree.
@@ -149,6 +153,12 @@ pub(crate) const STREAM_COLUMN: &str = "iggy_stream";
 pub(crate) const TOPIC_COLUMN: &str = "iggy_topic";
 pub(crate) const PARTITION_COLUMN: &str = "iggy_partition_id";
 pub(crate) const OFFSET_COLUMN: &str = "iggy_offset";
+const HEADER_PREFIX: &str = "header_";
+// The symbol that marks a base64 header value wraps the header column in
+// `iggy_` and `_encoding`. No header key gives a name that starts with
+// `iggy_`, so a key such as `bin_encoding` cannot claim the marker of `bin`.
+const HEADER_ENCODING_PREFIX: &str = "iggy_";
+const HEADER_ENCODING_SUFFIX: &str = "_encoding";
 
 /// Where a rounded integer came from, which decides what the warning tells the
 /// operator to do. An array element and a value past `i64::MAX` have no exact
@@ -378,10 +388,9 @@ impl Mapping {
     ) -> Result<PreparedRow<'m>, RowError> {
         // QuestDB resolves column names case-insensitively, so two fields that
         // differ only in case are one column and the second value would be
-        // dropped without a word. The claimed names are borrowed and compared in
-        // place: a row carries a handful of columns, so scanning that list costs
-        // less than hashing a lowercased copy of every name, and it copies no
-        // name on a path that runs for every field of every row.
+        // dropped without a word. The claimed names are borrowed, then sorted
+        // and compared once the row is complete, so a wide row costs
+        // O(n log n) compares and no name is copied.
         let field_count = fields.map_or(0, |fields| fields.len());
         let header_count = match &message.headers {
             Some(headers) if self.include_headers => headers.len(),
@@ -431,7 +440,17 @@ impl Mapping {
                                 "column {name} is listed in symbol_columns but its value is not a scalar"
                             )));
                         };
-                        self.claim_column(name.as_str(), &mut seen)?;
+                        // The client accepts a longer symbol into the buffer
+                        // and refuses it only when the frame is encoded, which
+                        // loses the whole window instead of this record.
+                        if text.len() > MAX_SYMBOL_LEN {
+                            return Err(RowError::Invalid(format!(
+                                "column {name} is listed in symbol_columns but its value is {} bytes, more than the {MAX_SYMBOL_LEN} bytes a QuestDB symbol can hold",
+                                text.len()
+                            )));
+                        }
+                        validate_name(name)?;
+                        seen.push(name.as_str());
                         row.symbols.push((name.as_str(), text));
                         continue;
                     }
@@ -439,7 +458,8 @@ impl Mapping {
                         // Encoded by omitting the column, so it claims nothing.
                         continue;
                     }
-                    self.claim_column(name.as_str(), &mut seen)?;
+                    validate_name(name)?;
+                    seen.push(name.as_str());
                     row.columns
                         .push((name.as_str(), self.prepare_value(name.as_str(), value)?));
                 }
@@ -453,22 +473,47 @@ impl Mapping {
             && let Some(headers) = message.headers.as_ref()
         {
             for (key, value) in headers {
-                let column = format!("header_{}", key.to_string_value());
-                // `to_string_value` Debug-formats a `Raw` value, which would
-                // store the literal text `b"\x01\x02"`. Base64 keeps the bytes
-                // recoverable, and matches what the HTTP sink writes for that
-                // kind.
-                let text = match value.as_raw() {
-                    Ok(bytes) => BASE64_STANDARD.encode(bytes),
-                    Err(_) => value.to_string_value(),
-                };
-                row.headers.push((column, text));
+                row.headers
+                    .push(PreparedHeader::new(HeaderName(key), JsonHeaderValue(value)));
             }
-            // The prefixed names are owned, so they are claimed from the vector
+            // The prefixed names are owned, so they are claimed from the row
             // that already holds them rather than being built a second time.
-            for (column, _) in &row.headers {
-                self.claim_column(column, &mut seen)?;
+            // `header_column` already replaced every character that the client
+            // refuses, so only the length can still be wrong.
+            for header in &row.headers {
+                for column in header.columns() {
+                    // The rewritten name alone does not lead back to a raw or
+                    // non-UTF-8 key, so the error names the key too.
+                    if let Err(RowError::Invalid(reason)) = validate_name_length(column) {
+                        return Err(RowError::Invalid(format!(
+                            "{reason}{}",
+                            header_keys_of(message, column)
+                        )));
+                    }
+                    seen.push(column);
+                }
             }
+        }
+        if let Some((first, second)) = case_collision(&mut seen) {
+            let columns = if first == second {
+                format!("column {first} is claimed twice")
+            } else {
+                format!(
+                    "columns {first} and {second} collide, because QuestDB matches column names case-insensitively"
+                )
+            };
+            // A header column starts with `header_` and a metadata column with
+            // `iggy_`, so at most one of the two explanations applies.
+            let source = match self
+                .reserved_columns_with_flags()
+                .find(|(reserved, _)| reserved.eq_ignore_ascii_case(first))
+            {
+                Some((reserved, flag)) => format!(
+                    ". The connector writes a metadata column {reserved}, so set {flag} = false or rename the field"
+                ),
+                None => header_keys_of(message, first),
+            };
+            return Err(RowError::Invalid(format!("{columns}{source}")));
         }
 
         // Every QuestDB row needs at least one symbol or column before its
@@ -523,26 +568,10 @@ impl Mapping {
             .filter_map(|(name, flag, included)| included.then_some((name, flag)))
     }
 
-    /// Records that `name` will occupy a column, rejecting a case-insensitive
-    /// collision with one already claimed.
-    fn claim_column<'n>(&self, name: &'n str, seen: &mut Vec<&'n str>) -> Result<(), RowError> {
-        validate_name(name)?;
-        if seen
-            .iter()
-            .any(|claimed| claimed.eq_ignore_ascii_case(name))
-        {
-            return Err(RowError::Invalid(format!(
-                "column {name} collides with another column of this row; QuestDB matches column names case-insensitively"
-            )));
-        }
-        seen.push(name);
-        Ok(())
-    }
-
     /// Turns one JSON value into the column the write pass will set.
     ///
-    /// The caller skips nulls and has already claimed the name, so neither is
-    /// rechecked here.
+    /// The caller skips nulls and validates the name, so neither is rechecked
+    /// here. The caller checks the name for collisions once the row is built.
     fn prepare_value<'v>(
         &self,
         name: &str,
@@ -595,6 +624,12 @@ impl Mapping {
                     source,
                 )))
             }
+            // QuestDB uses `i64::MIN` as the NULL of a `LONG` column, so the
+            // value would land as NULL with no error from the client or the
+            // server.
+            OwnedValue::Static(StaticNode::I64(i64::MIN)) => Err(RowError::Invalid(format!(
+                "column {name} holds the smallest LONG, which QuestDB stores as NULL"
+            ))),
             OwnedValue::Static(StaticNode::I64(number)) => Ok(PreparedValue::I64(*number)),
             // QuestDB has no unsigned 64-bit column, so anything past `i64::MAX`
             // would wrap. A column the operator declared an integer is refused
@@ -617,12 +652,13 @@ impl Mapping {
             // because JSON gives no way to tell `20` from `20.0`. A genuinely
             // fractional value is refused: rounding it would store something the
             // producer did not send, and sending it as a `DOUBLE` would break
-            // the type the declaration pinned. The upper bound is strict:
+            // the type the declaration pinned. Both bounds are strict:
             // `i64::MAX as f64` rounds up to 2^63, which `as i64` would
-            // saturate one short of the value sent.
+            // saturate one short of the value sent, and -2^63 is `i64::MIN`,
+            // which QuestDB stores as NULL.
             OwnedValue::Static(StaticNode::F64(number)) if declared_integer => {
                 let number = *number;
-                if number.fract() == 0.0 && number >= i64::MIN as f64 && number < i64::MAX as f64 {
+                if number.fract() == 0.0 && number > i64::MIN as f64 && number < i64::MAX as f64 {
                     Ok(PreparedValue::I64(number as i64))
                 } else {
                     Err(RowError::Invalid(format!(
@@ -667,11 +703,10 @@ impl Mapping {
     }
 
     fn warn_rounding(&self, name: &str, source: Rounding) {
-        if !self
-            .rounding_warned
-            .flag(source)
-            .swap(true, Ordering::Relaxed)
-        {
+        // The load keeps the flag's cache line shared once the warning fired.
+        // A `swap` on every rounded value would write it from every topic task.
+        let warned = self.rounding_warned.flag(source);
+        if !warned.load(Ordering::Relaxed) && !warned.swap(true, Ordering::Relaxed) {
             warn!(
                 "{CONNECTOR_NAME} ID: {} column {name} holds an integer a DOUBLE cannot carry exactly, so it was rounded; {}. This is reported once per connector for this kind of value.",
                 self.id,
@@ -757,6 +792,13 @@ impl Mapping {
         for (name, text) in &row.symbols {
             buffer.symbol(*name, text.as_ref())?;
         }
+        for column in row
+            .headers
+            .iter()
+            .filter_map(|header| header.encoding.as_deref())
+        {
+            buffer.symbol(column, DATA_ENCODING_BASE64)?;
+        }
 
         if self.include_partition_column {
             buffer.column_i64(PARTITION_COLUMN, i64::from(context.partition_id))?;
@@ -764,8 +806,8 @@ impl Mapping {
         if self.include_offset_column {
             buffer.column_i64(OFFSET_COLUMN, message.offset as i64)?;
         }
-        for (column, text) in &row.headers {
-            buffer.column_str(column.as_str(), text.as_str())?;
+        for header in &row.headers {
+            buffer.column_str(header.column.as_str(), header.text.as_ref())?;
         }
         for (name, value) in &row.columns {
             match value {
@@ -844,8 +886,44 @@ struct PreparedRow<'m> {
     symbols: Vec<(&'m str, Cow<'m, str>)>,
     columns: Vec<(&'m str, PreparedValue<'m>)>,
     payload: Option<Cow<'m, str>>,
-    headers: Vec<(String, String)>,
+    headers: Vec<PreparedHeader<'m>>,
     timestamp: PreparedTimestamp,
+}
+
+/// One header value and the columns it is written to.
+struct PreparedHeader<'m> {
+    column: String,
+    /// The `iggy_header_<name>_encoding` symbol of a base64 value. A base64
+    /// value looks like text, so the symbol records the encoding. A text value
+    /// leaves the symbol NULL, and a table of text headers gains no column.
+    encoding: Option<String>,
+    text: Cow<'m, str>,
+}
+
+impl<'m> PreparedHeader<'m> {
+    fn new(name: HeaderName<'_>, value: JsonHeaderValue<'m>) -> Self {
+        let column = header_column(name);
+        // `HeaderData` writes a valid UTF-8 string value as it is, so only the
+        // other values need a formatted copy, and only they can be base64.
+        let (text, encoding) = match value.0.as_str() {
+            Ok(text) => (Cow::Borrowed(text), None),
+            Err(_) => (
+                Cow::Owned(HeaderData(value.0).to_string()),
+                (value.data_encoding() == DATA_ENCODING_BASE64)
+                    .then(|| format!("{HEADER_ENCODING_PREFIX}{column}{HEADER_ENCODING_SUFFIX}")),
+            ),
+        };
+        Self {
+            column,
+            encoding,
+            text,
+        }
+    }
+
+    /// The value column, then the encoding symbol if there is one.
+    fn columns(&self) -> impl Iterator<Item = &str> {
+        iter::once(self.column.as_str()).chain(self.encoding.as_deref())
+    }
 }
 
 /// A column value in the shape the client's setter takes.
@@ -942,19 +1020,125 @@ fn scalar_to_symbol(value: &OwnedValue) -> Option<Cow<'_, str>> {
     }
 }
 
+/// Two claimed names that differ only in case, if any. Sorting puts such a pair
+/// next to each other, so one pass over neighbors finds it.
+fn case_collision<'n>(seen: &mut [&'n str]) -> Option<(&'n str, &'n str)> {
+    seen.sort_unstable_by(|left, right| {
+        left.bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+            .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
+    });
+    seen.windows(2)
+        .find(|pair| pair[0].eq_ignore_ascii_case(pair[1]))
+        .map(|pair| (pair[0], pair[1]))
+}
+
+/// The column a header is written to: its [`HeaderName`] behind `header_`, with
+/// every character QuestDB refuses in a column name replaced by `_`.
+///
+/// Header keys follow no naming rule, and the MQTT source sets `mqtt.protocol`
+/// on every message, so refusing such a key would reject every record that
+/// carries it. A non-string key's name holds `~` and `:`, which are refused too.
+///
+/// Two names that differ only in a replaced character, or only in case, give
+/// one column, for example `a.b` and `a-b`, or two raw keys whose base64url
+/// differs only in case or in `-` and `_`. In one record that is a collision,
+/// and the row is rejected. Across records the keys share the column.
+///
+/// The name is written straight into the column, so it is not built twice.
+fn header_column(name: HeaderName<'_>) -> String {
+    // Room for the longest marker, `~string_b64:`, and base64's 4/3 growth, so
+    // a key of the common kinds needs no regrowth.
+    let mut column =
+        String::with_capacity(HEADER_PREFIX.len() + 12 + name.0.as_bytes().len() * 4 / 3);
+    column.push_str(HEADER_PREFIX);
+    // `ColumnNameWriter` never fails, so neither does the write.
+    let _ = write!(ColumnNameWriter(&mut column), "{name}");
+    column
+}
+
+/// The header keys whose value column or encoding symbol is `column`, ignoring
+/// case, for the error of a collision. It runs only when the row is rejected.
+fn header_keys_of(message: &ConsumedMessage, column: &str) -> String {
+    let keys: Vec<String> = message
+        .headers
+        .iter()
+        .flatten()
+        .filter(|(key, value)| {
+            let header = PreparedHeader::new(HeaderName(key), JsonHeaderValue(value));
+            header
+                .columns()
+                .any(|name| name.eq_ignore_ascii_case(column))
+        })
+        .map(|(key, _)| HeaderName(key).to_string())
+        .collect();
+    if keys.is_empty() {
+        String::new()
+    } else {
+        format!(", from the header keys {}", keys.join(", "))
+    }
+}
+
+/// Appends text with every character QuestDB refuses replaced by `_`.
+struct ColumnNameWriter<'c>(&'c mut String);
+
+impl fmt::Write for ColumnNameWriter<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0.extend(text.chars().map(|character| {
+            if refused_in_name(character) {
+                '_'
+            } else {
+                character
+            }
+        }));
+        Ok(())
+    }
+}
+
+/// The characters that `ColumnName::new` in questdb-rs refuses.
+fn refused_in_name(character: char) -> bool {
+    matches!(
+        character,
+        '\0'..='\u{000f}'
+            | '\u{007f}'
+            | '\u{feff}'
+            | '?'
+            | '.'
+            | ','
+            | '\''
+            | '"'
+            | '\\'
+            | '/'
+            | ':'
+            | ')'
+            | '('
+            | '+'
+            | '-'
+            | '*'
+            | '%'
+            | '~'
+    )
+}
+
 /// Defers to the client's own character rule so the two cannot drift, and adds
-/// the length limit, which `ColumnName` does not carry: it lives on the buffer,
+/// the length limit.
+fn validate_name(name: &str) -> Result<(), RowError> {
+    validate_name_length(name)?;
+    ColumnName::new(name)
+        .map(|_| ())
+        .map_err(|error| RowError::Invalid(format!("column {name} is not a valid name: {error}")))
+}
+
+/// The length limit, which `ColumnName` does not carry: it lives on the buffer,
 /// so without this an over-long name is only refused once the row is half
 /// written.
-fn validate_name(name: &str) -> Result<(), RowError> {
+fn validate_name_length(name: &str) -> Result<(), RowError> {
     if name.len() > MAX_NAME_LEN {
         return Err(RowError::Invalid(format!(
             "column {name} is longer than the {MAX_NAME_LEN} bytes QuestDB allows"
         )));
     }
-    ColumnName::new(name)
-        .map(|_| ())
-        .map_err(|error| RowError::Invalid(format!("column {name} is not a valid name: {error}")))
+    Ok(())
 }
 
 /// A numeric array shaped for the client, by nesting depth.
@@ -1092,6 +1276,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use iggy::prelude::{HeaderKey, HeaderKind, HeaderValue};
+    use iggy_connector_testing::headers::{LONG_RAW_KEY_CASE, header_cases};
     use questdb::ingress::ProtocolVersion;
 
     use super::*;
@@ -1136,6 +1321,14 @@ mod tests {
             numbers_as_double: true,
             rounding_warned: Default::default(),
         }
+    }
+
+    /// The header column for a literal name, through the same writer as
+    /// `header_columns`, for tests that start from a name rather than a key.
+    fn column_for_name(name: impl fmt::Display) -> String {
+        let mut column = String::from(HEADER_PREFIX);
+        write!(ColumnNameWriter(&mut column), "{name}").unwrap();
+        column
     }
 
     fn context() -> RowContext<'static> {
@@ -1638,6 +1831,34 @@ mod tests {
             .append_row(
                 &mut qwp_buffer(),
                 &json_message(r#"{"region":null,"price":1.0}"#),
+                context(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn given_a_symbol_past_the_client_limit_when_appending_should_reject_the_row() {
+        // The client refuses it only when the frame is encoded, which would
+        // lose every row of the window, so the row is rejected first.
+        let mut mapping = mapping();
+        mapping.symbol_columns.insert("region".to_owned());
+        let payload = |len: usize| format!(r#"{{"region":"{}","price":1.0}}"#, "e".repeat(len));
+
+        let error = mapping
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(&payload(MAX_SYMBOL_LEN + 1)),
+                context(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, RowError::Invalid(reason) if reason.contains("region")),
+            "got {error:?}"
+        );
+        mapping
+            .append_row(
+                &mut qwp_buffer(),
+                &json_message(&payload(MAX_SYMBOL_LEN)),
                 context(),
             )
             .unwrap();
@@ -2184,6 +2405,63 @@ mod tests {
     }
 
     #[test]
+    fn given_the_smallest_long_when_appending_should_reject_the_row() {
+        // QuestDB stores `i64::MIN` in a LONG column as NULL, so the row would
+        // land with the value missing and no error anywhere. Both the integer
+        // literal and the whole float -2^63 reach a LONG column.
+        let mut integer_only = mapping();
+        integer_only.numbers_as_double = false;
+        let mut declared = mapping();
+        declared.integer_columns.insert("count".to_owned());
+        for (mapping, payload) in [
+            (&integer_only, r#"{"count":-9223372036854775808}"#),
+            (&declared, r#"{"count":-9223372036854775808}"#),
+            (&declared, r#"{"count":-9223372036854775808.0}"#),
+        ] {
+            let mut buffer = qwp_buffer();
+            let error = mapping
+                .append_row(&mut buffer, &json_message(payload), context())
+                .unwrap_err();
+            assert!(
+                matches!(error, RowError::Invalid(_)),
+                "{payload}: {error:?}"
+            );
+            assert_eq!(buffer.row_count(), 0, "{payload}");
+        }
+    }
+
+    #[test]
+    fn given_one_above_the_smallest_long_when_appending_should_keep_it() {
+        let mut mapping = mapping();
+        mapping.integer_columns.insert("count".to_owned());
+        let mut buffer = buffer();
+        mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"count":-9223372036854775807}"#),
+                context(),
+            )
+            .unwrap();
+        let line = rendered(&buffer);
+        assert!(line.contains("count=-9223372036854775807i"), "{line}");
+    }
+
+    #[test]
+    fn given_the_smallest_long_when_numbers_are_doubles_should_keep_it_as_a_double() {
+        // A DOUBLE column has its own NULL, NaN, so -2^63 is an ordinary value
+        // there.
+        let mut buffer = buffer();
+        mapping()
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"count":-9223372036854775808}"#),
+                context(),
+            )
+            .unwrap();
+        assert_eq!(buffer.row_count(), 1);
+    }
+
+    #[test]
     fn given_a_float_timestamp_of_2_to_63_when_resolved_should_be_out_of_range() {
         // The same strict bound as the integer column, for the same reason.
         assert_eq!(
@@ -2198,8 +2476,8 @@ mod tests {
 
     #[test]
     fn given_a_raw_header_when_appending_should_write_it_as_base64() {
-        // `to_string_value` Debug-formats a Raw value, which would store the
-        // literal text b"\x01\x02\xff"; base64 keeps the bytes recoverable.
+        // A `VARCHAR` cannot hold arbitrary bytes, so a Raw value is written as
+        // standard base64, which keeps the bytes recoverable.
         let mut mapping = mapping();
         mapping.include_headers = true;
         let mut message = json_message(r#"{"price":1.5}"#);
@@ -2217,6 +2495,8 @@ mod tests {
 
         let line = rendered(&buffer);
         assert!(line.contains("header_bin=\"AQL/\""), "{line}");
+        // The symbol tells a reader that the column holds base64.
+        assert!(line.contains(",iggy_header_bin_encoding=base64 "), "{line}");
     }
 
     #[test]
@@ -2361,26 +2641,52 @@ mod tests {
             .append_row(&mut buffer, &message, context())
             .unwrap();
 
-        assert!(
-            rendered(&buffer).contains("header_source="),
-            "{}",
-            rendered(&buffer)
-        );
+        let line = rendered(&buffer);
+        assert!(line.contains("header_source="), "{line}");
+        // A text value adds no encoding symbol.
+        assert!(!line.contains("_encoding"), "{line}");
     }
 
     #[test]
-    fn given_structureless_payload_with_bad_header_name_when_appending_should_reject_the_row() {
-        // Headers are written for structureless payloads too, so validation
-        // has to reach them on that path as well as the field path.
+    fn given_header_keys_with_refused_characters_when_appending_should_replace_them() {
+        // The MQTT source sets `mqtt.protocol` on every message, so a refused
+        // character must not cost the record. The structureless path is used
+        // because headers are written there too.
         let mut mapping = mapping();
         mapping.include_headers = true;
         let mut message = json_message(r#"{"unused":1}"#);
         message.payload = Payload::Text("body".to_owned());
         let mut headers = BTreeMap::new();
-        headers.insert(
-            HeaderKey::from_raw(HeaderKind::String, b"a.b").unwrap(),
-            HeaderValue::from_raw(HeaderKind::String, b"v").unwrap(),
-        );
+        for key in [b"mqtt.protocol".as_slice(), b"content-type"] {
+            headers.insert(
+                HeaderKey::from_raw(HeaderKind::String, key).unwrap(),
+                HeaderValue::from_raw(HeaderKind::String, b"v").unwrap(),
+            );
+        }
+        message.headers = Some(headers);
+        let mut buffer = buffer();
+
+        mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap();
+
+        let rendered = rendered(&buffer);
+        assert!(rendered.contains("header_mqtt_protocol="), "{rendered}");
+        assert!(rendered.contains("header_content_type="), "{rendered}");
+    }
+
+    #[test]
+    fn given_header_keys_equal_after_replacement_when_appending_should_reject_the_row() {
+        let mut mapping = mapping();
+        mapping.include_headers = true;
+        let mut message = json_message(r#"{"price":1.5}"#);
+        let mut headers = BTreeMap::new();
+        for key in [b"a.b".as_slice(), b"a-b"] {
+            headers.insert(
+                HeaderKey::from_raw(HeaderKind::String, key).unwrap(),
+                HeaderValue::from_raw(HeaderKind::String, b"v").unwrap(),
+            );
+        }
         message.headers = Some(headers);
         let mut buffer = buffer();
 
@@ -2388,8 +2694,197 @@ mod tests {
             .append_row(&mut buffer, &message, context())
             .unwrap_err();
 
-        assert!(matches!(error, RowError::Invalid(_)), "got {error:?}");
+        // The error names the column and both keys, so the operator can find
+        // the producer that sets them.
+        assert!(
+            matches!(&error, RowError::Invalid(reason)
+                if reason.contains("column header_a_b is claimed twice")
+                    && reason.contains("header keys a-b, a.b")),
+            "got {error:?}"
+        );
         assert_eq!(buffer.row_count(), 0);
+    }
+
+    #[test]
+    fn given_a_header_key_ending_in_encoding_when_appending_should_keep_it_apart_from_the_marker() {
+        let mut mapping = mapping();
+        mapping.include_headers = true;
+        let mut message = json_message(r#"{"price":1.5}"#);
+        message.headers = Some(BTreeMap::from([
+            (
+                HeaderKey::try_from("bin").unwrap(),
+                HeaderValue::from_raw(HeaderKind::Raw, &[1, 2, 255]).unwrap(),
+            ),
+            (
+                HeaderKey::try_from("bin_encoding").unwrap(),
+                HeaderValue::from_raw(HeaderKind::String, b"v").unwrap(),
+            ),
+        ]));
+        let mut buffer = buffer();
+
+        mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap();
+
+        // The marker starts with `iggy_`, which no header column does, so the
+        // value of `bin_encoding` and the marker of `bin` get two columns.
+        let line = rendered(&buffer);
+        assert!(line.contains(",iggy_header_bin_encoding=base64"), "{line}");
+        assert!(line.contains("header_bin_encoding=\"v\""), "{line}");
+    }
+
+    #[test]
+    fn given_a_field_named_like_an_encoding_symbol_when_appending_should_name_the_header_key() {
+        let mut mapping = mapping();
+        mapping.include_headers = true;
+        let mut message = json_message(r#"{"iggy_header_bin_encoding":"x"}"#);
+        message.headers = Some(BTreeMap::from([(
+            HeaderKey::try_from("bin").unwrap(),
+            HeaderValue::from_raw(HeaderKind::Raw, &[1, 2, 255]).unwrap(),
+        )]));
+        let mut buffer = buffer();
+
+        let error = mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap_err();
+
+        // `bin` claims the column through its encoding symbol, so the error
+        // names that key.
+        assert!(
+            matches!(&error, RowError::Invalid(reason)
+                if reason.contains("column iggy_header_bin_encoding is claimed twice")
+                    && reason.contains("header keys bin")),
+            "got {error:?}"
+        );
+        assert_eq!(buffer.row_count(), 0);
+    }
+
+    #[test]
+    fn given_a_field_named_like_an_enabled_metadata_column_when_appending_should_name_the_flag() {
+        let mut mapping = mapping();
+        mapping.include_stream_column = true;
+        let mut buffer = buffer();
+
+        let error = mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"iggy_stream":"web"}"#),
+                context(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, RowError::Invalid(reason)
+                if reason.contains("column iggy_stream is claimed twice")
+                    && reason.contains("set include_stream_column = false or rename the field")),
+            "got {error:?}"
+        );
+        assert_eq!(buffer.row_count(), 0);
+    }
+
+    #[test]
+    fn given_shared_header_cases_when_appending_should_name_them_by_header_name() {
+        // The long raw key's name is past the 127 bytes QuestDB allows, so it
+        // is tested on its own below.
+        let cases: Vec<_> = header_cases()
+            .into_iter()
+            .filter(|case| case.label != LONG_RAW_KEY_CASE)
+            .collect();
+        let mut mapping = mapping();
+        mapping.include_headers = true;
+        let mut message = json_message(r#"{"price":1.5}"#);
+        message.headers = Some(
+            cases
+                .iter()
+                .map(|case| (case.key.clone(), case.value.clone()))
+                .collect(),
+        );
+
+        // The QWP buffer matches names without regard to case, as QuestDB
+        // does, so this also proves that no two names collide there.
+        mapping
+            .append_row(&mut qwp_buffer(), &message, context())
+            .expect("the shared cases must not collide");
+
+        let mut buffer = buffer();
+        mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap();
+        let line = rendered(&buffer);
+        for case in &cases {
+            let column = column_for_name(&case.expected_name);
+            assert!(
+                line.contains(&format!("{column}=\"{}\"", case.label)),
+                "{}: {line}",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_header_name_past_the_length_limit_when_appending_should_reject_the_row() {
+        let mut mapping = mapping();
+        mapping.include_headers = true;
+        let mut message = json_message(r#"{"price":1.5}"#);
+        let case = header_cases()
+            .into_iter()
+            .find(|case| case.label == LONG_RAW_KEY_CASE)
+            .unwrap();
+        let key_name = HeaderName(&case.key).to_string();
+        message.headers = Some(BTreeMap::from([(case.key, case.value)]));
+        let mut buffer = qwp_buffer();
+
+        let error = mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap_err();
+
+        // The error names the key as well, because the rewritten column does
+        // not lead back to a raw key.
+        assert!(
+            matches!(&error, RowError::Invalid(reason)
+                if reason.contains("longer than")
+                    && reason.contains(&format!("from the header keys {key_name}"))),
+            "got {error:?}"
+        );
+        assert_eq!(buffer.row_count(), 0);
+    }
+
+    #[test]
+    fn given_a_non_utf8_string_header_value_when_appending_should_write_it_as_base64() {
+        let mut mapping = mapping();
+        mapping.include_headers = true;
+        let mut message = json_message(r#"{"price":1.5}"#);
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            HeaderKey::try_from("lossy").unwrap(),
+            HeaderValue::from_raw(HeaderKind::String, &[0xff, 0xfe]).unwrap(),
+        );
+        message.headers = Some(headers);
+        let mut buffer = buffer();
+
+        mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap();
+
+        let line = rendered(&buffer);
+        assert!(line.contains("header_lossy=\"//4=\""), "{line}");
+        assert!(
+            line.contains(",iggy_header_lossy_encoding=base64 "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn given_every_ascii_character_when_naming_a_header_should_replace_exactly_what_the_client_refuses()
+     {
+        // The client is the authority, so the rule is checked against it one
+        // character at a time: a character it accepts must survive unchanged.
+        for character in (0..=0x7f_u8).map(char::from).chain(['\u{feff}', 'é']) {
+            let refused = ColumnName::new(&format!("a{character}")).is_err();
+            assert_eq!(refused_in_name(character), refused, "{character:?}");
+            let column = column_for_name(character);
+            assert!(ColumnName::new(&column).is_ok(), "{column:?}");
+        }
     }
 
     #[test]

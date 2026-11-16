@@ -104,8 +104,10 @@ const DEFAULT_MAX_FLUSH_BYTES: usize = 1_000_000;
 
 /// Deserialize only. Nothing re-serializes a plugin config, and leaving
 /// `Serialize` off is what keeps `connection_string` unserializable rather than
-/// merely un-serialized.
+/// merely un-serialized. Unknown keys are refused, so a misspelled option
+/// fails the start instead of leaving its default in force.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuestDbSinkConfig {
     /// QuestDB connect string, `ws::` or `wss::`. May carry credentials, so it
     /// is treated as a secret throughout.
@@ -202,9 +204,26 @@ impl QuestDbSink {
                 )));
                 TimestampUnit::default()
             });
-        if timestamp_source == TimestampSource::Payload && config.timestamp_field.is_none() {
-            reject(Error::InvalidConfigValue(
+        match (
+            timestamp_source == TimestampSource::Payload,
+            config.timestamp_field.is_some(),
+        ) {
+            (true, false) => reject(Error::InvalidConfigValue(
                 "timestamp_field is required when timestamp_source is \"payload\"".to_owned(),
+            )),
+            // Setting only the field would keep the other source's time with no
+            // sign that the field was ignored.
+            (false, true) => reject(Error::InvalidConfigValue(
+                "timestamp_field is used only when timestamp_source is \"payload\"".to_owned(),
+            )),
+            _ => {}
+        }
+        // The same holds for a concrete unit. `auto` is the default, and the
+        // example configurations set it with every source, so it stays allowed.
+        if timestamp_source != TimestampSource::Payload && timestamp_unit != TimestampUnit::Auto {
+            reject(Error::InvalidConfigValue(
+                "timestamp_unit other than \"auto\" is used only when timestamp_source is \"payload\""
+                    .to_owned(),
             ));
         }
         // An unset ack level follows the connect string, as in the client: a
@@ -294,15 +313,20 @@ impl QuestDbSink {
             reject(error);
         }
         // Zero would make the chunking loop take nothing on every pass and never
-        // finish, holding the FFI call open for good.
-        let batch_size = nonzero_or_default(
-            id,
+        // finish, holding the FFI call open for good, so it is refused as the
+        // other settings that cannot work are.
+        let mut size = |field: &str, value: Option<usize>, default: usize| {
+            size_or_default(field, value, default).unwrap_or_else(|error| {
+                reject(error);
+                default
+            })
+        };
+        let batch_size = size(
             "batch_size",
             config.batch_size.map(|rows| rows as usize),
             DEFAULT_BATCH_SIZE as usize,
         );
-        let max_flush_bytes = nonzero_or_default(
-            id,
+        let max_flush_bytes = size(
             "max_flush_bytes",
             config.max_flush_bytes,
             DEFAULT_MAX_FLUSH_BYTES,
@@ -452,13 +476,12 @@ impl QuestDbSink {
                             // written are uncounted again rather than reported
                             // as delivered.
                             let discarded = buffer.row_count();
-                            if let Some(range) = MessageRange::of(&messages[window_start..index]) {
+                            if let window @ Some(_) =
+                                MessageRange::of(&messages[window_start..index])
+                            {
                                 error!(
-                                    "{CONNECTOR_NAME} ID: {id} discarded {discarded} unflushed rows after the client refused a designated timestamp, stream: {stream}, topic: {topic}, partition_id: {partition_id}, offsets: [{}, {}], message_ids: [{}, {}]: {error}",
-                                    range.first_offset,
-                                    range.last_offset,
-                                    range.first_id,
-                                    range.last_id
+                                    "{CONNECTOR_NAME} ID: {id} discarded {discarded} unflushed rows after the client refused a designated timestamp, stream: {stream}, topic: {topic}, partition_id: {partition_id}, {}: {error}",
+                                    WindowLabel(window)
                                 );
                             }
                             window_start = index + 1;
@@ -628,15 +651,12 @@ impl QuestDbSink {
             return;
         };
         error!(
-            "{CONNECTOR_NAME} ID: {} {what}: {} messages, stream: {}, topic: {}, partition_id: {partition_id}, offsets: [{}, {}], message_ids: [{}, {}], reason: {reason}",
+            "{CONNECTOR_NAME} ID: {} {what}: {} messages, stream: {}, topic: {}, partition_id: {partition_id}, {}, reason: {reason}",
             self.id,
             range.count,
             topic_metadata.stream,
             topic_metadata.topic,
-            range.first_offset,
-            range.last_offset,
-            range.first_id,
-            range.last_id
+            WindowLabel(Some(range))
         );
     }
 
@@ -1094,15 +1114,14 @@ impl std::io::Write for CappedWriter {
     }
 }
 
-/// The configured size, or the default with a warning when it is zero.
-fn nonzero_or_default(id: u32, field: &str, value: Option<usize>, default: usize) -> usize {
+/// The configured size, or the default when it is unset. Zero is refused.
+fn size_or_default(field: &str, value: Option<usize>, default: usize) -> Result<usize, Error> {
     match value {
-        None => default,
-        Some(0) => {
-            warn!("{field} = 0 for {CONNECTOR_NAME} ID: {id}, defaulting to {default}");
-            default
-        }
-        Some(value) => value,
+        None => Ok(default),
+        Some(0) => Err(Error::InvalidConfigValue(format!(
+            "{field} must be greater than zero"
+        ))),
+        Some(value) => Ok(value),
     }
 }
 
@@ -1230,7 +1249,7 @@ impl MessageRange {
     }
 }
 
-/// The offsets and ids of a flushed window, formatted only when a log line
+/// The offsets and ids of a run of messages, formatted only when a log line
 /// that names them is actually written.
 struct WindowLabel(Option<MessageRange>);
 
@@ -1458,7 +1477,7 @@ fn flush_window(
 /// This line gives an operator the category, the status and the frame range,
 /// also for a retriable rejection, which tells that the server is pushing
 /// back. The count lets a batch fail for a rejection that no `wait` reported.
-fn report_server_rejection(id: u32, rejections: &Arc<AtomicI64>, error: &QwpWsSenderError) {
+fn report_server_rejection(id: u32, rejections: &AtomicI64, error: &QwpWsSenderError) {
     let status = error
         .status
         .map_or_else(|| "none".to_owned(), |status| format!("0x{status:02x}"));
@@ -1837,6 +1856,49 @@ mod tests {
             .consume(&topic_metadata, messages_metadata, Vec::new())
             .await;
         assert!(matches!(result, Err(Error::InitError(_))));
+    }
+
+    #[test]
+    fn given_timestamp_field_with_another_source_when_constructed_should_record_init_error() {
+        for source in ["message", "origin", "server"] {
+            let mut config = config();
+            config.timestamp_source = Some(source.to_owned());
+            config.timestamp_field = Some("event_time".to_owned());
+            let sink = QuestDbSink::new(1, config);
+            assert!(
+                matches!(&sink.init_error, Some(Error::InvalidConfigValue(reason)) if reason.contains("timestamp_field")),
+                "source {source}: got {:?}",
+                sink.init_error
+            );
+        }
+    }
+
+    #[test]
+    fn given_concrete_timestamp_unit_with_another_source_when_constructed_should_record_init_error()
+    {
+        for source in ["message", "origin", "server"] {
+            let mut millis_config = config();
+            millis_config.timestamp_source = Some(source.to_owned());
+            millis_config.timestamp_unit = Some("millis".to_owned());
+            let sink = QuestDbSink::new(1, millis_config);
+            assert!(
+                matches!(&sink.init_error, Some(Error::InvalidConfigValue(reason)) if reason.contains("timestamp_unit")),
+                "source {source}: got {:?}",
+                sink.init_error
+            );
+
+            // `auto` is the default, and the example configurations set it with
+            // every source.
+            let mut auto_config = config();
+            auto_config.timestamp_source = Some(source.to_owned());
+            auto_config.timestamp_unit = Some("auto".to_owned());
+            let sink = QuestDbSink::new(1, auto_config);
+            assert!(
+                sink.init_error.is_none(),
+                "source {source}: got {:?}",
+                sink.init_error
+            );
+        }
     }
 
     #[test]
@@ -2235,23 +2297,22 @@ mod tests {
     }
 
     #[test]
-    fn given_zero_batch_size_when_constructed_should_fall_back_to_default() {
-        // Zero would make the first chunk empty, so the chunking loop would
-        // stop at once and `consume` would drop the whole batch unwritten.
-        let mut config = config();
-        config.batch_size = Some(0);
-        let sink = QuestDbSink::new(1, config);
-        assert_eq!(sink.batch_size, DEFAULT_BATCH_SIZE as usize);
-    }
-
-    #[test]
-    fn given_zero_max_flush_bytes_when_constructed_should_fall_back_to_default() {
-        // Zero would flush after every row, or never, depending on how the
-        // comparison is read. Neither is useful, so it falls back.
-        let mut config = config();
-        config.max_flush_bytes = Some(0);
-        let sink = QuestDbSink::new(1, config);
-        assert_eq!(sink.max_flush_bytes, DEFAULT_MAX_FLUSH_BYTES);
+    fn given_zero_sizes_when_constructed_should_record_init_error() {
+        // A zero batch size would make the chunking loop take nothing on every
+        // pass, and a zero byte bound would flush after every row. Both are
+        // refused at start, as the other settings that cannot work are.
+        let mut zero_batch = config();
+        zero_batch.batch_size = Some(0);
+        let mut zero_bytes = config();
+        zero_bytes.max_flush_bytes = Some(0);
+        for (field, config) in [("batch_size", zero_batch), ("max_flush_bytes", zero_bytes)] {
+            let sink = QuestDbSink::new(1, config);
+            assert!(
+                matches!(&sink.init_error, Some(Error::InvalidConfigValue(reason)) if reason.contains(field)),
+                "{field}: got {:?}",
+                sink.init_error
+            );
+        }
     }
 
     #[test]
@@ -2298,6 +2359,21 @@ mod tests {
         assert!(sink.mapping.symbol_columns.contains("side"));
         assert!(sink.mapping.integer_columns.contains("trade_id"));
         assert!(!sink.mapping.numbers_as_double);
+    }
+
+    #[test]
+    fn given_an_unknown_key_when_deserialized_should_refuse_the_config() {
+        let config = serde_json::json!({
+            "connection_string": "ws::addr=localhost:9000;",
+            "table": "iggy_events",
+            "integer_column": ["trade_id"],
+        });
+        let error = serde_json::from_value::<QuestDbSinkConfig>(config)
+            .expect_err("a misspelled key must not leave its default in force");
+        assert!(
+            error.to_string().contains("integer_column"),
+            "the error must name the key: {error}"
+        );
     }
 
     #[test]

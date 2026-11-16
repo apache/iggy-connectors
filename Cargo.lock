@@ -5992,7 +5992,6 @@ name = "iggy_connector_questdb_sink"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.23.1",
  "bytes",
  "ctor 1.0.13",
  "dtor 1.0.6",

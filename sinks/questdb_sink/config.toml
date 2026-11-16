@@ -43,10 +43,11 @@ table = "iggy_events"
 
 # message | origin | payload | server
 timestamp_source = "message"
-# Required only when timestamp_source = "payload".
+# Required when timestamp_source = "payload", and rejected with any other
+# source.
 # timestamp_field = "event_time"
-# Used only when timestamp_source = "payload", but an invalid value is
-# rejected with any source.
+# Used only when timestamp_source = "payload". A value other than "auto" is
+# rejected with another source, and an invalid value with any source.
 # auto | seconds | millis | micros | nanos
 timestamp_unit = "auto"
 

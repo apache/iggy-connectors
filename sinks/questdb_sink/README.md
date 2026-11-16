@@ -56,16 +56,16 @@ verbose_logging = false
 | `connection_string` | required | QuestDB connect string, `ws::` or `wss::`. Treated as a secret. |
 | `table` | required | Target table. |
 | `timestamp_source` | `message` | `message`, `origin`, `payload`, or `server`. |
-| `timestamp_field` | none | Payload field holding the timestamp. Required when `timestamp_source = "payload"`. |
-| `timestamp_unit` | `auto` | Unit of the payload timestamp: `auto`, `seconds` (`s`), `millis` (`ms`), `micros` (`us`), `nanos` (`ns`). `auto` infers the unit from the magnitude. Used only when `timestamp_source = "payload"`, but an invalid value is rejected with any source. |
-| `symbol_columns` | `[]` | Payload fields stored as `SYMBOL`. A record with an object or array in one of these fields is rejected. |
+| `timestamp_field` | none | Payload field holding the timestamp. Required when `timestamp_source = "payload"`, and rejected with any other source. |
+| `timestamp_unit` | `auto` | Unit of the payload timestamp: `auto`, `seconds` (`s`), `millis` (`ms`), `micros` (`us`), `nanos` (`ns`). `auto` infers the unit from the magnitude. Used only when `timestamp_source = "payload"`. A value other than `auto` is rejected with another source, and an invalid value is rejected with any source. |
+| `symbol_columns` | `[]` | Payload fields stored as `SYMBOL`. A record with an object or array in one of these fields, or with a value longer than 1 MiB, is rejected. |
 | `uuid_columns` | `[]` | Payload fields holding RFC-4122 strings, stored as `UUID`. A record with a non-string value there is rejected. |
 | `integer_columns` | `[]` | Payload fields stored as `LONG`. A fractional, non-numeric or out-of-range value there is rejected. |
 | `include_stream_column` | `true` | Write the stream name as a `SYMBOL` column named `iggy_stream`. |
 | `include_topic_column` | `true` | Write the topic name as a `SYMBOL` column named `iggy_topic`. |
 | `include_partition_column` | `false` | Write the partition as a `LONG` column named `iggy_partition_id`. |
 | `include_offset_column` | `false` | Write the offset as a `LONG` column named `iggy_offset`. |
-| `include_headers` | `false` | Write each header as a `VARCHAR` column named `header_<key>`. Binary header values are base64-encoded. A key that is not a valid QuestDB column name, for example one with `-` or `.` such as `content-type`, rejects the whole record. Rename such headers with a transform. |
+| `include_headers` | `false` | Write each header as a `VARCHAR` column named `header_<name>`, so `content-type` is written to `header_content_type`. See [Headers](#headers). |
 | `ack_level` | `ok` | `ok` waits for the server to accept a flush. `durable` waits for the Enterprise durable ack. If you do not set it and the connect string sets `request_durable_ack=on`, the default is `durable`. |
 | `flush_timeout` | `30s` | How long a flush waits for its ack without progress. `0s` with `ack_level = "ok"` means fire and forget. `0s` is not allowed with `durable`. |
 | `batch_size` | `1000` | Maximum rows per flush. |
@@ -148,9 +148,10 @@ that starts with `QuestDB did not confirm writing`. To recover:
 
 1. Stop the connectors runtime.
 2. Fix the cause, for example the producer or the column type in the table.
-3. Delete the slot directories under `<sf_dir>/<sender_id>-ingest-*/`. This
-   drops every frame that they hold, including the frames of other slots that
-   QuestDB did not acknowledge yet.
+3. Delete the slot directories under `<sf_dir>/<sender_id>-ingest-*/`. If
+   the connect string sets no `sender_id`, it is `default`. This drops every
+   frame that they hold, including the frames of other slots that QuestDB did
+   not acknowledge yet.
 4. Rewind the consumer group of the sink, as
    [Recovery after a host failure](#recovery-after-a-host-failure) describes,
    to the lowest offset in the sink's `QuestDB did not confirm writing` and
@@ -262,9 +263,10 @@ integer_columns = ["trade_id", "event_nanos"]
 
 A whole value written as `20.0` is accepted in an `integer_columns` field. A
 fractional value, a non-number or a value outside the `LONG` range there is
-rejected. When the connector rounds a
-number past 2^53 to a `DOUBLE`, it logs one warning per kind of value with the
-column name.
+rejected. QuestDB stores -9223372036854775808 (`i64::MIN`) in a `LONG` column as
+NULL, so a record with that value in a `LONG` column is rejected too. When the
+connector rounds a number past 2^53 to a `DOUBLE`, it logs one warning per kind
+of value with the column name.
 
 With `numbers_as_double = false`, each value takes its type from its JSON shape:
 integers become `LONG` and fractions `DOUBLE`. Two problems follow:
@@ -281,14 +283,59 @@ table with explicit column types.
 
 An auto-created table names its designated timestamp `timestamp`. A payload
 field with the same name collides with it, and the server rejects the whole
-flush. Rename the field with a transform, or create the table with
-`timestamp(<name>)`. The field named by `timestamp_field` is used only as the
-designated timestamp.
+flush. Create the table first with `timestamp(<name>)` for another column, or
+remove the field with the `delete_fields` transform. The field named by
+`timestamp_field` is used only as the designated timestamp.
 
 `message` and `origin` timestamps are in microseconds, so an auto-created table
 gets a `TIMESTAMP` column. `payload` timestamps are converted to nanoseconds and
 give a `TIMESTAMP_NS` column. With `server`, QuestDB stamps each row on arrival.
 Use one source per table.
+
+### Headers
+
+With `include_headers = true`, each header is written to a `VARCHAR` column
+named `header_<name>`. `<name>` is the `HeaderName` of the key:
+
+- a string key as it is
+- a string key that starts with `~` as `~string:<key>`
+- a string key that is not UTF-8 as `~string_b64:<base64url>`
+- any other kind as `~<kind>:<value>`
+
+Characters that QuestDB refuses in a column name, such as `.`, `-`, `~` and
+`:`, become `_`:
+
+| Key | Column |
+| --- | ------ |
+| string `content-type` | `header_content_type` |
+| string `mqtt.protocol` | `header_mqtt_protocol` |
+| string `1` | `header_1` |
+| integer `1` | `header__int32_1` |
+| string `~note` | `header__string__note` |
+| string bytes `ff fe` | `header__string_b64___4` |
+
+Raw values, and string values that are not UTF-8, are written as standard
+base64. For each such value, the sink also writes the `SYMBOL` column
+`iggy_header_<name>_encoding` with the value `base64`. A text value leaves
+that column NULL, so a table with only text headers has no encoding columns:
+
+```sql
+SELECT header_bin FROM iggy_events WHERE iggy_header_bin_encoding = 'base64';
+```
+
+The encoding column starts with `iggy_`, as the metadata columns do, so no
+header key can write to it. A header key `bin_encoding` next to `bin` gets its
+own column, `header_bin_encoding`.
+
+A name longer than 127 bytes rejects the record, and the encoding column counts
+toward that limit.
+
+Different keys can give the same column name, ignoring case. Examples are
+`a.b` and `a-b`, two raw keys whose base64url differs only in case or in
+`-` and `_`, and keys of different kinds, such as the string key `_int32_1`
+and the integer key `1`, which both give `header__int32_1`. Two such keys in one record reject the record. In different
+records, the keys write to the same column, and nothing records which key
+each value came from.
 
 ## Delivery semantics
 
@@ -372,7 +419,8 @@ A record is rejected when:
 
 - **The connector rejects it before writing**: a binary payload that is not
   UTF-8, a malformed UUID, a bad array, a value of the wrong type in a listed
-  column, a missing or out-of-range timestamp field, an invalid or duplicate
+  column, a symbol value longer than 1 MiB, a missing or out-of-range
+  timestamp field, an invalid or duplicate
   column name, or a row with no columns. The rest of the batch is written.
 - **The client rejects it while writing**, usually because a column already has
   another type in this flush. The rest of the batch is written.
@@ -403,6 +451,10 @@ margin, and let `DEDUP UPSERT KEYS` drop the rows that are written twice.
    iggy consumer-offset set questdb_sink events questdb_events <partition> <offset> --kind consumer-group
    ```
 
+   If that offset is 0, no stored offset comes before it. Set a new
+   `consumer_group` for the stream instead. A group with no stored offset
+   starts every partition at offset 0.
+
 4. Start the connectors runtime.
 
 The sink writes some rows a second time. Declare `DEDUP UPSERT KEYS` on the
@@ -420,12 +472,13 @@ same name, ignoring case, is rejected.
 | `iggy_topic` | `include_topic_column = true`, the default |
 | `iggy_partition_id` | `include_partition_column = true` |
 | `iggy_offset` | `include_offset_column = true` |
-| `header_<key>` | `include_headers = true` |
+| `header_<name>` | `include_headers = true` |
+| `iggy_header_<name>_encoding` | `include_headers = true`, for a header whose value is base64 |
 
 The `iggy_` prefix keeps these names apart from common payload fields such as
 `stream`, `topic` or `offset`, which are written as ordinary columns. A payload
-field named like a reserved column is rare. If you have one, turn the flag off
-or rename the field with a transform.
+field named like a reserved column is rare. If you have one, turn the flag off,
+or remove the field with the `delete_fields` transform.
 
 ## Testing
 

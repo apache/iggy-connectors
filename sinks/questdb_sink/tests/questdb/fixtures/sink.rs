@@ -697,6 +697,23 @@ delegate_fixture!(
 );
 
 delegate_fixture!(
+    /// A table pre-created with a designated timestamp named `ts`, which is the
+    /// README's fix for a payload field named `timestamp`.
+    QuestDbSinkCustomTimestampFixture,
+    QuestDbSinkOptions {
+        include_stream_column: Some(false),
+        include_topic_column: Some(false),
+        pre_create_ddl: Some(|table| {
+            format!(
+                "create table {table} (price DOUBLE, ts TIMESTAMP) \
+                 timestamp(ts) partition by DAY WAL"
+            )
+        }),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
     QuestDbSinkPayloadTimestampFixture,
     QuestDbSinkOptions {
         timestamp_source: Some("payload".to_string()),

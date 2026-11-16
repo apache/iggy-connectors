@@ -48,7 +48,6 @@ insecure-skip-verify = ["questdb-rs/insecure-skip-verify"]
 
 [dependencies]
 async-trait = { workspace = true }
-base64 = { workspace = true }
 humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 questdb-rs = { workspace = true }

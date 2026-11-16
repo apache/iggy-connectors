@@ -26,8 +26,9 @@ use tokio::time::sleep;
 
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::fixtures::{
-    QuestDbOps, QuestDbSinkCoercionFixture, QuestDbSinkDedupFixture, QuestDbSinkFixture,
-    QuestDbSinkHeadersFixture, QuestDbSinkOriginTimestampFixture, QuestDbSinkOutageFixture,
+    QuestDbOps, QuestDbSinkCoercionFixture, QuestDbSinkCustomTimestampFixture,
+    QuestDbSinkDedupFixture, QuestDbSinkFixture, QuestDbSinkHeadersFixture,
+    QuestDbSinkOriginTimestampFixture, QuestDbSinkOutageFixture,
     QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerRejectionFixture,
     QuestDbSinkServerRejectionStoreAndForwardFixture, QuestDbSinkServerTimestampFixture,
     QuestDbSinkSmallBatchFixture, QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture,
@@ -943,6 +944,20 @@ async fn given_headers_enabled_when_consumed_should_write_prefixed_columns(
         HeaderKey::from_raw(HeaderKind::String, b"source").unwrap(),
         HeaderValue::from_raw(HeaderKind::String, b"gateway").unwrap(),
     );
+    // A string `1` and an integer `1` must land in two columns, not collide.
+    headers.insert(
+        HeaderKey::try_from("1").unwrap(),
+        HeaderValue::try_from("string key").unwrap(),
+    );
+    headers.insert(
+        HeaderKey::from(1i32),
+        HeaderValue::try_from("int32 key").unwrap(),
+    );
+    // A raw value is written as base64, with a symbol that says so.
+    headers.insert(
+        HeaderKey::try_from("bin").unwrap(),
+        HeaderValue::from_raw(HeaderKind::Raw, &[1, 2, 255]).unwrap(),
+    );
     send(
         &harness.root_client().await.unwrap(),
         vec![
@@ -969,6 +984,197 @@ async fn given_headers_enabled_when_consumed_should_write_prefixed_columns(
         .await
         .expect("no values");
     assert_eq!(values[0].as_str(), Some("gateway"));
+    let values = fixture.column_values("header_1").await.expect("no values");
+    assert_eq!(values[0].as_str(), Some("string key"));
+    let values = fixture
+        .column_values("header__int32_1")
+        .await
+        .expect("no values");
+    assert_eq!(values[0].as_str(), Some("int32 key"));
+
+    let values = fixture
+        .column_values("header_bin")
+        .await
+        .expect("no values");
+    assert_eq!(values[0].as_str(), Some("AQL/"));
+    assert_eq!(
+        columns.get("iggy_header_bin_encoding").map(String::as_str),
+        Some("SYMBOL"),
+        "{columns:?}"
+    );
+    let values = fixture
+        .column_values("iggy_header_bin_encoding")
+        .await
+        .expect("no values");
+    assert_eq!(values[0].as_str(), Some("base64"));
+    // Text values add no encoding column.
+    assert!(
+        !columns.contains_key("iggy_header_source_encoding"),
+        "{columns:?}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_mqtt_source_headers_when_consumed_should_write_every_one(
+    harness: &TestHarness,
+    fixture: QuestDbSinkHeadersFixture,
+) {
+    // The headers the MQTT source sets on every message. Each key has a `.`,
+    // which QuestDB refuses in a column name, so before the keys were rewritten
+    // every MQTT record was rejected.
+    let fixture = &fixture.0;
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert(
+        HeaderKey::try_from("mqtt.protocol").unwrap(),
+        HeaderValue::try_from("mqtt5").unwrap(),
+    );
+    headers.insert(
+        HeaderKey::try_from("mqtt.topic").unwrap(),
+        HeaderValue::try_from("sensors/room1").unwrap(),
+    );
+    headers.insert(
+        HeaderKey::try_from("mqtt.qos").unwrap(),
+        HeaderValue::from(1u8),
+    );
+    headers.insert(
+        HeaderKey::try_from("mqtt.dup").unwrap(),
+        HeaderValue::from(false),
+    );
+    headers.insert(
+        HeaderKey::try_from("mqtt.retain").unwrap(),
+        HeaderValue::from(true),
+    );
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![
+            IggyMessage::builder()
+                .id(1)
+                .payload(Bytes::from(
+                    serde_json::to_vec(&json!({"temp": 21.5})).unwrap(),
+                ))
+                .user_headers(headers)
+                .build()
+                .expect("Failed to build message"),
+        ],
+    )
+    .await;
+
+    fixture
+        .wait_for_rows(1)
+        .await
+        .expect("an MQTT record must not be rejected for its header keys");
+
+    for (column, expected) in [
+        ("header_mqtt_protocol", "mqtt5"),
+        ("header_mqtt_topic", "sensors/room1"),
+        ("header_mqtt_qos", "1"),
+        ("header_mqtt_dup", "false"),
+        ("header_mqtt_retain", "true"),
+    ] {
+        let values = fixture.column_values(column).await.expect("no values");
+        assert_eq!(values[0].as_str(), Some(expected), "{column}");
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/delete_fields.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_a_timestamp_payload_field_and_delete_fields_when_consumed_should_write_the_row(
+    harness: &TestHarness,
+    fixture: QuestDbSinkFixture,
+) {
+    // An auto-created table names its designated timestamp `timestamp`, so a
+    // payload field of that name makes the server reject the flush. The README
+    // tells users to remove the field with `delete_fields`, which this proves.
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![message(1, json!({"timestamp": "2026-09-04", "price": 1.5}))],
+    )
+    .await;
+
+    fixture
+        .wait_for_rows(1)
+        .await
+        .expect("delete_fields must remove the colliding field");
+
+    let columns = fixture.column_types().await.expect("no columns");
+    assert_eq!(
+        columns.get("timestamp").map(String::as_str),
+        Some("TIMESTAMP"),
+        "the designated timestamp must keep its type: {columns:?}"
+    );
+    let prices = fixture.column_values("price").await.expect("no values");
+    assert_eq!(prices[0].as_f64(), Some(1.5));
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/delete_fields.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_a_reserved_payload_field_and_delete_fields_when_consumed_should_write_the_row(
+    harness: &TestHarness,
+    fixture: QuestDbSinkFixture,
+) {
+    // `iggy_stream` is reserved while `include_stream_column` is on, so the
+    // connector rejects a record that carries it. The README tells users to
+    // remove the field with `delete_fields`, which this proves.
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![message(1, json!({"iggy_stream": "spoofed", "price": 1.5}))],
+    )
+    .await;
+
+    fixture
+        .wait_for_rows(1)
+        .await
+        .expect("delete_fields must remove the reserved field");
+
+    let streams = fixture
+        .column_values("iggy_stream")
+        .await
+        .expect("no values");
+    assert_eq!(
+        streams[0].as_str(),
+        Some(seeds::names::STREAM),
+        "the column must hold the stream name, not the deleted payload value"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_a_table_with_another_designated_timestamp_when_consumed_should_keep_the_timestamp_field(
+    harness: &TestHarness,
+    fixture: QuestDbSinkCustomTimestampFixture,
+) {
+    // The README's other fix for a payload field named `timestamp`: create
+    // the table first with `timestamp(<name>)` for another column. The field
+    // then lands as an ordinary column and keeps its data.
+    let fixture = &fixture.0;
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![message(1, json!({"timestamp": "2026-09-04", "price": 1.5}))],
+    )
+    .await;
+
+    fixture
+        .wait_for_rows(1)
+        .await
+        .expect("a table with another designated timestamp must accept the field");
+
+    let columns = fixture.column_types().await.expect("no columns");
+    assert_eq!(
+        columns.get("timestamp").map(String::as_str),
+        Some("VARCHAR"),
+        "{columns:?}"
+    );
+    let values = fixture.column_values("timestamp").await.expect("no values");
+    assert_eq!(values[0].as_str(), Some("2026-09-04"));
 }
 
 #[iggy_harness(

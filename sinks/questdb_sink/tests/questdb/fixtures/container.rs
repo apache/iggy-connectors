@@ -30,18 +30,26 @@ use testcontainers_modules::testcontainers::{
 use tracing::info;
 
 const QUESTDB_IMAGE: &str = "docker.io/questdb/questdb";
+/// 10.2.0 is the first release with `cairo.commit.mode=adaptive`, which the
+/// local durable acknowledgement needs. QWP over WebSocket alone needs 10.0.
+/// A macro, so that the container name below is built from the same literal.
+macro_rules! questdb_tag {
+    () => {
+        "10.2.0"
+    };
+}
+const QUESTDB_TAG: &str = questdb_tag!();
 /// Fixed name plus `ReuseDirective::Always` shares one server across every
 /// QuestDB test process on the Docker daemon, as the Elasticsearch and Doris
 /// fixtures do. Tests stay isolated through a table per fixture. The container
-/// outlives the run: `docker rm -f iggy-test-questdb` forces a fresh one.
-const QUESTDB_SHARED_CONTAINER_NAME: &str = "iggy-test-questdb";
+/// outlives the run: `docker rm -f iggy-test-questdb-10.2.0` forces a fresh one.
+/// The name carries the tag, so that a container left from an older tag is
+/// never reused.
+const QUESTDB_SHARED_CONTAINER_NAME: &str = concat!("iggy-test-questdb-", questdb_tag!());
 /// Bounds the create-or-attach race in [`start_shared_container`], with the
 /// same values as the Doris and Elasticsearch fixtures.
 const CONTAINER_START_ATTEMPTS: u32 = 30;
 const CONTAINER_START_RETRY_DELAY_MS: u64 = 1_000;
-/// QWP over WebSocket requires QuestDB 10.0 or newer, so this tag cannot be
-/// rolled back to a 9.x line without disabling the whole suite.
-const QUESTDB_TAG: &str = "10.0.1";
 /// QuestDB serves the REST API and the QWP WebSocket upgrade on the same port.
 const QUESTDB_HTTP_PORT: u16 = 9000;
 
@@ -98,6 +106,7 @@ pub const ENV_SINK_LOG_REJECTED_PAYLOAD: &str =
     "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_LOG_REJECTED_PAYLOAD";
 pub const ENV_SINK_BATCH_SIZE: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_BATCH_SIZE";
 pub const ENV_SINK_FLUSH_TIMEOUT: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_FLUSH_TIMEOUT";
+pub const ENV_SINK_ACK_LEVEL: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_ACK_LEVEL";
 pub const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_STREAM";
 pub const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_TOPICS";
 pub const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_SCHEMA";
@@ -152,12 +161,16 @@ pub struct QuestDbContainer {
 /// and readiness is confirmed by the `/ping` poll in the sink fixture anyway.
 /// That poll also covers an attach to the shared container, which skips this
 /// wait.
+///
+/// Every server runs `cairo.commit.mode=adaptive`, so that the local durable
+/// acknowledgement is tested on the same server as everything else.
 fn container_request(name: &str) -> ContainerRequest<GenericImage> {
     GenericImage::new(QUESTDB_IMAGE, QUESTDB_TAG)
         .with_exposed_port(QUESTDB_HTTP_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout(QUESTDB_READY_LOG))
         .with_mapped_port(0, QUESTDB_HTTP_PORT.tcp())
         .with_container_name(name)
+        .with_env_var("QDB_CAIRO_COMMIT_MODE", "adaptive")
 }
 
 /// Creates the shared QuestDB container, or attaches to it if another test won

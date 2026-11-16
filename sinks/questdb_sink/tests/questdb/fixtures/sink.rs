@@ -26,16 +26,16 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::container::{
-    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_BATCH_SIZE, ENV_SINK_CONNECTION_STRING,
-    ENV_SINK_FLUSH_TIMEOUT, ENV_SINK_INCLUDE_HEADERS, ENV_SINK_INCLUDE_OFFSET_COLUMN,
-    ENV_SINK_INCLUDE_PARTITION_COLUMN, ENV_SINK_INCLUDE_STREAM_COLUMN,
-    ENV_SINK_INCLUDE_TOPIC_COLUMN, ENV_SINK_INTEGER_COLUMNS, ENV_SINK_LOG_REJECTED_PAYLOAD,
-    ENV_SINK_NUMBERS_AS_DOUBLE, ENV_SINK_PATH, ENV_SINK_STREAMS_0_CONSUMER_GROUP,
-    ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS,
-    ENV_SINK_SYMBOL_COLUMNS, ENV_SINK_TABLE, ENV_SINK_TIMESTAMP_FIELD, ENV_SINK_TIMESTAMP_SOURCE,
-    ENV_SINK_TIMESTAMP_UNIT, ENV_SINK_UUID_COLUMNS, HEALTH_CHECK_ATTEMPTS,
-    HEALTH_CHECK_INTERVAL_MS, QuestDbContainer, QuestDbOps, SINK_PLUGIN_NAME, create_http_client,
-    ensure_plugin_built,
+    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_ACK_LEVEL, ENV_SINK_BATCH_SIZE,
+    ENV_SINK_CONNECTION_STRING, ENV_SINK_FLUSH_TIMEOUT, ENV_SINK_INCLUDE_HEADERS,
+    ENV_SINK_INCLUDE_OFFSET_COLUMN, ENV_SINK_INCLUDE_PARTITION_COLUMN,
+    ENV_SINK_INCLUDE_STREAM_COLUMN, ENV_SINK_INCLUDE_TOPIC_COLUMN, ENV_SINK_INTEGER_COLUMNS,
+    ENV_SINK_LOG_REJECTED_PAYLOAD, ENV_SINK_NUMBERS_AS_DOUBLE, ENV_SINK_PATH,
+    ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
+    ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_SYMBOL_COLUMNS, ENV_SINK_TABLE, ENV_SINK_TIMESTAMP_FIELD,
+    ENV_SINK_TIMESTAMP_SOURCE, ENV_SINK_TIMESTAMP_UNIT, ENV_SINK_UUID_COLUMNS,
+    HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, QuestDbContainer, QuestDbOps,
+    SINK_PLUGIN_NAME, create_http_client, ensure_plugin_built,
 };
 
 const POLL_ATTEMPTS: usize = 120;
@@ -69,6 +69,9 @@ pub struct QuestDbSinkOptions {
     pub log_rejected_payload: Option<bool>,
     pub batch_size: Option<u32>,
     pub flush_timeout: Option<String>,
+    pub ack_level: Option<String>,
+    /// Appended to the connect string as `request_durable_ack=<value>`.
+    pub request_durable_ack: Option<String>,
     /// Schema the runtime decodes the stream with. `None` → "json".
     pub schema: Option<String>,
     /// Enable QWP store-and-forward against a temp directory owned by the
@@ -83,6 +86,9 @@ pub struct QuestDbSinkOptions {
     /// Run on a QuestDB server of its own instead of the shared one, for a
     /// test that pauses the server.
     pub dedicated_container: bool,
+    /// `RUST_LOG` for the connectors runtime, for a test that asserts a
+    /// `debug` line. `None` keeps the runtime's `INFO` default.
+    pub runtime_log_level: Option<String>,
 }
 
 pub struct QuestDbSinkFixture {
@@ -401,6 +407,9 @@ impl TestFixture for QuestDbSinkFixture {
                 self.table
             ));
         }
+        if let Some(value) = &self.options.request_durable_ack {
+            connection_string.push_str(&format!("request_durable_ack={value};"));
+        }
         envs.insert(ENV_SINK_CONNECTION_STRING.to_string(), connection_string);
         envs.insert(ENV_SINK_TABLE.to_string(), self.table());
         envs.insert(
@@ -477,6 +486,12 @@ impl TestFixture for QuestDbSinkFixture {
         }
         if let Some(value) = &self.options.flush_timeout {
             envs.insert(ENV_SINK_FLUSH_TIMEOUT.to_string(), value.clone());
+        }
+        if let Some(value) = &self.options.ack_level {
+            envs.insert(ENV_SINK_ACK_LEVEL.to_string(), value.clone());
+        }
+        if let Some(value) = &self.options.runtime_log_level {
+            envs.insert("RUST_LOG".to_string(), value.clone());
         }
         envs
     }
@@ -692,6 +707,22 @@ delegate_fixture!(
     QuestDbSinkHeadersFixture,
     QuestDbSinkOptions {
         include_headers: Some(true),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// Waits for the local durable acknowledgement, which the test server sends
+    /// because it runs `cairo.commit.mode=adaptive`. The flush timeout is
+    /// short, so that a missing acknowledgement shows up as a warning within
+    /// the test.
+    QuestDbSinkLocalDurableFixture,
+    QuestDbSinkOptions {
+        ack_level: Some("local_durable".to_string()),
+        request_durable_ack: Some("local".to_string()),
+        flush_timeout: Some("3s".to_string()),
+        // The confirmation of each acknowledged flush is a `debug` line.
+        runtime_log_level: Some("debug".to_string()),
         ..Default::default()
     }
 );

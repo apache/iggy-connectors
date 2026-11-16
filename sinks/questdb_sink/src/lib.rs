@@ -148,6 +148,9 @@ pub struct QuestDbSink {
     connection_string: SecretString,
     mapping: Arc<Mapping>,
     ack_level: AckLevel,
+    /// The connect string's `request_durable_ack` value, read once in `new`
+    /// and checked against `ack_level` in `open`.
+    durable_ack_request: Option<String>,
     flush_timeout: Duration,
     batch_size: usize,
     max_flush_bytes: usize,
@@ -230,18 +233,37 @@ impl QuestDbSink {
         // connect string that asks for durable acks gets them. Otherwise the
         // flag would only cost the extra acknowledgements, while every flush
         // still waits only for the server to accept it.
+        let durable_ack_request = request_durable_ack(config.connection_string.expose_secret());
         let ack_level = match config.ack_level.as_deref() {
-            None if requests_durable_ack(config.connection_string.expose_secret()) => {
-                AckLevel::Durable
-            }
-            raw => parse_ack_level(raw).unwrap_or_else(|| {
+            // A value that the client refuses asks for nothing, and the client
+            // then refuses the connect string.
+            None => durable_ack_request
+                .as_deref()
+                .and_then(ack_level_for)
+                .unwrap_or(AckLevel::Ok),
+            Some(raw) => parse_ack_level(raw).unwrap_or_else(|| {
                 reject(Error::InvalidConfigValue(format!(
-                    "ack_level {:?} is not one of ok, durable",
-                    raw.unwrap_or_default()
+                    "ack_level {raw:?} is not one of {}",
+                    ACK_LEVELS.map(|(name, _)| name).join(", ")
                 )));
                 AckLevel::Ok
             }),
         };
+        // An explicit `ok` is allowed with a durable request, because the
+        // client accepts the pair, but it waits for less than the connect
+        // string asks for, so the operator hears of it.
+        if config.ack_level.is_some()
+            && ack_level == AckLevel::Ok
+            && let Some(requested) = durable_ack_request
+                .as_deref()
+                .and_then(ack_level_for)
+                .filter(|requested| *requested != AckLevel::Ok)
+        {
+            warn!(
+                "{CONNECTOR_NAME} ID: {id} ack_level = \"ok\" overrides request_durable_ack in the connection string, which asks for {}; each chunk waits only for the server to accept it. Leave ack_level unset to wait for the durable acknowledgement",
+                ack_level_name(requested)
+            );
+        }
 
         let flush_timeout = match config.flush_timeout.as_deref() {
             None => DEFAULT_FLUSH_TIMEOUT,
@@ -258,10 +280,16 @@ impl QuestDbSink {
         // level the sink treats it as fire and forget and never calls `wait`,
         // but a durable ack level has to wait, so the pair would block the FFI
         // call for good with no way to stop the connector.
-        if ack_level == AckLevel::Durable && flush_timeout.is_zero() {
-            reject(Error::InvalidConfigValue(
-                "flush_timeout must be greater than zero when ack_level is \"durable\", because a zero timeout never expires".to_owned(),
-            ));
+        if ack_level != AckLevel::Ok && flush_timeout.is_zero() {
+            let source = if config.ack_level.is_none() {
+                ", which request_durable_ack in the connection string selects"
+            } else {
+                ""
+            };
+            reject(Error::InvalidConfigValue(format!(
+                "flush_timeout must be greater than zero when ack_level is \"{}\"{source}, because a zero timeout never expires",
+                ack_level_name(ack_level)
+            )));
         }
 
         // A bad table name fails on every row of every batch, so it is caught
@@ -337,6 +365,7 @@ impl QuestDbSink {
             connection_string: config.connection_string,
             mapping: Arc::new(mapping),
             ack_level,
+            durable_ack_request,
             flush_timeout,
             batch_size,
             max_flush_bytes,
@@ -737,12 +766,44 @@ impl QuestDbSink {
         // server for them, so a config that sets one without the other fails
         // every batch while the rows themselves land. Catch it here rather than
         // letting the operator read that as data loss.
-        if self.ack_level == AckLevel::Durable && !requests_durable_ack(&connection_string) {
-            return Err(Error::InvalidConfigValue(
-                "ack_level is \"durable\" but the connection string does not set \
-                 request_durable_ack=on, which the QuestDB client requires for durable acknowledgement"
-                    .to_owned(),
-            ));
+        // With `local,replicated` the client trims on the replicated
+        // acknowledgement and refuses a local wait, so each level needs its own
+        // values.
+        let requested = self.durable_ack_request.as_deref().and_then(ack_level_for);
+        if self.ack_level != AckLevel::Ok && requested != Some(self.ack_level) {
+            let found = match (self.durable_ack_request.as_deref(), requested) {
+                (Some(value), Some(level)) => format!(
+                    "sets request_durable_ack={value}, which gives ack_level \"{}\"",
+                    ack_level_name(level)
+                ),
+                (Some(value), None) => format!(
+                    "sets request_durable_ack={value}, which the QuestDB client does not accept"
+                ),
+                // A key that the sink cannot find, although the string holds
+                // it, is a key that the client cannot parse either, such as one
+                // after a space.
+                (None, _)
+                    if connection_string
+                        .to_ascii_lowercase()
+                        .contains("request_durable_ack") =>
+                {
+                    "does not set request_durable_ack in a form that the QuestDB client \
+                     reads, which is the key in lowercase, right after `::` or a `;`, \
+                     with no space around it"
+                        .to_owned()
+                }
+                (None, _) => "does not set request_durable_ack".to_owned(),
+            };
+            let needed = if self.ack_level == AckLevel::LocalDurable {
+                "local"
+            } else {
+                "on, replicated or local,replicated"
+            };
+            return Err(Error::InvalidConfigValue(format!(
+                "ack_level is \"{}\" but the connection string {found}. The QuestDB client \
+                 needs request_durable_ack set to {needed} for that ack level",
+                ack_level_name(self.ack_level)
+            )));
         }
 
         let id = self.id;
@@ -767,10 +828,10 @@ impl QuestDbSink {
         .map_err(|error| Error::InitError(format!("cannot connect to QuestDB: {}", error)))?;
         self.db = Some(Arc::new(db));
         info!(
-            "Opened {CONNECTOR_NAME} connector ID: {}, table: {}, ack_level: {:?}, numbers_as_double: {}, symbol_columns: {:?}, uuid_columns: {:?}, integer_columns: {:?}",
+            "Opened {CONNECTOR_NAME} connector ID: {}, table: {}, ack_level: {}, numbers_as_double: {}, symbol_columns: {:?}, uuid_columns: {:?}, integer_columns: {:?}",
             self.id,
             self.mapping.table,
-            self.ack_level,
+            ack_level_name(self.ack_level),
             self.mapping.numbers_as_double,
             self.mapping.symbol_columns.iter().collect::<Vec<_>>(),
             self.mapping.uuid_columns.iter().collect::<Vec<_>>(),
@@ -982,8 +1043,9 @@ impl Sink for QuestDbSink {
         // queued and the stall ends when the server acknowledges again.
         if should_escalate_stall(stalled) {
             return Err(Error::CannotStoreData(format!(
-                "{CONNECTOR_NAME} ID: {}: the last {stalled} batches were flushed without QuestDB acknowledging them at ack_level {:?}; the frames are queued but nothing is being committed",
-                self.id, self.ack_level
+                "{CONNECTOR_NAME} ID: {}: the last {stalled} batches were flushed without QuestDB acknowledging them at ack_level {}; the frames are queued but nothing is being committed",
+                self.id,
+                ack_level_name(self.ack_level)
             )));
         }
         Ok(())
@@ -1125,19 +1187,78 @@ fn size_or_default(field: &str, value: Option<usize>, default: usize) -> Result<
     }
 }
 
-/// Whether the connect string asks the server for durable acknowledgements.
-fn requests_durable_ack(connection_string: &str) -> bool {
-    connection_string
-        .to_ascii_lowercase()
-        .contains("request_durable_ack=on")
+/// The ack level that a `request_durable_ack` value selects, or `None` for a
+/// value that the client refuses. The client trims on the replicated
+/// acknowledgement whenever the set holds `replicated`, or its original name
+/// `on`, so `local,replicated` selects `Durable`, and `local` alone selects
+/// `LocalDurable`.
+fn ack_level_for(value: &str) -> Option<AckLevel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "replicated" | "local,replicated" | "replicated,local" => Some(AckLevel::Durable),
+        "local" => Some(AckLevel::LocalDurable),
+        "off" => Some(AckLevel::Ok),
+        _ => None,
+    }
 }
 
-fn parse_ack_level(raw: Option<&str>) -> Option<AckLevel> {
-    match raw.map(str::to_ascii_lowercase).as_deref() {
-        None | Some("ok") => Some(AckLevel::Ok),
-        Some("durable") => Some(AckLevel::Durable),
-        Some(_) => None,
+/// The value of `request_durable_ack`, read with the grammar of the client:
+/// the keys follow `<service>::`, and `;;` in a value is a literal `;`.
+/// `questdb_confstr::parse_conf_str` refuses a repeated key, but the client
+/// accepts a repeated `addr` for failover, so it cannot read the raw string.
+fn request_durable_ack(connection_string: &str) -> Option<String> {
+    let (_, mut rest) = connection_string.split_once("::")?;
+    while !rest.is_empty() {
+        let (key, after_key) = rest.split_once('=')?;
+        let end = value_end(after_key);
+        if key == "request_durable_ack" {
+            // Every `;` before `end` is half of a `;;` pair.
+            return Some(after_key[..end].replace(";;", ";"));
+        }
+        rest = after_key.get(end + 1..).unwrap_or_default();
     }
+    None
+}
+
+/// The length of the value at the start of `text`: up to the first `;` that
+/// does not start a `;;` pair, as the client reads it.
+fn value_end(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b';' {
+            if bytes.get(index + 1) == Some(&b';') {
+                index += 2;
+                continue;
+            }
+            return index;
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+/// Each `ack_level` and its configuration spelling.
+const ACK_LEVELS: [(&str, AckLevel); 3] = [
+    ("ok", AckLevel::Ok),
+    ("durable", AckLevel::Durable),
+    ("local_durable", AckLevel::LocalDurable),
+];
+
+/// The configuration spelling of an ack level, for logs and errors.
+fn ack_level_name(level: AckLevel) -> &'static str {
+    // `AckLevel` is `non_exhaustive`, and the sink never selects a level that
+    // it does not parse.
+    ACK_LEVELS
+        .iter()
+        .find(|(_, known)| *known == level)
+        .map_or("unknown", |(name, _)| name)
+}
+
+fn parse_ack_level(raw: &str) -> Option<AckLevel> {
+    ACK_LEVELS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(raw))
+        .map(|(_, level)| *level)
 }
 
 /// A column has one type. It cannot be two of `SYMBOL`, `UUID` and `LONG`, and
@@ -1458,7 +1579,13 @@ fn flush_window(
     }
 
     match sender.wait(ack_level, flush_timeout) {
-        Ok(()) => Ok(WindowAck::Confirmed),
+        Ok(()) => {
+            debug!(
+                "{CONNECTOR_NAME} ID: {id} flushed rows that QuestDB acknowledged at ack_level {}, stream: {stream}, topic: {topic}, partition_id: {partition_id}, {window}",
+                ack_level_name(ack_level)
+            );
+            Ok(WindowAck::Confirmed)
+        }
         Err(error) if is_pending_ack(&error) => {
             outcome.pending_acks += 1;
             warn!(
@@ -1611,14 +1738,16 @@ mod tests {
         // The client reads a zero timeout as "no deadline", so a durable ack
         // level would wait for good inside the FFI call and the connector could
         // not be stopped.
-        let mut config = config();
-        config.ack_level = Some("durable".to_owned());
-        config.flush_timeout = Some("0s".to_owned());
-        let sink = QuestDbSink::new(1, config);
-        assert!(matches!(
-            sink.init_error,
-            Some(Error::InvalidConfigValue(_))
-        ));
+        for level in ["durable", "local_durable"] {
+            let mut config = config();
+            config.ack_level = Some(level.to_owned());
+            config.flush_timeout = Some("0s".to_owned());
+            let sink = QuestDbSink::new(1, config);
+            assert!(
+                matches!(sink.init_error, Some(Error::InvalidConfigValue(_))),
+                "{level}"
+            );
+        }
     }
 
     #[test]
@@ -1763,6 +1892,124 @@ mod tests {
         assert_eq!(QuestDbSink::new(1, config).ack_level, AckLevel::Ok);
     }
 
+    #[test]
+    fn given_the_durable_ack_key_anywhere_in_the_connect_string_when_read_should_match_the_client()
+    {
+        for (connection_string, expected) in [
+            // The first key follows `::`, with no `;` before it.
+            ("ws::request_durable_ack=on;addr=a:9000;", AckLevel::Durable),
+            (
+                "wss::request_durable_ack=local;addr=a:9000",
+                AckLevel::LocalDurable,
+            ),
+            // Failover repeats `addr`, which the client accepts.
+            (
+                "ws::addr=a:9000;addr=b:9000;request_durable_ack=replicated;",
+                AckLevel::Durable,
+            ),
+            (
+                "ws::addr=a:9000,b:9000;request_durable_ack=local;",
+                AckLevel::LocalDurable,
+            ),
+            // `;;` is a literal `;` inside a value, so this is a password.
+            (
+                "ws::addr=a:9000;password=x;;request_durable_ack=on;;y;",
+                AckLevel::Ok,
+            ),
+            (
+                "ws::password=x;;y;request_durable_ack=local;",
+                AckLevel::LocalDurable,
+            ),
+            // The client refuses these sets, so they ask for nothing.
+            (
+                "ws::addr=a:9000;request_durable_ack=on,local;",
+                AckLevel::Ok,
+            ),
+            (
+                "ws::addr=a:9000;request_durable_ack=local, replicated;",
+                AckLevel::Ok,
+            ),
+            // Keys match exactly, as in the client.
+            ("ws::addr=a:9000;REQUEST_DURABLE_ACK=on;", AckLevel::Ok),
+            ("ws::addr=a:9000;", AckLevel::Ok),
+        ] {
+            let requested = request_durable_ack(connection_string)
+                .as_deref()
+                .and_then(ack_level_for)
+                .unwrap_or(AckLevel::Ok);
+            assert_eq!(requested, expected, "{connection_string}");
+        }
+    }
+
+    #[test]
+    fn given_each_durable_ack_value_without_an_ack_level_when_constructed_should_follow_it() {
+        // `on`, `replicated` and `local,replicated` all make the client trim on
+        // the replicated acknowledgement. `local` alone asks for the local
+        // flush only, so it selects the local wait and never the replicated one.
+        for (value, expected) in [
+            ("on", AckLevel::Durable),
+            ("ON", AckLevel::Durable),
+            ("replicated", AckLevel::Durable),
+            ("local,replicated", AckLevel::Durable),
+            ("replicated,local", AckLevel::Durable),
+            ("local", AckLevel::LocalDurable),
+            ("LOCAL", AckLevel::LocalDurable),
+            ("off", AckLevel::Ok),
+        ] {
+            let mut config = config();
+            config.connection_string =
+                format!("ws::addr=127.0.0.1:1;request_durable_ack={value};").into();
+            assert_eq!(
+                QuestDbSink::new(1, config).ack_level,
+                expected,
+                "request_durable_ack={value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_local_durable_acks_without_the_local_flag_when_opened_should_fail() {
+        // The client refuses a local wait unless the set is exactly `local`:
+        // with `local,replicated` it trims on the replicated acknowledgement.
+        // The error names what the string sets, and which level that gives,
+        // so the operator can see that `durable` is the level to use.
+        for (flag, expected) in [
+            ("", "does not set request_durable_ack"),
+            ("request_durable_ack=on;", "gives ack_level \"durable\""),
+            (
+                "request_durable_ack=local,replicated;",
+                "sets request_durable_ack=local,replicated, which gives ack_level \"durable\"",
+            ),
+            (
+                "request_durable_ack=local, replicated;",
+                "sets request_durable_ack=local, replicated, which the QuestDB client does not accept",
+            ),
+            // A space after `;` hides the key from the client too.
+            (
+                "foo=bar; request_durable_ack=local;",
+                "does not set request_durable_ack in a form that the QuestDB client reads",
+            ),
+        ] {
+            let mut config = config();
+            config.connection_string = format!("ws::addr=127.0.0.1:1;{flag}").into();
+            config.ack_level = Some("local_durable".to_owned());
+            let mut sink = QuestDbSink::new(1, config);
+            match sink.open().await {
+                Err(Error::InvalidConfigValue(reason)) => {
+                    assert!(reason.contains(expected), "{flag:?}: {reason}");
+                    // The hint about spaces fits only a string that holds
+                    // the key.
+                    assert_eq!(
+                        reason.contains("no space around it"),
+                        flag.contains("request_durable_ack") && !reason.contains("sets"),
+                        "{flag:?}: {reason}"
+                    );
+                }
+                other => panic!("{flag:?}: expected InvalidConfigValue, got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn given_durable_acks_with_the_connect_string_flag_when_opened_should_pass_validation() {
         // The pairing is accepted; only the connect itself then fails, which
@@ -1770,6 +2017,17 @@ mod tests {
         let mut config = config();
         config.ack_level = Some("durable".to_owned());
         config.connection_string = "ws::addr=127.0.0.1:1;request_durable_ack=on;"
+            .to_owned()
+            .into();
+        let mut sink = QuestDbSink::new(1, config);
+        assert!(matches!(sink.open().await, Err(Error::InitError(_))));
+    }
+
+    #[tokio::test]
+    async fn given_local_durable_acks_with_the_local_flag_when_opened_should_pass_validation() {
+        let mut config = config();
+        config.ack_level = Some("local_durable".to_owned());
+        config.connection_string = "ws::addr=127.0.0.1:1;request_durable_ack=local;"
             .to_owned()
             .into();
         let mut sink = QuestDbSink::new(1, config);

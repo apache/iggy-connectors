@@ -24,7 +24,9 @@ QuestDB's native binary protocol, on a WebSocket transport. The same build
 works with QuestDB open source and QuestDB Enterprise. Enterprise features are
 enabled through the connect string.
 
-Requires QuestDB 10.0 or newer.
+Requires QuestDB 10.0 or QuestDB Enterprise 4.0, or newer.
+`ack_level = "local_durable"` requires QuestDB 10.2.0 or QuestDB Enterprise
+4.2.0. The tests run against QuestDB 10.2.0 with `cairo.commit.mode=adaptive`.
 
 ## Configuration
 
@@ -42,7 +44,8 @@ include_topic_column = true
 include_partition_column = false
 include_offset_column = false
 include_headers = false
-ack_level = "ok"
+# Leave ack_level unset to follow request_durable_ack in the connect string.
+# ack_level = "ok"
 flush_timeout = "30s"
 batch_size = 1000
 max_flush_bytes = 1000000
@@ -66,8 +69,8 @@ verbose_logging = false
 | `include_partition_column` | `false` | Write the partition as a `LONG` column named `iggy_partition_id`. |
 | `include_offset_column` | `false` | Write the offset as a `LONG` column named `iggy_offset`. |
 | `include_headers` | `false` | Write each header as a `VARCHAR` column named `header_<name>`, so `content-type` is written to `header_content_type`. See [Headers](#headers). |
-| `ack_level` | `ok` | `ok` waits for the server to accept a flush. `durable` waits for the Enterprise durable ack. If you do not set it and the connect string sets `request_durable_ack=on`, the default is `durable`. |
-| `flush_timeout` | `30s` | How long a flush waits for its ack without progress. `0s` with `ack_level = "ok"` means fire and forget. `0s` is not allowed with `durable`. |
+| `ack_level` | from the connect string | `ok` waits for the server to accept a flush. `durable` waits for the Enterprise durable ack. `local_durable` waits until the server flushed the rows to its own disk. If you do not set it, the connect string decides: `request_durable_ack` set to `on`, `replicated` or `local,replicated` gives `durable`, `local` gives `local_durable`, and no `request_durable_ack` gives `ok`. |
+| `flush_timeout` | `30s` | How long a flush waits for its ack without progress. `0s` with `ack_level = "ok"` means fire and forget. `0s` is not allowed with `durable` or `local_durable`. |
 | `batch_size` | `1000` | Maximum rows per flush. |
 | `max_flush_bytes` | `1000000` | Flush when the buffer reaches this size, even before `batch_size` rows. |
 | `numbers_as_double` | `true` | Write every JSON number as a `DOUBLE`. See [Numbers](#numbers). |
@@ -187,11 +190,16 @@ connection_string = "ws::addr=localhost:9000;sender_pool_max=16;"
   `tls_verify=unsafe_off` turns off certificate checks. A default build refuses
   it. Build with the `insecure-skip-verify` feature to use it against a test
   server.
-- **Durable ack**: set `request_durable_ack=on` in the connect string. The
-  sink then waits for the durable ack, unless you set `ack_level = "ok"`. The
-  connector does not start with `ack_level = "durable"` alone, because the
-  client would refuse every wait. The server also needs replication
-  configured. Without it no flush is ever acknowledged.
+- **Durable ack**: set `request_durable_ack=on`, `replicated` or
+  `local,replicated` in the connect string. The three ask for the same
+  acknowledgement. `replicated` and `local,replicated` need Enterprise 4.2.0.
+  Older servers accept only `on`. `local,replicated` also needs
+  `cairo.commit.mode=adaptive`, as `local` does. The
+  sink then waits for the durable ack, unless you set `ack_level = "ok"`, which
+  logs a warning at start. The connector does not start with
+  `ack_level = "durable"` alone, because the client would refuse every wait.
+  The server also needs replication configured. Without it no flush is ever
+  acknowledged.
 
 ### Choosing an ack level
 
@@ -201,6 +209,13 @@ lose rows it already acknowledged. Use `durable` when losing that tail matters.
 
 `durable` adds one wait for log shipping to every flush, whatever the batch
 size, so throughput grows with rows per batch.
+
+`local_durable` waits until the server flushed the rows to its own disk, so
+they survive a power loss on the QuestDB host but not the loss of its disk. It
+works with QuestDB open source. See [Server durability](#server-durability).
+It does not wait for log shipping, so on a cluster a primary that fails before
+shipping can lose rows it acknowledged, as with `ok`. Only `durable` covers a
+failover.
 
 ### Server durability
 
@@ -219,10 +234,20 @@ to flush every commit before QuestDB acknowledges it. QuestDB 10.0 and 10.1 and
 QuestDB Enterprise 4.0 and 4.1 do not have this mode. See the
 [durability documentation](https://questdb.com/docs/concepts/durability/).
 
-The commit mode is a server setting, and the sink needs no change for it.
-`request_durable_ack=local`, which waits for that flush, is not supported yet,
-because the `questdb-rs` client that the sink uses accepts only `on` and
-`off`.
+The commit mode is a server setting. To make each flush of the sink wait until
+the server flushed its rows to disk, add `request_durable_ack=local` to the
+connect string. `ack_level` then defaults to `local_durable`. A row whose
+flush QuestDB acknowledged then survives a power loss, also within the group
+window. A flush whose acknowledgement does not arrive within `flush_timeout`
+is logged and stays queued, and `consume()` still reports success. See
+[Delivery semantics](#delivery-semantics). A server without the `adaptive` mode
+refuses the connection with
+`server did not enable durable ACK [requested=local, ...]`, and the connector
+does not start.
+
+```toml
+connection_string = "ws::addr=localhost:9000;request_durable_ack=local;"
+```
 
 ## Types
 
@@ -354,8 +379,8 @@ tables that must not have duplicates.
 The client queues unacknowledged frames in memory, or on disk when `sf_dir` is
 set. Rows can be lost in these cases:
 
-- With `ack_level = "ok"` on a cluster, a primary that fails before it ships
-  its write-ahead log can lose rows it accepted. See
+- With `ack_level = "ok"` or `"local_durable"` on a cluster, a primary that
+  fails before it ships its write-ahead log can lose rows it accepted. See
   [Choosing an ack level](#choosing-an-ack-level).
 - Without `sf_dir`, a crash, or a shutdown that outlasts
   `close_flush_timeout_millis` in the connect string, loses the queue even
@@ -499,10 +524,11 @@ cargo build -p iggy-connectors -p iggy_connector_questdb_sink
 cargo nextest run -p iggy_connector_questdb_sink --test questdb
 ```
 
-The tests share one QuestDB container, `iggy-test-questdb`, and each test
-writes to its own table. The container stays up after the run so the next run
-can reuse it. Remove it with `docker rm -f iggy-test-questdb`. The outage test
-pauses QuestDB, so it runs on a container of its own.
+The tests share one QuestDB 10.2.0 container, `iggy-test-questdb-10.2.0`, which
+runs `cairo.commit.mode=adaptive`, and each test writes to its own table. The
+container stays up after the run so the next run can reuse it. Remove it with
+`docker rm -f iggy-test-questdb-10.2.0`. The outage test pauses QuestDB, so it
+runs on a container of its own.
 
 If the plugin is missing, the tests fail at once with the build command to run.
 Rebuild it after every change to the sink, because the tests do not detect a

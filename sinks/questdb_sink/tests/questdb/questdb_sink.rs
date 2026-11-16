@@ -28,7 +28,7 @@ use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::fixtures::{
     QuestDbOps, QuestDbSinkCoercionFixture, QuestDbSinkCustomTimestampFixture,
     QuestDbSinkDedupFixture, QuestDbSinkFixture, QuestDbSinkHeadersFixture,
-    QuestDbSinkOriginTimestampFixture, QuestDbSinkOutageFixture,
+    QuestDbSinkLocalDurableFixture, QuestDbSinkOriginTimestampFixture, QuestDbSinkOutageFixture,
     QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerRejectionFixture,
     QuestDbSinkServerRejectionStoreAndForwardFixture, QuestDbSinkServerTimestampFixture,
     QuestDbSinkSmallBatchFixture, QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture,
@@ -1076,6 +1076,45 @@ async fn given_mqtt_source_headers_when_consumed_should_write_every_one(
     ] {
         let values = fixture.column_values(column).await.expect("no values");
         assert_eq!(values[0].as_str(), Some(expected), "{column}");
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_local_durable_acks_on_an_adaptive_commit_server_when_consumed_should_be_acknowledged(
+    harness: &TestHarness,
+    fixture: QuestDbSinkLocalDurableFixture,
+) {
+    // The rows land whether or not the acknowledgement arrives, so the proof
+    // is in the log: the sink confirms each acknowledged flush, and warns
+    // about a flush still unacknowledged after `flush_timeout`.
+    let fixture = &fixture.0;
+    let messages = (1..=TEST_MESSAGE_COUNT as u32)
+        .map(|i| message(i as u128, json!({"seq": i})))
+        .collect();
+    send(&harness.root_client().await.unwrap(), messages).await;
+
+    fixture
+        .wait_for_rows(TEST_MESSAGE_COUNT)
+        .await
+        .expect("Failed to wait for QuestDB rows");
+    wait_for_runtime_log(harness, "ack_level: local_durable").await;
+    wait_for_runtime_log(harness, "QuestDB acknowledged at ack_level local_durable").await;
+    // Past the 3 s flush timeout, so a missing acknowledgement has been logged.
+    sleep(Duration::from_secs(5)).await;
+
+    let (stdout, stderr) = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available")
+        .collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    for needle in [
+        "acknowledgement has not arrived yet",
+        "QuestDB did not confirm writing",
+    ] {
+        assert!(!logs.contains(needle), "the sink logged {needle:?}: {logs}");
     }
 }
 

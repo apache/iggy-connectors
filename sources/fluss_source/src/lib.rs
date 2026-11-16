@@ -44,6 +44,9 @@ const CONNECTOR_NAME: &str = "Apache Fluss source";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The client adds `poll_timeout` to the current instant and the connector adds the two limits
+/// together. Both additions panic on overflow, which this cap keeps out of reach.
+const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MIN_PAUSE_AFTER_FAILED_POLL: Duration = Duration::from_secs(1);
 const LOG_TABLE_TYPE: &str = "log";
 const JSON_PAYLOAD_FORMAT: &str = "json";
@@ -451,6 +454,17 @@ impl FlussSource {
             return Err(Error::InitError(format!(
                 "request_timeout for {CONNECTOR_NAME} must be greater than 0"
             )));
+        }
+        for (field, value) in [
+            ("poll_timeout", self.poll_timeout),
+            ("request_timeout", self.request_timeout),
+        ] {
+            if value > MAX_TIMEOUT {
+                return Err(Error::InitError(format!(
+                    "{field} for {CONNECTOR_NAME} must not exceed {}",
+                    humantime::format_duration(MAX_TIMEOUT)
+                )));
+            }
         }
 
         self.config
@@ -1190,6 +1204,17 @@ mod tests {
             sasl_password: None,
             verbose_logging: None,
         }
+    }
+
+    fn config_with_timeout(field: &str, value: &str) -> FlussSourceConfig {
+        let mut config = test_config();
+        let value = Some(value.to_owned());
+        match field {
+            "poll_timeout" => config.poll_timeout = value,
+            "request_timeout" => config.request_timeout = value,
+            other => panic!("{other} is not a timeout setting"),
+        }
+        config
     }
 
     fn state_with(offsets: &[(i32, i64)], produced: u64) -> State {
@@ -1999,6 +2024,34 @@ mod tests {
             .expect_err("A limit that no request can meet should be rejected");
 
         assert!(matches!(error, Error::InitError(message) if message.contains("request_timeout")));
+    }
+
+    #[test]
+    fn given_timeout_above_the_limit_should_be_rejected() {
+        // The second value overflows both additions the cap protects.
+        for value in ["1day 1ms", "18446744073709551615s"] {
+            for field in ["poll_timeout", "request_timeout"] {
+                let source = FlussSource::new(1, config_with_timeout(field, value), None);
+
+                let error = source
+                    .validate_config()
+                    .expect_err("A timeout above the limit should be rejected");
+
+                assert!(
+                    matches!(&error, Error::InitError(message) if message.contains(field) && message.contains("1day")),
+                    "{field} = {value}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_timeout_at_the_limit_should_be_accepted() {
+        for field in ["poll_timeout", "request_timeout"] {
+            let source = FlussSource::new(1, config_with_timeout(field, "1day"), None);
+
+            assert!(source.validate_config().is_ok(), "{field}");
+        }
     }
 
     #[test]

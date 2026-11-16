@@ -85,7 +85,7 @@ struct State {
     /// scan starts there instead of after the tuple, so a late-visible hit is still found.
     /// Documents without `timestamp_field` have nothing to rescan, so the next scan resumes
     /// right after this tuple.
-    #[serde(default)]
+    #[serde(default, with = "sort_tuple_as_json")]
     last_sort: Option<Vec<Value>>,
     #[serde(default)]
     error_count: usize,
@@ -100,6 +100,35 @@ struct State {
     /// Page cursor of the running scan. Not persisted: a restart rescans from the watermark.
     #[serde(skip)]
     scan_cursor: Option<Vec<Value>>,
+}
+
+// The state is saved as MessagePack. With serde_json's `arbitrary_precision` feature, which other
+// workspace crates enable, a `Value` number is written as a one-field struct and comes back as an
+// array, so the sort tuple is kept as JSON text instead.
+mod sort_tuple_as_json {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
+    use serde_json::Value;
+
+    pub fn serialize<S: Serializer>(
+        tuple: &Option<Vec<Value>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        tuple
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<Value>>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|text| serde_json::from_str(&text))
+            .transpose()
+            .map_err(de::Error::custom)
+    }
 }
 
 impl State {
@@ -1465,6 +1494,28 @@ mod tests {
     fn given_epoch_millis_timestamp_when_parsed_should_succeed() {
         let value = json!(1_705_312_200_000_i64);
         assert!(parse_document_timestamp(&value).is_some());
+    }
+
+    #[test]
+    fn given_numeric_sort_tuple_when_state_round_trips_should_keep_it() {
+        let source = OpenSearchSource::new(1, test_config(), None);
+        let state = State {
+            last_sort: Some(vec![
+                json!(1_704_067_200_000_i64),
+                json!("doc_42"),
+                json!("logs"),
+            ]),
+            ..State::default()
+        };
+
+        let saved = source
+            .serialize_state(&state)
+            .expect("state should serialize");
+        let restored: State = saved
+            .deserialize(CONNECTOR_NAME, 1)
+            .expect("state should deserialize");
+
+        assert_eq!(restored.last_sort, state.last_sort);
     }
 
     #[test]

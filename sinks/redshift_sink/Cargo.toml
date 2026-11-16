@@ -70,3 +70,6 @@ sqlparser = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-postgres = { workspace = true }
+
+[lints]
+workspace = true

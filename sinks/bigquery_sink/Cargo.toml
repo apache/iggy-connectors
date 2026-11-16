@@ -55,6 +55,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 iggy_common = { workspace = true }
+iggy_connector_testing = { workspace = true }
 prost = { workspace = true }
 tokio-stream = { workspace = true }
 toml = { workspace = true }

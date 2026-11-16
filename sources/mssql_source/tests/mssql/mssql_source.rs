@@ -18,8 +18,8 @@
 use crate::fixtures::{
     MSSQL_ORDERS_INSTANCE, MssqlAllTypesFixture, MssqlCdcDisabledFixture,
     MssqlDuplicateTableFixture, MssqlInvalidCredentialsFixture, MssqlLatestStartFixture,
-    MssqlMissingTableFixture, MssqlSourceFixture, MssqlSourceManualScanFixture,
-    MssqlUncapturedTableFixture, MssqlUnsupportedTypeFixture,
+    MssqlMissingTableFixture, MssqlOlderInstanceHistoryFixture, MssqlSourceFixture,
+    MssqlSourceManualScanFixture, MssqlUncapturedTableFixture, MssqlUnsupportedTypeFixture,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -735,6 +735,22 @@ async fn second_capture_instance_is_read_after_restart_without_loss(
     received.extend(receive_from(harness, "mssql_rotation", 1).await);
 
     assert_eq!(received.len(), 5, "every change must arrive exactly once");
+    assert_unique_ids(&received);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/mssql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn earliest_start_reads_changes_retained_only_in_older_instance(
+    harness: &TestHarness,
+    _fixture: MssqlOlderInstanceHistoryFixture,
+) {
+    wait_until_running(harness).await;
+
+    let received = receive_from(harness, "mssql_older_history", 4).await;
+
+    assert_eq!(received.len(), 4, "every retained change must arrive once");
     assert_unique_ids(&received);
 }
 

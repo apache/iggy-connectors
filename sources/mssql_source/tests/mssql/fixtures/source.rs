@@ -66,6 +66,8 @@ struct Settings {
     start_position: &'static str,
     /// Orders inserted and captured before the connector starts.
     seeded_orders: usize,
+    /// A second instance on `dbo.orders` created after the seeded orders, then one more order.
+    second_orders_instance: Option<&'static str>,
     /// Logs every batch at info, so a test can count batches.
     verbose_logging: bool,
 }
@@ -81,6 +83,7 @@ impl Default for Settings {
             extra_sql: None,
             start_position: "earliest",
             seeded_orders: 0,
+            second_orders_instance: None,
             verbose_logging: false,
         }
     }
@@ -154,6 +157,16 @@ fixture_variant!(
     Settings {
         start_position: "latest",
         seeded_orders: 3,
+        ..Settings::default()
+    }
+);
+
+fixture_variant!(
+    /// Three orders held only by `dbo_orders`, then `dbo_orders_v2` and a fourth order held by both.
+    MssqlOlderInstanceHistoryFixture,
+    Settings {
+        seeded_orders: 3,
+        second_orders_instance: Some("dbo_orders_v2"),
         ..Settings::default()
     }
 );
@@ -412,6 +425,19 @@ impl MssqlSourceFixture {
                 .await;
             fixture
                 .wait_for_change_rows(MSSQL_ORDERS_INSTANCE, fixture.settings.seeded_orders)
+                .await;
+        }
+        if let Some(capture_instance) = fixture.settings.second_orders_instance {
+            fixture.add_orders_instance(capture_instance).await;
+            let id = fixture.settings.seeded_orders + 1;
+            fixture
+                .execute(&format!(
+                    "INSERT INTO dbo.orders (id, amount) VALUES ({id}, 1.00)"
+                ))
+                .await;
+            fixture.wait_for_change_rows(capture_instance, 1).await;
+            fixture
+                .wait_for_change_rows(MSSQL_ORDERS_INSTANCE, id)
                 .await;
         }
         Ok(fixture)

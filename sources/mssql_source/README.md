@@ -119,6 +119,10 @@ under a case-insensitive collation, and listing both fails startup.
 `start_position = "earliest"` reads every change still retained by CDC. `"latest"` skips retained history and starts
 with changes committed after the first start. Both apply only when no checkpoint is saved.
 
+A table read for the first time starts on the newest capture instance that holds every change after the checkpoint,
+or else on the instance with the oldest retained change. With `earliest` and no checkpoint, that is the oldest
+instance.
+
 The `latest` position is saved with the first acknowledged batch. If the connector stops before that, the next start
 picks a new `latest` position, and changes committed in between are skipped.
 
@@ -340,6 +344,7 @@ A schema change needs a new capture instance. SQL Server allows two per table. T
 
 Dropping `_v1` before step 2 leaves no way to prove that no change was missed, and startup fails. The connector
 switches instances only at startup. Event shapes can change at the switch, because `_v2` can capture other columns.
+A connector first started while both instances exist reads `_v1` until it is dropped and the connector restarts.
 
 ---
 

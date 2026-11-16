@@ -226,6 +226,10 @@ impl MssqlSource {
         let configured: HashSet<String> = canonical.keys().map(TableName::to_string).collect();
         state.tables.retain(|table, _| configured.contains(table));
 
+        if state.checkpoint.is_none() && self.config.start_position == StartPosition::Latest {
+            state.checkpoint = Some(latest_checkpoint(max_lsn));
+        }
+
         let mut instances = Vec::with_capacity(resolved_tables.len());
         for resolved in resolved_tables {
             let key = resolved.to_string();
@@ -238,7 +242,11 @@ impl MssqlSource {
                 minimums.push((instance.name.clone(), client.min_lsn(&instance.name).await?));
             }
             let recorded = state.tables.get(&key);
-            let needed = recorded.map(|entry| next_needed(state.checkpoint, entry.floor));
+            let first_read = recorded.is_none();
+            let needed = match recorded {
+                Some(entry) => Some(next_needed(state.checkpoint, entry.floor)),
+                None => state.checkpoint,
+            };
             let choice = choose_instance(
                 &minimums,
                 needed.map(|position| position.start_lsn),
@@ -262,7 +270,18 @@ impl MssqlSource {
                 }
             };
             let (name, min_lsn) = minimums[index].clone();
+            if let Some(needed) = needed
+                && first_read
+                && !needed.start_lsn.is_zero()
+                && min_lsn > needed.start_lsn
+            {
+                warn!(
+                    "{CONNECTOR_NAME} connector with ID {}: no capture instance of {key} holds every change after checkpoint {}, so it starts at {name} with minimum {min_lsn}",
+                    self.id, needed.start_lsn
+                );
+            }
             match state.tables.get_mut(&key) {
+                // The floor stays. A switch needs the new minimum at or below the next needed LSN.
                 Some(entry) if entry.capture_instance != name => {
                     info!(
                         "{CONNECTOR_NAME} connector with ID {} switches {key} from capture instance {} to {name}",
@@ -286,10 +305,6 @@ impl MssqlSource {
                 .nth(index)
                 .ok_or(MssqlError::MissingMetadata("chosen capture instance"))?;
             instances.push(CaptureInstance::new(chosen, resolved)?);
-        }
-
-        if state.checkpoint.is_none() && self.config.start_position == StartPosition::Latest {
-            state.checkpoint = Some(latest_checkpoint(max_lsn));
         }
 
         if state != original {
@@ -865,6 +880,10 @@ fn next_needed(checkpoint: Option<Position>, floor: Lsn) -> Position {
 }
 
 /// The newest instance whose minimum is at or below `next_needed`. Zero minimums are unusable.
+///
+/// Without `next_needed`, an earliest start with no checkpoint, the instance with the lowest
+/// minimum, which retains the most history. A table never read whose `next_needed` is below every
+/// minimum also starts at the lowest minimum, as nothing below it is retained.
 fn choose_instance(
     instances: &[(String, Lsn)],
     next_needed: Option<Lsn>,
@@ -872,16 +891,16 @@ fn choose_instance(
 ) -> Choice {
     let usable = |min_lsn: &Lsn| !min_lsn.is_zero();
     let Some(next_needed) = next_needed else {
-        return instances
-            .iter()
-            .position(|(_, min_lsn)| usable(min_lsn))
-            .map_or(Choice::NoUsable, Choice::Use);
+        return lowest_minimum(instances);
     };
     if let Some(index) = instances
         .iter()
         .position(|(_, min_lsn)| usable(min_lsn) && *min_lsn <= next_needed)
     {
         return Choice::Use(index);
+    }
+    if recorded.is_none() {
+        return lowest_minimum(instances);
     }
     match instances
         .iter()
@@ -890,6 +909,17 @@ fn choose_instance(
         Some((_, min_lsn)) => Choice::Gap { min_lsn: *min_lsn },
         None => Choice::NoUsable,
     }
+}
+
+/// The usable instance with the lowest minimum. The list is newest first, and `min_by_key` keeps
+/// the first of equal minimums, so a tie goes to the newest instance.
+fn lowest_minimum(instances: &[(String, Lsn)]) -> Choice {
+    instances
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, min_lsn))| !min_lsn.is_zero())
+        .min_by_key(|(_, (_, min_lsn))| *min_lsn)
+        .map_or(Choice::NoUsable, |(index, _)| Choice::Use(index))
 }
 
 /// A gap when cleanup moved the minimum past the next needed LSN, or a missing instance when it is zero.
@@ -1291,10 +1321,58 @@ mod tests {
     }
 
     #[test]
-    fn given_no_table_state_should_choose_newest_usable_instance() {
-        let minimums = instances(&[("dbo_users_v2", 0), ("dbo_users", 3)]);
+    fn given_no_table_state_should_choose_lowest_minimum() {
+        let minimums = instances(&[("dbo_users_v2", 6), ("dbo_users", 3)]);
 
         assert_eq!(choose_instance(&minimums, None, None), Choice::Use(1));
+    }
+
+    #[test]
+    fn given_no_table_state_and_equal_minimums_should_choose_newest() {
+        let minimums = instances(&[("dbo_users_v2", 3), ("dbo_users", 3)]);
+
+        assert_eq!(choose_instance(&minimums, None, None), Choice::Use(0));
+    }
+
+    #[test]
+    fn given_no_table_state_and_newest_covering_checkpoint_should_choose_newest() {
+        let minimums = instances(&[("dbo_users_v2", 4), ("dbo_users", 3)]);
+
+        assert_eq!(
+            choose_instance(&minimums, Some(lsn(5)), None),
+            Choice::Use(0)
+        );
+    }
+
+    #[test]
+    fn given_no_table_state_and_checkpoint_below_every_minimum_should_choose_lowest_minimum() {
+        let minimums = instances(&[("dbo_users_v2", 9), ("dbo_users", 7)]);
+
+        assert_eq!(
+            choose_instance(&minimums, Some(lsn(5)), None),
+            Choice::Use(1)
+        );
+        assert_eq!(
+            choose_instance(&minimums, Some(Lsn::ZERO), None),
+            Choice::Use(1)
+        );
+    }
+
+    #[test]
+    fn given_no_table_state_should_skip_zero_minimum() {
+        let minimums = instances(&[("dbo_users_v2", 6), ("dbo_users", 0)]);
+
+        assert_eq!(choose_instance(&minimums, None, None), Choice::Use(0));
+    }
+
+    #[test]
+    fn given_recorded_table_below_every_minimum_should_report_gap() {
+        let minimums = instances(&[("dbo_users_v2", 9), ("dbo_users", 7)]);
+
+        assert_eq!(
+            choose_instance(&minimums, Some(lsn(5)), Some("dbo_users")),
+            Choice::Gap { min_lsn: lsn(7) }
+        );
     }
 
     #[test]

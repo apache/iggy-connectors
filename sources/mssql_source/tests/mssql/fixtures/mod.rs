@@ -21,6 +21,6 @@ mod source;
 pub use source::{
     MSSQL_ORDERS_INSTANCE, MssqlAllTypesFixture, MssqlCdcDisabledFixture,
     MssqlDuplicateTableFixture, MssqlInvalidCredentialsFixture, MssqlLatestStartFixture,
-    MssqlMissingTableFixture, MssqlSourceFixture, MssqlSourceManualScanFixture,
-    MssqlUncapturedTableFixture, MssqlUnsupportedTypeFixture,
+    MssqlMissingTableFixture, MssqlOlderInstanceHistoryFixture, MssqlSourceFixture,
+    MssqlSourceManualScanFixture, MssqlUncapturedTableFixture, MssqlUnsupportedTypeFixture,
 };

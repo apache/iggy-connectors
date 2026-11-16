@@ -361,10 +361,6 @@ impl FlussSource {
         }
     }
 
-    fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
-        ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
-    }
-
     fn client_config(&self) -> Config {
         let mut config = Config {
             bootstrap_servers: self.config.bootstrap_servers.clone(),
@@ -648,12 +644,13 @@ impl FlussSource {
         candidate.bucket_offsets.extend(polled_offsets);
         candidate.messages_produced += produced as u64;
         candidate.rows_skipped += skipped as u64;
-        let persisted = self.serialize_state(&candidate).ok_or_else(|| {
-            Error::Serialization(format!(
-                "failed to serialize state for {CONNECTOR_NAME} connector with ID: {}",
-                self.id
-            ))
-        })?;
+        let persisted =
+            ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id).ok_or_else(|| {
+                Error::Serialization(format!(
+                    "failed to serialize state for {CONNECTOR_NAME} connector with ID: {}",
+                    self.id
+                ))
+            })?;
         Ok(Some((candidate, persisted)))
     }
 

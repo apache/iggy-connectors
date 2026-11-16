@@ -446,9 +446,10 @@ impl MssqlSource {
             Err(error) => return Err(self.log_stuck(client, error).await),
         };
         let mut messages = Vec::with_capacity(events.len());
-        for event in &events {
-            let message =
-                produced_message(event).map_err(|error| MssqlError::Encoding(error.to_string()))?;
+        // Consumed, so each JSON tree is freed once its payload is serialized.
+        for event in events {
+            let message = produced_message(&event)
+                .map_err(|error| MssqlError::Encoding(error.to_string()))?;
             if let Err(error) =
                 check_payload_size(event.table, event.position, message.payload.len())
             {

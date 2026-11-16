@@ -214,6 +214,7 @@ A source produces messages to an Iggy stream and topic. Configure one `[[streams
 | [MQTT](sources/mqtt_source/README.md)                   | the topics of an MQTT 3.1.1 or MQTT 5 broker, with QoS 0, 1 or 2                             |
 | [PostgreSQL](sources/postgres_source/README.md)         | PostgreSQL tables, by table polling or Change Data Capture                                   |
 | [Random](sources/random_source/README.md)               | random test messages, for testing and development                                            |
+| [SQL Server](sources/mssql_source/README.md)            | SQL Server change data capture (CDC) events, in commit order across tables                   |
 
 ## Write a connector
 

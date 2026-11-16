@@ -23,5 +23,16 @@ nextest-version = { required = "0.9.127" }
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# MSSQL tests share one reusable SQL Server container (`iggy-test-mssql`), which
+# needs about 2 GB. Each fixture creates its own database in it.
+[test-groups.mssql]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(iggy_connector_mssql_source) and kind(test)'
+test-group = "mssql"
+# A test can wait up to 180 s for SQL Server to start and up to 180 s for delivery.
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 [profile.ci]
 retries = 3

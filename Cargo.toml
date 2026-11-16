@@ -42,6 +42,7 @@ members = [
     "sources/http_source",
     "sources/influxdb_source",
     "sources/mqtt_source",
+    "sources/mssql_source",
     "sources/postgres_source",
     "sources/random_source",
     "testing",
@@ -193,10 +194,16 @@ tempfile = "3.27.0"
 testcontainers = { version = "0.27.3", features = ["reusable-containers"] }
 testcontainers-modules = { version = "0.15.0", features = ["postgres", "http_wait"] }
 thiserror = "2.0.21"
+tiberius = { version = "0.13.0", default-features = false, features = [
+    "chrono",
+    "rustls",
+    "tds80",
+] }
 token-source = "1.0.0"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-postgres = "0.7.18"
 tokio-stream = { version = "0.1.19", features = ["net"] }
+tokio-util = { version = "0.7.20", features = ["compat"] }
 toml = "1.1.8"
 tonic = { version = "0.14.9", default-features = false, features = ["codegen", "router", "server"] }
 tonic-prost = "0.14.9"

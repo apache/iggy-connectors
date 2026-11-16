@@ -769,13 +769,6 @@ fn validate_config(config: &MssqlSourceConfig) -> Result<ValidatedConfig, Error>
         DEFAULT_QUERY_TIMEOUT,
         "query_timeout",
     )?;
-    if names_instance_without_port(config.connection_string.expose_secret()) {
-        return Err(Error::InvalidConfigValue(
-            "connection_string names an instance (host\\instance) without a port. SQL Browser lookup is not \
-             supported, so add the instance's port: Server=tcp:host,port"
-                .to_string(),
-        ));
-    }
     // The parse error can quote the string, so it is not passed on.
     let tiberius_config = tiberius::Config::from_ado_string(
         config.connection_string.expose_secret(),
@@ -785,6 +778,13 @@ fn validate_config(config: &MssqlSourceConfig) -> Result<ValidatedConfig, Error>
             "connection_string is not a valid ADO.NET connection string".to_string(),
         )
     })?;
+    if names_instance_without_port(config.connection_string.expose_secret()) {
+        return Err(Error::InvalidConfigValue(
+            "connection_string names an instance (host\\instance) without a port. SQL Browser lookup is not \
+             supported, so add the instance's port: Server=tcp:host,port"
+                .to_string(),
+        ));
+    }
     Ok(ValidatedConfig {
         tiberius_config,
         poll_interval,
@@ -797,19 +797,106 @@ fn validate_config(config: &MssqlSourceConfig) -> Result<ValidatedConfig, Error>
 
 /// A `Server=host\instance` value without `,port` makes the driver ask SQL Browser on UDP 1434.
 fn names_instance_without_port(connection_string: &str) -> bool {
-    connection_string
-        .split(';')
-        .filter_map(|pair| pair.split_once('='))
-        .filter(|(key, _)| {
-            matches!(
-                key.trim().to_ascii_lowercase().as_str(),
-                "server" | "data source" | "address" | "addr" | "network address"
-            )
-        })
-        .any(|(_, value)| {
-            let value = value.trim();
-            value.contains('\\') && !value.contains(',')
-        })
+    effective_server(connection_string).is_some_and(|server| {
+        let address = server.strip_prefix("tcp:").unwrap_or(&server);
+        address.contains('\\') && !address.contains(',')
+    })
+}
+
+/// The endpoint tiberius connects to: the last `Server` value, else the last `Data Source`. Other
+/// aliases such as `Address` are ignored by tiberius 0.13, so they are ignored here too.
+fn effective_server(connection_string: &str) -> Option<String> {
+    let mut server = None;
+    let mut data_source = None;
+    for (key, value) in ado_pairs(connection_string) {
+        match key.as_str() {
+            "server" => server = Some(value),
+            "data source" => data_source = Some(value),
+            _ => {}
+        }
+    }
+    server.or(data_source)
+}
+
+/// Key and value pairs by the tokenizer rules of tiberius 0.13: `;` separates pairs, keys are trimmed
+/// and lower-cased, and a value can be quoted with `'…'` or `"…"` (a doubled quote escapes) or `{…}`.
+/// It runs only on a string tiberius already accepted, so malformed input needs no error.
+fn ado_pairs(connection_string: &str) -> Vec<(String, String)> {
+    let bytes = connection_string.as_bytes();
+    let mut pairs = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && (bytes[index] == b';' || bytes[index].is_ascii_whitespace()) {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let mut key = String::new();
+        while index < bytes.len() && bytes[index] != b';' {
+            if bytes[index] == b'=' {
+                // `==` in a key is a literal `=`.
+                if bytes.get(index + 1) == Some(&b'=') {
+                    key.push('=');
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                break;
+            }
+            key.push(char::from(bytes[index]));
+            index += 1;
+        }
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let value = match bytes.get(index) {
+            Some(&quote @ (b'\'' | b'"')) => {
+                index += 1;
+                let mut value = String::new();
+                while index < bytes.len() {
+                    if bytes[index] == quote {
+                        if bytes.get(index + 1) == Some(&quote) {
+                            value.push(char::from(quote));
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    value.push(char::from(bytes[index]));
+                    index += 1;
+                }
+                value
+            }
+            Some(b'{') => {
+                let start = index + 1;
+                let end = connection_string[start..]
+                    .find('}')
+                    .map_or(bytes.len(), |offset| start + offset);
+                index = end + 1;
+                connection_string[start..end].to_string()
+            }
+            _ => {
+                let end = connection_string[index..]
+                    .find(';')
+                    .map_or(bytes.len(), |offset| index + offset);
+                let value = connection_string[index..end]
+                    .trim_end_matches(|character: char| character.is_ascii_whitespace())
+                    .to_string();
+                index = end;
+                value
+            }
+        };
+        while index < bytes.len() && bytes[index] != b';' {
+            index += 1;
+        }
+        let key = key
+            .trim_matches(|character: char| character.is_ascii_whitespace())
+            .to_ascii_lowercase();
+        pairs.push((key, value));
+    }
+    pairs
 }
 
 fn parse_duration(value: Option<&str>, default: &str, field: &str) -> Result<Duration, Error> {
@@ -1308,6 +1395,64 @@ mod tests {
             ),
             ..test_config()
         };
+
+        assert!(validate_config(&config).is_ok());
+    }
+
+    fn with_connection_string(connection_string: &str) -> MssqlSourceConfig {
+        MssqlSourceConfig {
+            connection_string: SecretString::from(connection_string),
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn given_server_overridden_with_port_should_accept_configuration() {
+        let config = with_connection_string(
+            r"Server=sql\INSTANCE;Server=tcp:sql,1433;Database=shop;User Id=sa;Password=x",
+        );
+
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn given_server_overridden_with_instance_without_port_should_reject_configuration() {
+        let config = with_connection_string(
+            r"Server=tcp:sql,1433;Server=sql\INSTANCE;Database=shop;User Id=sa;Password=x",
+        );
+
+        assert!(rejected(config).contains("without a port"));
+    }
+
+    #[test]
+    fn given_quoted_password_holding_server_entry_should_accept_configuration() {
+        for password in [r"'x;Server=h\i'", r#""x"";Server=h\i""#, r"{x;Server=h\i}"] {
+            let config = with_connection_string(&format!(
+                "Server=tcp:sql,1433;Database=shop;User Id=sa;Password={password}"
+            ));
+
+            assert!(validate_config(&config).is_ok(), "{password}");
+        }
+    }
+
+    #[test]
+    fn given_server_and_data_source_should_use_server() {
+        let with_port = with_connection_string(
+            r"Data Source=sql\SALES;Server=sql,1433;Database=shop;User Id=sa;Password=x",
+        );
+        let without_port = with_connection_string(
+            r"Server=sql\SALES;Data Source=sql,1433;Database=shop;User Id=sa;Password=x",
+        );
+
+        assert!(validate_config(&with_port).is_ok());
+        assert!(rejected(without_port).contains("without a port"));
+    }
+
+    #[test]
+    fn given_address_alias_should_be_ignored_like_the_driver() {
+        let config = with_connection_string(
+            r"Server=tcp:sql,1433;Address=sql\SALES;Database=shop;User Id=sa;Password=x",
+        );
 
         assert!(validate_config(&config).is_ok());
     }

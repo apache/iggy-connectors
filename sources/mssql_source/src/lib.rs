@@ -79,7 +79,8 @@ pub enum StartPosition {
     /// Read every change still retained by CDC.
     #[default]
     Earliest,
-    /// Skip the retained history and read changes committed after the first start.
+    /// Skip the changes CDC has captured so far and read from the capture job's position at the first
+    /// start. Changes committed before that start but not yet captured are still read.
     Latest,
 }
 

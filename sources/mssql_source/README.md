@@ -145,8 +145,10 @@ Without a port the connection uses 1433. A named instance (`Server=host\instance
 `tables` must not use brackets. Names are resolved by SQL Server, so `dbo.Users` and `dbo.users` are the same table
 under a case-insensitive collation, and listing both fails startup.
 
-`start_position = "earliest"` reads every change still retained by CDC. `"latest"` skips retained history and starts
-with changes committed after the first start. Both apply only when no checkpoint is saved.
+`start_position = "earliest"` reads every change still retained by CDC. `"latest"` skips the changes CDC has captured
+before the first start and reads everything after the capture job's position at that moment
+(`sys.fn_cdc_get_max_lsn`). Changes committed shortly before the start that the capture job has not read yet still
+arrive, so the cutoff trails the start by the capture lag. Both apply only when no checkpoint is saved.
 
 A table read for the first time starts on the newest capture instance that holds every change after the checkpoint,
 or else on the instance with the oldest retained change. With `earliest` and no checkpoint, that is the oldest

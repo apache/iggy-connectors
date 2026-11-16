@@ -16,11 +16,11 @@
 // under the License.
 
 use crate::fixtures::{
-    MSSQL_ORDERS_INSTANCE, MssqlAllTypesFixture, MssqlCdcDisabledFixture,
+    DOCUMENTED_GRANTS, MSSQL_ORDERS_INSTANCE, MssqlAllTypesFixture, MssqlCdcDisabledFixture,
     MssqlDuplicateTableFixture, MssqlInvalidCredentialsFixture, MssqlLatestStartFixture,
-    MssqlMissingTableFixture, MssqlOlderInstanceHistoryFixture, MssqlSourceFixture,
-    MssqlSourceManualScanFixture, MssqlUncapturedTableFixture, MssqlUniqueSwapFixture,
-    MssqlUnsupportedTypeFixture,
+    MssqlMissingTableFixture, MssqlOlderInstanceHistoryFixture, MssqlRestrictedLoginFixture,
+    MssqlRestrictedLoginWithoutRoleFixture, MssqlSourceFixture, MssqlSourceManualScanFixture,
+    MssqlUncapturedTableFixture, MssqlUniqueSwapFixture, MssqlUnsupportedTypeFixture,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -52,6 +52,8 @@ const LSN_GAP_MARKER: &str = "were cleaned up";
 // The runtime logs this when the source stops itself through on_batch_result.
 const RUNTIME_STOP_MARKER: &str = "batch result could not be applied";
 const NO_USABLE_INSTANCE_MARKER: &str = "no capture instance of";
+// The requirement the zero-minimum hint names, as the README quotes it.
+const CHANGE_DATA_ACCESS_MARKER: &str = "membership in the instance's gating role, if one was set";
 const INSTANCE_MISSING_MARKER: &str = "no longer exists";
 const LOGIN_FAILED_MARKER: &str = "Login failed";
 const TABLE_NOT_FOUND_MARKER: &str = "table dbo.missing does not exist";
@@ -1074,6 +1076,55 @@ fn assert_replays_without_unique_conflict(received: &[Received]) {
             );
         }
     }
+}
+
+// The login is also denied VIEW ANY DATABASE, so this covers a server whose public role lacks it.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/mssql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn restricted_login_with_documented_grants_streams_changes(
+    harness: &TestHarness,
+    fixture: MssqlRestrictedLoginFixture,
+) {
+    wait_until_running(harness).await;
+    fixture
+        .execute("INSERT INTO dbo.gated (id, qty, body) VALUES (1, 1, N'long text')")
+        .await;
+    let mut received = receive_from(harness, "mssql_restricted", 1).await;
+    fixture
+        .execute("UPDATE dbo.gated SET qty = 2 WHERE id = 1")
+        .await;
+
+    received.extend(receive_from(harness, "mssql_restricted", 1).await);
+
+    let ops: Vec<_> = received.iter().map(Received::op).collect();
+    assert_eq!(ops, ["insert", "update"]);
+    // Listing the unchanged LOB needs its max_length from sys.columns, which this login must see.
+    assert_eq!(received[1].event["unavailable_columns"], json!(["body"]));
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/mssql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn restricted_login_without_gating_role_fails_source_initialization(
+    harness: &TestHarness,
+    _fixture: MssqlRestrictedLoginWithoutRoleFixture,
+) {
+    assert_stops_with(harness, NO_USABLE_INSTANCE_MARKER).await;
+    let runtime = harness.connectors_runtime().expect("connectors runtime");
+    assert_logs_contain(runtime, CHANGE_DATA_ACCESS_MARKER);
+}
+
+#[test]
+fn readme_documents_every_grant_of_the_restricted_login_tests() {
+    let readme = include_str!("../../README.md");
+
+    for grant in DOCUMENTED_GRANTS {
+        assert!(readme.contains(grant), "README is missing {grant}");
+    }
+    assert!(readme.contains(CHANGE_DATA_ACCESS_MARKER));
 }
 
 /// Inserts three orders and waits until they are in Iggy and the checkpoint is saved.

@@ -19,8 +19,8 @@ use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_CONNECTION_STRING,
     ENV_SOURCE_PATH, ENV_SOURCE_POLL_INTERVAL, ENV_SOURCE_START_POSITION,
     ENV_SOURCE_STREAMS_0_SCHEMA, ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC,
-    ENV_SOURCE_TABLES, ENV_SOURCE_VERBOSE_LOGGING, MSSQL_CONTAINER_NAME, MssqlContainer, SqlClient,
-    connect_to, execute, setup_error,
+    ENV_SOURCE_TABLES, ENV_SOURCE_VERBOSE_LOGGING, MSSQL_CONTAINER_NAME, MssqlContainer,
+    SA_PASSWORD, SqlClient, connect_to, execute, setup_error,
 };
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
@@ -30,6 +30,16 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 pub const MSSQL_ORDERS_INSTANCE: &str = "dbo_orders";
+/// The grants of the README's permissions script, word for word. A test checks that the README holds each.
+pub const DOCUMENTED_GRANTS: [&str; 3] = [
+    "GRANT SELECT ON SCHEMA::cdc TO [<user>];",
+    "GRANT SELECT ON [<schema>].[<table>] TO [<user>];",
+    "ALTER ROLE [<gating_role>] ADD MEMBER [<user>];",
+];
+const GATED_ROLE: &str = "cdc_gated";
+const GATED_TABLE: &str = "CREATE TABLE dbo.gated (id INT PRIMARY KEY, qty INT NOT NULL, body NVARCHAR(MAX) NULL); \
+    EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'gated', @role_name = N'cdc_gated'";
+const RESTRICTED_PASSWORD: &str = "Iggy_Restricted_Passw0rd!";
 const ALL_TYPES_TABLE: &str = "CREATE TABLE dbo.types ( \
     id INT PRIMARY KEY, c_tinyint TINYINT, c_smallint SMALLINT, c_bigint BIGINT, c_bit BIT, \
     c_decimal DECIMAL(10, 2), c_numeric NUMERIC(38, 10), c_money MONEY, c_smallmoney SMALLMONEY, \
@@ -70,6 +80,15 @@ struct Settings {
     second_orders_instance: Option<&'static str>,
     /// Logs every batch at info, so a test can count batches.
     verbose_logging: bool,
+    /// Runs the connector as its own login instead of sa.
+    restricted_login: Option<RestrictedLogin>,
+}
+
+/// A login named after the test database, with the documented grants on `dbo.gated`. It is denied
+/// `VIEW ANY DATABASE`, which is stricter than a `public` role without that permission.
+#[derive(Clone, Copy)]
+struct RestrictedLogin {
+    gating_role_member: bool,
 }
 
 impl Default for Settings {
@@ -85,6 +104,7 @@ impl Default for Settings {
             seeded_orders: 0,
             second_orders_instance: None,
             verbose_logging: false,
+            restricted_login: None,
         }
     }
 }
@@ -182,6 +202,32 @@ fixture_variant!(
              @role_name = NULL; \
              INSERT INTO dbo.codes (id, code) VALUES (1, 10), (2, 20)"
         ),
+        ..Settings::default()
+    }
+);
+
+fixture_variant!(
+    /// The connector runs as a restricted login with every documented grant on the gated `dbo.gated`.
+    MssqlRestrictedLoginFixture,
+    Settings {
+        tables: "[dbo.gated]",
+        extra_sql: Some(GATED_TABLE),
+        restricted_login: Some(RestrictedLogin {
+            gating_role_member: true,
+        }),
+        ..Settings::default()
+    }
+);
+
+fixture_variant!(
+    /// As [`MssqlRestrictedLoginFixture`], but the login is not in the gating role of `dbo_gated`.
+    MssqlRestrictedLoginWithoutRoleFixture,
+    Settings {
+        tables: "[dbo.gated]",
+        extra_sql: Some(GATED_TABLE),
+        restricted_login: Some(RestrictedLogin {
+            gating_role_member: false,
+        }),
         ..Settings::default()
     }
 );
@@ -418,6 +464,9 @@ impl MssqlSourceFixture {
                 .await
                 .map_err(|error| setup_error(format!("Fixture SQL failed: {error}")))?;
         }
+        if let Some(login) = settings.restricted_login {
+            create_restricted_login(&mut master, &mut client, &database, login).await?;
+        }
         match settings.capture_job {
             CaptureJob::Running => restart_capture_job(&mut client).await?,
             CaptureJob::Stopped => stop_capture_job(&mut client).await?,
@@ -462,8 +511,18 @@ impl MssqlSourceFixture {
         HashMap::from([
             (
                 ENV_SOURCE_CONNECTION_STRING.to_string(),
-                self.container
-                    .connection_string(&self.database, self.settings.password),
+                match self.settings.restricted_login {
+                    Some(_) => self.container.connection_string(
+                        &self.database,
+                        &self.database,
+                        RESTRICTED_PASSWORD,
+                    ),
+                    None => self.container.connection_string(
+                        &self.database,
+                        "sa",
+                        self.settings.password.unwrap_or(SA_PASSWORD),
+                    ),
+                },
             ),
             (
                 ENV_SOURCE_TABLES.to_string(),
@@ -518,6 +577,7 @@ impl Drop for MssqlSourceFixture {
     fn drop(&mut self) {
         let port = self.container.port;
         let database = self.database.clone();
+        let restricted = self.settings.restricted_login.is_some();
         // Drop cannot await, and the test's runtime may be shutting down, so a short-lived runtime does the work.
         let dropped = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -526,13 +586,17 @@ impl Drop for MssqlSourceFixture {
                 .ok()?;
             runtime.block_on(async {
                 let mut master = connect_to(port, "master").await.ok()?;
-                drop_database(&mut master, &database).await.ok()
+                drop_database(&mut master, &database).await.ok()?;
+                if restricted {
+                    drop_login(&mut master, &database).await.ok()?;
+                }
+                Some(())
             })
         })
         .join();
         if !matches!(dropped, Ok(Some(()))) {
             tracing::warn!(
-                "Could not drop test database {}, the stale sweep will",
+                "Could not drop test database or login {}, the stale sweep will",
                 self.database
             );
         }
@@ -612,6 +676,58 @@ async fn drop_database(
     .map(|_| ())
 }
 
+/// Creates the login named `name` with the documented grants, and denies it `VIEW ANY DATABASE`.
+async fn create_restricted_login(
+    master: &mut SqlClient,
+    client: &mut SqlClient,
+    name: &str,
+    login: RestrictedLogin,
+) -> Result<(), TestBinaryError> {
+    execute(
+        master,
+        &format!(
+            "CREATE LOGIN [{name}] WITH PASSWORD = N'{RESTRICTED_PASSWORD}', CHECK_POLICY = OFF; \
+             DENY VIEW ANY DATABASE TO [{name}]"
+        ),
+    )
+    .await
+    .map_err(|error| setup_error(format!("CREATE LOGIN failed: {error}")))?;
+    let mut sql = format!("CREATE USER [{name}] FOR LOGIN [{name}]; ");
+    for grant in DOCUMENTED_GRANTS {
+        if grant.starts_with("ALTER ROLE") && !login.gating_role_member {
+            continue;
+        }
+        sql.push_str(
+            &grant
+                .replace("<user>", name)
+                .replace("<schema>", "dbo")
+                .replace("<table>", "gated")
+                .replace("<gating_role>", GATED_ROLE),
+        );
+        sql.push(' ');
+    }
+    execute(client, &sql)
+        .await
+        .map_err(|error| setup_error(format!("Restricted login grants failed: {error}")))?;
+    Ok(())
+}
+
+/// Ends the login's sessions first, because a login with a session cannot be dropped.
+async fn drop_login(master: &mut SqlClient, login: &str) -> Result<(), tiberius::error::Error> {
+    execute(
+        master,
+        &format!(
+            "DECLARE @kill NVARCHAR(MAX) = N''; \
+             SELECT @kill += N'KILL ' + CAST(session_id AS NVARCHAR(10)) + N'; ' \
+             FROM sys.dm_exec_sessions WHERE login_name = N'{login}'; \
+             EXEC (@kill); \
+             IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}]"
+        ),
+    )
+    .await
+    .map(|_| ())
+}
+
 async fn drop_stale_databases(master: &mut SqlClient) -> Result<(), TestBinaryError> {
     let rows = execute(
         master,
@@ -629,6 +745,22 @@ async fn drop_stale_databases(master: &mut SqlClient) -> Result<(), TestBinaryEr
     for name in names {
         // A failed drop only leaves a stale database behind, so it does not fail the test.
         let _ = drop_database(master, &name).await;
+    }
+    let rows = execute(
+        master,
+        &format!(
+            "SELECT name FROM sys.server_principals WHERE type = 'S' AND name LIKE N'{DATABASE_PREFIX}%' \
+             AND create_date < DATEADD(MINUTE, -{STALE_DATABASE_MINUTES}, GETDATE())"
+        ),
+    )
+    .await
+    .map_err(|error| setup_error(format!("Failed to list stale logins: {error}")))?;
+    let logins: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.get::<&str, _>(0).map(str::to_string))
+        .collect();
+    for login in logins {
+        let _ = drop_login(master, &login).await;
     }
     Ok(())
 }

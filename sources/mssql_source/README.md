@@ -89,15 +89,41 @@ EXEC sys.sp_cdc_enable_table
 SQL Server Agent must be running. Without it the capture job never runs and the change tables stay empty. In the
 official container image, set `MSSQL_AGENT_ENABLED=true`.
 
-The connector login needs:
+The connector login needs no server-level permission, and none beyond these in the database. This script creates
+one. Fill in the placeholders and repeat the per-table and per-role lines as needed:
 
-- `SELECT` on the `cdc` schema, to read `cdc.change_tables`, `cdc.captured_columns` and the change tables
-  `cdc.<instance>_CT`. The connector reads the change tables directly, because `fn_cdc_get_all_changes_<instance>`
-  does not return `__$command_id`. A gating role set with `@role_name` grants access only to that function, so it
-  does not give the connector access.
-- `VIEW DATABASE STATE`, to read `sys.database_recovery_status` for the restore check.
+```sql
+USE master;
+CREATE LOGIN [<user>] WITH PASSWORD = '<password>';
 
-The integration tests run as `sa`. This minimal set has not been verified against a restricted login yet.
+USE [<database>];
+CREATE USER [<user>] FOR LOGIN [<user>];
+GRANT SELECT ON SCHEMA::cdc TO [<user>];
+-- For each source table. SELECT on every captured column of the table also works.
+GRANT SELECT ON [<schema>].[<table>] TO [<user>];
+-- For each capture instance enabled with @role_name. sp_cdc_enable_table creates the role.
+ALTER ROLE [<gating_role>] ADD MEMBER [<user>];
+```
+
+| Grant | Needed by | Without it |
+| --- | --- | --- |
+| `SELECT` on schema `cdc` | `cdc.change_tables`, `cdc.captured_columns`, the change tables `cdc.<instance>_CT` and `cdc.lsn_time_mapping` | `server error 229` (permission denied) |
+| `SELECT` on the source table, or on every captured column | `OBJECT_ID` when resolving `tables`, and `sys.fn_cdc_get_min_lsn` | `table <table> does not exist, or the login has no permission on it`, or the gating role row below |
+| Gating role membership, when `@role_name` was set | `sys.fn_cdc_get_min_lsn`, which returns zero for a caller it does not authorize | `no capture instance of <table> …`, explained as needing `SELECT on every captured column of the table and membership in the instance's gating role, if one was set` |
+
+`VIEW DEFINITION` on a table is not enough: it resolves the table, but the minimum LSN stays zero. The connector reads
+the change tables directly, so the gating role does not grant it access to the changes, but `sys.fn_cdc_get_min_lsn`
+still checks the role.
+
+The restore check reads `sys.database_recovery_status` and `sys.databases` for the connected database only. SQL
+Server shows a login those rows without any grant, also when `public` lacks `VIEW ANY DATABASE` or the login is
+denied it. This was tested on SQL Server 2022.
+
+The capture and cleanup jobs run under SQL Server Agent, not under this login.
+
+The integration tests `restricted_login_with_documented_grants_streams_changes` and
+`restricted_login_without_gating_role_fails_source_initialization` run the connector as a login with exactly these
+grants, denied `VIEW ANY DATABASE`.
 
 ---
 

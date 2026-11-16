@@ -19,9 +19,9 @@ mod container;
 mod source;
 
 pub use source::{
-    MSSQL_ORDERS_INSTANCE, MssqlAllTypesFixture, MssqlCdcDisabledFixture,
+    DOCUMENTED_GRANTS, MSSQL_ORDERS_INSTANCE, MssqlAllTypesFixture, MssqlCdcDisabledFixture,
     MssqlDuplicateTableFixture, MssqlInvalidCredentialsFixture, MssqlLatestStartFixture,
-    MssqlMissingTableFixture, MssqlOlderInstanceHistoryFixture, MssqlSourceFixture,
-    MssqlSourceManualScanFixture, MssqlUncapturedTableFixture, MssqlUniqueSwapFixture,
-    MssqlUnsupportedTypeFixture,
+    MssqlMissingTableFixture, MssqlOlderInstanceHistoryFixture, MssqlRestrictedLoginFixture,
+    MssqlRestrictedLoginWithoutRoleFixture, MssqlSourceFixture, MssqlSourceManualScanFixture,
+    MssqlUncapturedTableFixture, MssqlUniqueSwapFixture, MssqlUnsupportedTypeFixture,
 };

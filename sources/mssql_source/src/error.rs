@@ -19,6 +19,8 @@ use crate::lsn::{InvalidLsnLength, Lsn, Position};
 use std::fmt;
 
 const INVALID_OBJECT_NAME: u32 = 208;
+/// What `sys.fn_cdc_get_min_lsn` checks before it returns a minimum other than zero.
+const CHANGE_DATA_ACCESS: &str = "SELECT on every captured column of the table and membership in the instance's gating role, if one was set";
 
 #[derive(Debug)]
 pub(crate) enum MssqlError {
@@ -195,7 +197,10 @@ impl fmt::Display for MssqlError {
                 formatter,
                 "CDC is not enabled on database '{database}'. Check Database= in the connection string and run sys.sp_cdc_enable_db"
             ),
-            Self::TableNotFound { table } => write!(formatter, "table {table} does not exist"),
+            Self::TableNotFound { table } => write!(
+                formatter,
+                "table {table} does not exist, or the login has no permission on it"
+            ),
             Self::TableNotCaptured { table } => write!(
                 formatter,
                 "table {table} has no CDC capture instance. Run sys.sp_cdc_enable_table"
@@ -230,7 +235,8 @@ impl fmt::Display for MssqlError {
                 if !instances.is_empty() && instances.iter().all(|(_, min_lsn)| min_lsn.is_zero()) {
                     write!(
                         formatter,
-                        ". A zero minimum means the instance is gone or the login cannot read its change data"
+                        ". A zero minimum means the instance is gone or the login cannot read its change data, \
+                         which needs {CHANGE_DATA_ACCESS}"
                     )?;
                 }
                 Ok(())
@@ -240,7 +246,8 @@ impl fmt::Display for MssqlError {
                 capture_instance,
             } => write!(
                 formatter,
-                "capture instance {capture_instance} of {table} no longer exists, or the login can no longer read its change data"
+                "capture instance {capture_instance} of {table} no longer exists, or the login can no longer read \
+                 its change data, which needs {CHANGE_DATA_ACCESS}"
             ),
             Self::LsnGap {
                 table,
@@ -359,11 +366,9 @@ mod tests {
             next_needed: Lsn::ZERO,
         };
 
-        assert!(
-            error
-                .to_string()
-                .contains("the login cannot read its change data")
-        );
+        let message = error.to_string();
+        assert!(message.contains("the login cannot read its change data"));
+        assert!(message.contains("membership in the instance's gating role"));
     }
 
     #[test]

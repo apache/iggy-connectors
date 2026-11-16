@@ -82,11 +82,10 @@ impl MssqlContainer {
         Ok(started)
     }
 
-    pub(super) fn connection_string(&self, database: &str, password: Option<&str>) -> String {
+    pub(super) fn connection_string(&self, database: &str, user: &str, password: &str) -> String {
         format!(
-            "Server=tcp:127.0.0.1,{};Database={database};User Id=sa;Password={};TrustServerCertificate=true",
-            self.port,
-            password.unwrap_or(SA_PASSWORD)
+            "Server=tcp:127.0.0.1,{};Database={database};User Id={user};Password={password};TrustServerCertificate=true",
+            self.port
         )
     }
 

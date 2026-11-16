@@ -62,8 +62,9 @@ Everything else should match siblings.
 - Credentials are `secrecy::SecretString`, which hides the value in `Debug` output. It has no `Display` impl, so `{}` does not compile.
   The `iggy_common::serde_secret::serialize_secret` attribute the plugins add only
   lets the config derive `Serialize`: it writes the plaintext, so never serialize
-  a config into logs, errors or state. Use `serialize_redacted` where a redacted
-  copy is needed.
+  a config into logs, errors or state. For a redacted copy, serialize a separate view
+  with `serialize_redacted`. Never put it on a config field that is read back: it
+  writes the literal `[REDACTED]`, and a reload would store that as the secret.
 - Never log connection strings, API keys, or tokens.
 - Never persist URL userinfo / bearers into source state files.
 
@@ -146,7 +147,9 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
 ### Sink-specific
 
 - `async fn consume(&self, …)`.
-- Never convert a failed batch into bare `Ok(())`.
+- Never convert a failed batch into bare `Ok(())`. The one exception is the at-most-once
+  skip of a permanently rejected chunk: log it, count it and return `Ok`. Do not `break` out
+  of that arm, because later chunks of the call must still be delivered.
 - **Keep trying a batch within one time budget.** Retry transient errors
   with jittered backoff until a per-call budget (`max_delivery_time`,
   template default `20s`) runs out. Keep it well under a minute: the call
@@ -157,7 +160,7 @@ calls `on_batch_result(SourceBatchResult::Ack | Nack)`. Only
   can otherwise run past it.
 - **Use the circuit breaker to pace attempts, not to discard batches.**
   While it is open, wait for the cool-down instead of returning an error,
-  because a refused batch is gone for good. Record one failure per failed
+  because at most once a refused batch is gone for good. Record one failure per failed
   round, and keep the cool-down shorter than the budget.
 - **When you give up, say what was lost.** Log the stream, topic,
   partition and offset range, count the messages as failed, and stop

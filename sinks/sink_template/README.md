@@ -33,7 +33,8 @@ stores the offset of a partition only after `consume()` returned `Ok` and the
 flush that follows proved it. The
 template writes inside `consume()`, so the default no-op `flush()` is enough and
 `enable_at_least_once()` accepts the mode. A failed call is handed over again,
-and a message can arrive more than once, but none is skipped. A permanent
+and a message can arrive more than once, but the plugin skips none. The runtime setting
+`invalid_messages = "skip"` (default `stop`) can still skip a message before `consume()` sees it. A permanent
 failure stops delivery of that topic at that offset instead of skipping the batch. An
 unclassified failure ends the call at its chunk, and the runtime hands the batch
 over again.
@@ -315,7 +316,7 @@ to key your write on `dedup_key()`, and one is documentation only:
 `self.config.connection_string` and `self.config.target` (already validated), via
 `self.client`. The error you return steers the loop: transient errors are
 retried, a permanent error (`Error::is_permanent()`) skips the chunk (and stops
-the sink at least once), anything else is not retried (at least once it also
+delivery of that topic at least once), anything else is not retried (at least once it also
 stops the call at that chunk). Use
 `message.payload.try_to_bytes()` and do not clone `Payload::Json`. If the
 destination's call can succeed at the transport level while rejecting rows (a

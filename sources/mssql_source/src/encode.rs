@@ -156,7 +156,8 @@ pub(crate) fn is_column_changed(mask: &[u8], ordinal: u16) -> bool {
     mask[mask.len() - 1 - byte_from_end] & (1 << (bit % 8)) != 0
 }
 
-pub(crate) fn column_value(data: &ColumnData<'static>) -> Result<Value, ConversionError> {
+/// Takes the value by move, so a decoded string becomes the JSON string without a copy.
+pub(crate) fn column_value(data: ColumnData<'static>) -> Result<Value, ConversionError> {
     let value = match data {
         ColumnData::U8(value) => value.map(Value::from),
         ColumnData::I16(value) => value.map(Value::from),
@@ -165,39 +166,40 @@ pub(crate) fn column_value(data: &ColumnData<'static>) -> Result<Value, Conversi
         ColumnData::F32(value) => value.map(real).transpose()?,
         ColumnData::F64(value) => value.map(float).transpose()?,
         ColumnData::Bit(value) => value.map(Value::Bool),
-        ColumnData::String(value) => value.as_ref().map(|value| Value::String(value.to_string())),
+        ColumnData::String(value) => value.map(|value| Value::String(value.into_owned())),
         ColumnData::Guid(value) => value.map(|value| Value::String(value.to_string())),
-        ColumnData::Binary(value) => value
-            .as_ref()
-            .map(|value| Value::String(BASE64.encode(value))),
+        ColumnData::Binary(value) => value.map(|value| Value::String(BASE64.encode(value))),
         ColumnData::Numeric(value) => {
             value.map(|value| Value::String(format_numeric(value.value(), value.scale())))
         }
-        ColumnData::Xml(value) => value.as_ref().map(|value| Value::String(value.to_string())),
+        ColumnData::Xml(value) => {
+            value.map(|value| Value::String(value.into_owned().into_string()))
+        }
         // datetime ticks are 1/300 s. SQL Server shows them rounded to milliseconds.
-        ColumnData::DateTime(_) => from_sql::<NaiveDateTime>(data, "datetime")?
+        data @ ColumnData::DateTime(_) => from_sql::<NaiveDateTime>(&data, "datetime")?
             .map(|value| Value::String(format_datetime(value.round_subsecs(3)))),
-        ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => {
-            from_sql::<NaiveDateTime>(data, "datetime2")?
+        data @ (ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_)) => {
+            from_sql::<NaiveDateTime>(&data, "datetime2")?
                 .map(|value| Value::String(format_datetime(value)))
         }
-        ColumnData::Date(_) => from_sql::<NaiveDate>(data, "date")?
+        data @ ColumnData::Date(_) => from_sql::<NaiveDate>(&data, "date")?
             .map(|value| Value::String(value.format("%Y-%m-%d").to_string())),
-        ColumnData::Time(_) => from_sql::<NaiveTime>(data, "time")?.map(|value| {
+        data @ ColumnData::Time(_) => from_sql::<NaiveTime>(&data, "time")?.map(|value| {
             Value::String(format!(
                 "{}{}",
                 value.format("%H:%M:%S"),
                 fraction(value.nanosecond())
             ))
         }),
-        ColumnData::DateTimeOffset(_) => from_sql::<DateTime<FixedOffset>>(data, "datetimeoffset")?
-            .map(|value| {
+        data @ ColumnData::DateTimeOffset(_) => {
+            from_sql::<DateTime<FixedOffset>>(&data, "datetimeoffset")?.map(|value| {
                 Value::String(format!(
                     "{}{}",
                     format_datetime(value.naive_local()),
                     value.format("%:z")
                 ))
-            }),
+            })
+        }
     };
     Ok(value.unwrap_or(Value::Null))
 }
@@ -742,50 +744,44 @@ mod tests {
 
     #[test]
     fn given_integer_float_and_bit_variants_should_convert() {
-        assert_eq!(column_value(&ColumnData::U8(Some(7))), Ok(json!(7)));
-        assert_eq!(column_value(&ColumnData::I16(Some(-7))), Ok(json!(-7)));
+        assert_eq!(column_value(ColumnData::U8(Some(7))), Ok(json!(7)));
+        assert_eq!(column_value(ColumnData::I16(Some(-7))), Ok(json!(-7)));
+        assert_eq!(column_value(ColumnData::I32(Some(70000))), Ok(json!(70000)));
         assert_eq!(
-            column_value(&ColumnData::I32(Some(70000))),
-            Ok(json!(70000))
-        );
-        assert_eq!(
-            column_value(&ColumnData::I64(Some(i64::MAX))),
+            column_value(ColumnData::I64(Some(i64::MAX))),
             Ok(json!(i64::MAX))
         );
-        assert_eq!(column_value(&ColumnData::F32(Some(1.5))), Ok(json!(1.5)));
-        assert_eq!(
-            column_value(&ColumnData::F64(Some(-2.25))),
-            Ok(json!(-2.25))
-        );
-        assert_eq!(column_value(&ColumnData::Bit(Some(true))), Ok(json!(true)));
+        assert_eq!(column_value(ColumnData::F32(Some(1.5))), Ok(json!(1.5)));
+        assert_eq!(column_value(ColumnData::F64(Some(-2.25))), Ok(json!(-2.25)));
+        assert_eq!(column_value(ColumnData::Bit(Some(true))), Ok(json!(true)));
     }
 
     #[test]
     fn given_string_guid_binary_and_xml_variants_should_convert() {
         assert_eq!(
-            column_value(&ColumnData::String(Some(Cow::from("tag_1   ")))),
+            column_value(ColumnData::String(Some(Cow::from("tag_1   ")))),
             Ok(json!("tag_1   "))
         );
         let guid = Uuid::parse_str("6F9619FF-8B86-D011-B42D-00C04FC964FF").expect("uuid");
         assert_eq!(
-            column_value(&ColumnData::Guid(Some(guid))),
+            column_value(ColumnData::Guid(Some(guid))),
             Ok(json!("6f9619ff-8b86-d011-b42d-00c04fc964ff"))
         );
         assert_eq!(
-            column_value(&ColumnData::Binary(Some(Cow::from(vec![0x5B, 0x40])))),
+            column_value(ColumnData::Binary(Some(Cow::from(vec![0x5B, 0x40])))),
             Ok(json!("W0A="))
         );
         assert_eq!(
-            column_value(&ColumnData::Xml(Some(Cow::Owned(XmlData::new("<a/>"))))),
+            column_value(ColumnData::Xml(Some(Cow::Owned(XmlData::new("<a/>"))))),
             Ok(json!("<a/>"))
         );
     }
 
     #[test]
     fn given_null_should_convert_to_json_null() {
-        assert_eq!(column_value(&ColumnData::I32(None)), Ok(Value::Null));
-        assert_eq!(column_value(&ColumnData::String(None)), Ok(Value::Null));
-        assert_eq!(column_value(&ColumnData::DateTime2(None)), Ok(Value::Null));
+        assert_eq!(column_value(ColumnData::I32(None)), Ok(Value::Null));
+        assert_eq!(column_value(ColumnData::String(None)), Ok(Value::Null));
+        assert_eq!(column_value(ColumnData::DateTime2(None)), Ok(Value::Null));
     }
 
     #[test]
@@ -793,10 +789,10 @@ mod tests {
         let numeric =
             |value, scale| ColumnData::Numeric(Some(Numeric::new_with_scale(value, scale)));
 
-        assert_eq!(column_value(&numeric(5, 0)), Ok(json!("5")));
-        assert_eq!(column_value(&numeric(1050, 2)), Ok(json!("10.50")));
-        assert_eq!(column_value(&numeric(-5, 2)), Ok(json!("-0.05")));
-        assert_eq!(column_value(&numeric(-1250, 3)), Ok(json!("-1.250")));
+        assert_eq!(column_value(numeric(5, 0)), Ok(json!("5")));
+        assert_eq!(column_value(numeric(1050, 2)), Ok(json!("10.50")));
+        assert_eq!(column_value(numeric(-5, 2)), Ok(json!("-0.05")));
+        assert_eq!(column_value(numeric(-1250, 3)), Ok(json!("-1.250")));
     }
 
     #[test]
@@ -809,13 +805,13 @@ mod tests {
         let offset = DateTime::parse_from_rfc3339("2026-10-20T22:42:52.530+02:00").expect("offset");
 
         assert_eq!(
-            column_value(&datetime2.into_sql()),
+            column_value(datetime2.into_sql()),
             Ok(json!("2026-10-20T22:42:52.530"))
         );
-        assert_eq!(column_value(&date.into_sql()), Ok(json!("2026-10-20")));
-        assert_eq!(column_value(&time.into_sql()), Ok(json!("22:42:52.530")));
+        assert_eq!(column_value(date.into_sql()), Ok(json!("2026-10-20")));
+        assert_eq!(column_value(time.into_sql()), Ok(json!("22:42:52.530")));
         assert_eq!(
-            column_value(&offset.into_sql()),
+            column_value(offset.into_sql()),
             Ok(json!("2026-10-20T22:42:52.530+02:00"))
         );
     }
@@ -831,26 +827,23 @@ mod tests {
             ten_o_clock_plus_299_ticks,
         )));
 
-        assert_eq!(
-            column_value(&datetime),
-            Ok(json!("2026-10-20T10:00:00.997"))
-        );
+        assert_eq!(column_value(datetime), Ok(json!("2026-10-20T10:00:00.997")));
     }
 
     #[test]
     fn given_real_should_keep_its_shortest_decimal_form() {
         assert_eq!(
-            column_value(&ColumnData::F32(Some(3.4e38))),
+            column_value(ColumnData::F32(Some(3.4e38))),
             Ok(json!(3.4e38))
         );
-        assert_eq!(column_value(&ColumnData::F32(Some(0.1))), Ok(json!(0.1)));
+        assert_eq!(column_value(ColumnData::F32(Some(0.1))), Ok(json!(0.1)));
     }
 
     #[test]
     fn given_time_7_should_keep_seven_fraction_digits() {
         let last_tick = ColumnData::Time(Some(tiberius::time::Time::new(863_999_999_999, 7)));
 
-        assert_eq!(column_value(&last_tick), Ok(json!("23:59:59.9999999")));
+        assert_eq!(column_value(last_tick), Ok(json!("23:59:59.9999999")));
     }
 
     #[test]
@@ -859,6 +852,19 @@ mod tests {
         assert_eq!(fraction(530_000_000), ".530");
         assert_eq!(fraction(123_456_700), ".1234567");
         assert_eq!(fraction(100), ".0000001");
+    }
+
+    #[test]
+    fn given_owned_string_should_move_into_json_without_copy() {
+        let text = String::from("a long nvarchar(max) value");
+        let buffer = text.as_ptr();
+
+        let value = column_value(ColumnData::String(Some(Cow::Owned(text)))).expect("value");
+
+        let Value::String(json) = value else {
+            panic!("expected a JSON string, got {value:?}");
+        };
+        assert_eq!(json.as_ptr(), buffer);
     }
 
     #[test]

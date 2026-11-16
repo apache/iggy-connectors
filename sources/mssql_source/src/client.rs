@@ -413,7 +413,8 @@ impl CdcClient {
                 ],
             )
             .await?;
-        rows.iter()
+        // Each driver row is consumed, so its strings move into the event instead of being copied.
+        rows.into_iter()
             .map(|row| read_change_row(row, instance, instance_index))
             .collect()
     }
@@ -531,12 +532,16 @@ fn read_operation(row: &Row) -> Result<u8, MssqlError> {
 }
 
 fn read_change_row(
-    row: &Row,
+    row: Row,
     instance: &CaptureInstance,
     instance_index: usize,
 ) -> Result<ChangeRow, MssqlError> {
-    let position = read_position(row, ROW_METADATA_COLUMNS + instance.columns.len(), instance)?;
-    let operation = read_operation(row)?;
+    let position = read_position(
+        &row,
+        ROW_METADATA_COLUMNS + instance.columns.len(),
+        instance,
+    )?;
+    let operation = read_operation(&row)?;
     // Only an update's before image reads the mask.
     let update_mask = if operation == OPERATION_UPDATE_BEFORE {
         row.try_get::<&[u8], _>(3)?
@@ -547,8 +552,8 @@ fn read_change_row(
     };
     let commit_time = row.try_get::<DateTime<FixedOffset>, _>(4)?;
     let mut values = Vec::with_capacity(instance.columns.len());
-    for ((_, data), column) in row
-        .cells()
+    for (data, column) in row
+        .into_iter()
         .skip(ROW_METADATA_COLUMNS)
         .zip(&instance.columns)
     {

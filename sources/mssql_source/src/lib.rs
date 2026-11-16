@@ -129,7 +129,7 @@ struct ValidatedConfig {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct State {
     database: Option<DatabaseIdentity>,
-    /// Last emitted change, or an idle watermark `(max_lsn, Lsn::MAX)`.
+    /// Last emitted change, or an idle watermark `Position::end_of(max_lsn)`.
     checkpoint: Option<Position>,
     /// Keyed by the canonical `schema.table`.
     tables: BTreeMap<String, TableState>,
@@ -360,7 +360,7 @@ impl MssqlSource {
             return Ok((Vec::new(), Candidate::Stop(error)));
         }
         // At the idle watermark nothing new can exist, so only the minimums below are read.
-        let idle = state.checkpoint == Some(Position::new(to, Lsn::MAX));
+        let idle = state.checkpoint == Some(Position::end_of(to));
         let readable: &[CaptureInstance] = if idle { &[] } else { &self.instances };
 
         let needed: Vec<Position> = self
@@ -387,9 +387,12 @@ impl MssqlSource {
                     any_full |= instance_keys.len() >= validated.batch_size;
                     keys.extend(instance_keys);
                 }
-                Err(error) if error.is_lsn_out_of_range() || error.is_missing_object() => {
+                Err(error) if error.is_missing_object() => {
                     query_error = Some(error);
                     break;
+                }
+                Err(error @ MssqlError::Conversion { .. }) => {
+                    return Err(self.log_stuck(client, error).await);
                 }
                 Err(error) => return Err(error),
             }
@@ -406,7 +409,7 @@ impl MssqlSource {
                     .await
                 {
                     Ok(instance_rows) => rows.extend(instance_rows),
-                    Err(error) if error.is_lsn_out_of_range() || error.is_missing_object() => {
+                    Err(error) if error.is_missing_object() => {
                         query_error = Some(error);
                         break;
                     }
@@ -458,7 +461,7 @@ impl MssqlSource {
         candidate.checkpoint = if behind {
             batch.last.or(state.checkpoint)
         } else {
-            Some(Position::new(to, Lsn::MAX))
+            Some(Position::end_of(to))
         };
         let count = messages.len() as u64;
         Ok((
@@ -875,7 +878,7 @@ fn check_checkpoint(checkpoint: Option<Position>, max_lsn: Lsn) -> Result<(), Ms
 fn next_needed(checkpoint: Option<Position>, floor: Lsn) -> Position {
     match checkpoint {
         Some(checkpoint) if checkpoint.start_lsn >= floor => checkpoint,
-        _ => Position::new(floor, Lsn::ZERO),
+        _ => Position::start_of(floor),
     }
 }
 
@@ -944,8 +947,8 @@ fn check_minimum(
 /// No checkpoint yet under `latest`. A NULL maximum means no change exists, so every table reads from its floor.
 fn latest_checkpoint(max_lsn: Option<Lsn>) -> Position {
     match max_lsn {
-        Some(max_lsn) => Position::new(max_lsn, Lsn::MAX),
-        None => Position::new(Lsn::ZERO, Lsn::ZERO),
+        Some(max_lsn) => Position::end_of(max_lsn),
+        None => Position::start_of(Lsn::ZERO),
     }
 }
 
@@ -1023,7 +1026,7 @@ mod tests {
     fn saved_state() -> State {
         State {
             database: Some(identity(1)),
-            checkpoint: Some(position(5, 2)),
+            checkpoint: Some(position(5, 2, 2)),
             tables: BTreeMap::from([(
                 "dbo.users".to_string(),
                 TableState {
@@ -1274,7 +1277,7 @@ mod tests {
     // Saved checkpoints must keep decoding after an upgrade. Change these bytes only with a migration.
     #[test]
     fn given_state_bytes_from_this_version_should_decode() {
-        const SAVED: &str = "9392a473686f70c41000000000000000000000000000000001929a000000000000000000059a0000000000000000000281a964626f2e757365727392a964626f5f75736572739a00000000000000000001";
+        const SAVED: &str = "9392a473686f70c41000000000000000000000000000000001939a00000000000000000005029a0000000000000000000281a964626f2e757365727392a964626f5f75736572739a00000000000000000001";
         let bytes: Vec<u8> = (0..SAVED.len())
             .step_by(2)
             .map(|index| u8::from_str_radix(&SAVED[index..index + 2], 16).expect("hex"))
@@ -1311,13 +1314,19 @@ mod tests {
 
     #[test]
     fn given_checkpoint_above_floor_should_resume_from_checkpoint() {
-        assert_eq!(next_needed(Some(position(5, 2)), lsn(3)), position(5, 2));
+        assert_eq!(
+            next_needed(Some(position(5, 2, 2)), lsn(3)),
+            position(5, 2, 2)
+        );
     }
 
     #[test]
     fn given_floor_above_checkpoint_should_start_at_floor() {
-        assert_eq!(next_needed(Some(position(5, 2)), lsn(8)), position(8, 0));
-        assert_eq!(next_needed(None, lsn(8)), position(8, 0));
+        assert_eq!(
+            next_needed(Some(position(5, 2, 2)), lsn(8)),
+            position(8, 0, 0)
+        );
+        assert_eq!(next_needed(None, lsn(8)), position(8, 0, 0));
     }
 
     #[test]
@@ -1437,26 +1446,26 @@ mod tests {
 
     #[test]
     fn given_minimum_above_next_needed_should_report_gap() {
-        let error = check_minimum(&users_instance(), position(5, 2), lsn(6));
+        let error = check_minimum(&users_instance(), position(5, 2, 2), lsn(6));
 
         assert!(matches!(error, Some(MssqlError::LsnGap { .. })));
     }
 
     #[test]
     fn given_new_table_with_floor_at_minimum_should_have_no_gap() {
-        assert!(check_minimum(&users_instance(), position(3, 0), lsn(3)).is_none());
+        assert!(check_minimum(&users_instance(), position(3, 0, 0), lsn(3)).is_none());
     }
 
     #[test]
     fn given_idle_watermark_above_minimum_should_have_no_gap() {
-        let watermark = Position::new(lsn(9), Lsn::MAX);
+        let watermark = Position::end_of(lsn(9));
 
         assert!(check_minimum(&users_instance(), watermark, lsn(4)).is_none());
     }
 
     #[test]
     fn given_zero_minimum_should_report_missing_instance() {
-        let error = check_minimum(&users_instance(), position(5, 2), Lsn::ZERO);
+        let error = check_minimum(&users_instance(), position(5, 2, 2), Lsn::ZERO);
 
         assert!(matches!(error, Some(MssqlError::InstanceMissing { .. })));
     }
@@ -1556,18 +1565,18 @@ mod tests {
     fn given_payload_at_iggy_limit_should_be_accepted() {
         let table = TableName::new("dbo", "orders");
 
-        assert!(check_payload_size(&table, position(5, 1), MAX_PAYLOAD_SIZE as usize).is_ok());
+        assert!(check_payload_size(&table, position(5, 1, 1), MAX_PAYLOAD_SIZE as usize).is_ok());
     }
 
     #[test]
     fn given_payload_one_byte_over_iggy_limit_should_hold_progress() {
         let table = TableName::new("dbo", "orders");
 
-        let error = check_payload_size(&table, position(5, 1), MAX_PAYLOAD_SIZE as usize + 1)
+        let error = check_payload_size(&table, position(5, 1, 1), MAX_PAYLOAD_SIZE as usize + 1)
             .expect_err("over the limit");
 
         assert!(matches!(error, MssqlError::PayloadTooLarge { .. }));
-        assert_eq!(error.stuck_position(), Some(position(5, 1)));
+        assert_eq!(error.stuck_position(), Some(position(5, 1, 1)));
     }
 
     #[test]
@@ -1576,7 +1585,7 @@ mod tests {
         let commit_time =
             chrono::DateTime::parse_from_rfc3339("2026-10-20T22:42:52.530+00:00").expect("time");
         let rows = vec![encode::ChangeRow {
-            position: position(5, 1),
+            position: position(5, 1, 1),
             operation: encode::OPERATION_INSERT,
             update_mask: Vec::new(),
             commit_time: Some(commit_time),
@@ -1592,10 +1601,7 @@ mod tests {
 
     #[test]
     fn given_latest_with_changes_should_start_after_the_newest_lsn() {
-        assert_eq!(
-            latest_checkpoint(Some(lsn(9))),
-            Position::new(lsn(9), Lsn::MAX)
-        );
+        assert_eq!(latest_checkpoint(Some(lsn(9))), Position::end_of(lsn(9)));
     }
 
     // Leaving the checkpoint empty would apply `latest` again on the next start and skip changes.
@@ -1603,7 +1609,7 @@ mod tests {
     fn given_latest_with_no_changes_should_save_a_checkpoint_below_every_floor() {
         let checkpoint = latest_checkpoint(None);
 
-        assert_eq!(next_needed(Some(checkpoint), lsn(3)), position(3, 0));
+        assert_eq!(next_needed(Some(checkpoint), lsn(3)), position(3, 0, 0));
     }
 
     #[test]
@@ -1619,10 +1625,10 @@ mod tests {
     fn given_new_stuck_position_should_log_at_error() {
         let now = Instant::now();
 
-        assert!(should_log_stuck(None, position(5, 1), now));
+        assert!(should_log_stuck(None, position(5, 1, 1), now));
         assert!(should_log_stuck(
-            Some((position(4, 1), now)),
-            position(5, 1),
+            Some((position(4, 1, 1), now)),
+            position(5, 1, 1),
             now
         ));
     }
@@ -1630,16 +1636,16 @@ mod tests {
     #[test]
     fn given_same_stuck_position_should_log_at_error_once_a_minute() {
         let now = Instant::now();
-        let logged = Some((position(5, 1), now));
+        let logged = Some((position(5, 1, 1), now));
 
         assert!(!should_log_stuck(
             logged,
-            position(5, 1),
+            position(5, 1, 1),
             now + Duration::from_secs(30)
         ));
         assert!(should_log_stuck(
             logged,
-            position(5, 1),
+            position(5, 1, 1),
             now + STUCK_LOG_INTERVAL
         ));
     }

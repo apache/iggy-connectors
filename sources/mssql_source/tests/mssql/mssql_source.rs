@@ -19,7 +19,8 @@ use crate::fixtures::{
     MSSQL_ORDERS_INSTANCE, MssqlAllTypesFixture, MssqlCdcDisabledFixture,
     MssqlDuplicateTableFixture, MssqlInvalidCredentialsFixture, MssqlLatestStartFixture,
     MssqlMissingTableFixture, MssqlOlderInstanceHistoryFixture, MssqlSourceFixture,
-    MssqlSourceManualScanFixture, MssqlUncapturedTableFixture, MssqlUnsupportedTypeFixture,
+    MssqlSourceManualScanFixture, MssqlUncapturedTableFixture, MssqlUniqueSwapFixture,
+    MssqlUnsupportedTypeFixture,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -32,7 +33,7 @@ use integration::harness::{ConnectorsRuntimeHandle, TestHarness, seeds};
 use integration::iggy_harness;
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::time::{Instant, sleep};
@@ -1000,7 +1001,7 @@ async fn latest_start_position_is_not_applied_again_after_restart(
     assert_eq!(ids, [&json!(100), &json!(101)]);
 }
 
-// Every row of a multi-row primary key update gets its own seqval, so ids stay distinct.
+// Every row of a multi-row primary key update gets its own operation and command id, so ids stay distinct.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/mssql/source.toml")),
     seed = seeds::connector_stream
@@ -1024,6 +1025,55 @@ async fn multi_row_primary_key_update_is_persisted_with_distinct_ids(
             (("orders".to_string(), "insert".to_string()), 3),
         ])
     );
+}
+
+// SQL Server logs this swap as two deletes and two inserts, interleaved by seqval.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/mssql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn unique_value_swap_is_delivered_with_deletes_before_inserts(
+    harness: &TestHarness,
+    fixture: MssqlUniqueSwapFixture,
+) {
+    wait_until_running(harness).await;
+    let mut received = receive_from(harness, "mssql_unique_swap", 2).await;
+    fixture
+        .execute("UPDATE dbo.codes SET code = CASE code WHEN 10 THEN 20 ELSE 10 END")
+        .await;
+
+    received.extend(receive_from(harness, "mssql_unique_swap", 4).await);
+
+    assert_eq!(received.len(), 6);
+    assert_unique_ids(&received);
+    let ops: Vec<_> = received[2..].iter().map(Received::op).collect();
+    assert_eq!(ops, ["delete", "delete", "insert", "insert"]);
+    assert_replays_without_unique_conflict(&received);
+}
+
+/// Applies the events in order to a map of `code` to `id`, as a sequential replay into a table would.
+fn assert_replays_without_unique_conflict(received: &[Received]) {
+    let mut holders: HashMap<i64, i64> = HashMap::with_capacity(received.len());
+    for message in received {
+        let image = |name: &str| {
+            let row = &message.event[name];
+            (row["code"].as_i64(), row["id"].as_i64())
+        };
+        if let (Some(code), Some(id)) = image("before") {
+            assert_eq!(
+                holders.remove(&code),
+                Some(id),
+                "delete of an unheld code {code}"
+            );
+        }
+        if let (Some(code), Some(id)) = image("after") {
+            let holder = holders.insert(code, id);
+            assert!(
+                holder.is_none(),
+                "code {code} still held when id {id} took it"
+            );
+        }
+    }
 }
 
 /// Inserts three orders and waits until they are in Iggy and the checkpoint is saved.

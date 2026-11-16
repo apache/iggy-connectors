@@ -57,6 +57,7 @@ pub(crate) struct ChangeEvent<'a> {
     source: SourceInfo<'a>,
     op: &'static str,
     lsn: String,
+    command_id: i32,
     seqval: String,
     commit_time: Option<String>,
     before: Option<BTreeMap<&'a str, Value>>,
@@ -216,6 +217,7 @@ pub(crate) fn message_id(
     hasher.update(table.table.as_bytes());
     hasher.update(&[0]);
     hasher.update(position.start_lsn.as_bytes());
+    hasher.update(&position.command_id.to_be_bytes());
     hasher.update(position.seqval.as_bytes());
     hasher.update(&[operation]);
     let mut bytes = [0u8; 16];
@@ -287,6 +289,7 @@ fn build_event<'a>(
             },
             op,
             lsn: identity.position.start_lsn.to_string(),
+            command_id: identity.position.command_id,
             seqval: identity.position.seqval.to_string(),
             commit_time: identity
                 .commit_time
@@ -385,7 +388,7 @@ mod tests {
 
     fn key(start_lsn: u8, seqval: u8, operation: u8, instance: usize) -> ChangeKey {
         ChangeKey {
-            position: position(start_lsn, seqval),
+            position: position(start_lsn, i32::from(seqval), seqval),
             operation,
             instance,
         }
@@ -430,12 +433,24 @@ mod tests {
         instance: usize,
     ) -> ChangeRow {
         ChangeRow {
-            position: position(start_lsn, seqval),
+            position: position(start_lsn, i32::from(seqval), seqval),
             operation,
             update_mask: vec![mask],
             commit_time: None,
             values,
             instance,
+        }
+    }
+
+    /// A delete or insert of `users` with an explicit command id, as a deferred update logs them.
+    fn command_row(command_id: i32, seqval: u8, operation: u8, id: i64) -> ChangeRow {
+        ChangeRow {
+            position: position(5, command_id, seqval),
+            operation,
+            update_mask: vec![0x07],
+            commit_time: None,
+            values: vec![json!(id), json!("1.00"), json!("a")],
+            instance: 0,
         }
     }
 
@@ -445,7 +460,7 @@ mod tests {
 
         let result = cut(keys, 1);
 
-        assert_eq!(result.last, Some(position(5, 7)));
+        assert_eq!(result.last, Some(position(5, 7, 7)));
         assert!(result.left_behind);
     }
 
@@ -456,7 +471,7 @@ mod tests {
         let result = cut(keys, 2);
 
         assert_eq!(result.instances, BTreeSet::from([0, 1]));
-        assert_eq!(result.last, Some(position(5, 2)));
+        assert_eq!(result.last, Some(position(5, 2, 2)));
         assert!(result.left_behind);
     }
 
@@ -466,7 +481,7 @@ mod tests {
 
         let result = cut(keys, 1);
 
-        assert_eq!(result.last, Some(position(5, 1)));
+        assert_eq!(result.last, Some(position(5, 1, 1)));
         assert!(result.left_behind);
     }
 
@@ -476,7 +491,7 @@ mod tests {
 
         let result = cut(keys, 1);
 
-        assert_eq!(result.last, Some(position(5, 1)));
+        assert_eq!(result.last, Some(position(5, 1, 1)));
         assert!(!result.left_behind);
     }
 
@@ -486,7 +501,23 @@ mod tests {
 
         let result = cut(keys, 5);
 
-        assert_eq!(result.last, Some(position(5, 5)));
+        assert_eq!(result.last, Some(position(5, 5, 5)));
+        assert!(result.left_behind);
+    }
+
+    #[test]
+    fn given_cut_between_command_ids_at_one_seqval_should_end_on_lower_command_id() {
+        let at = |command_id, seqval, operation| ChangeKey {
+            position: position(5, command_id, seqval),
+            operation,
+            instance: 0,
+        };
+        // A deferred update: deletes 1 and 2 come before inserts 3 and 4, interleaved by seqval.
+        let keys = vec![at(3, 3, 2), at(1, 3, 1), at(4, 4, 2), at(2, 4, 1)];
+
+        let result = cut(keys, 2);
+
+        assert_eq!(result.last, Some(position(5, 2, 4)));
         assert!(result.left_behind);
     }
 
@@ -552,8 +583,27 @@ mod tests {
         );
         assert_eq!(
             events[1].id,
-            message_id("shop", &instances[0].table, position(6, 1), 4)
+            message_id("shop", &instances[0].table, position(6, 1, 1), 4)
         );
+    }
+
+    #[test]
+    fn given_deferred_update_rows_should_emit_deletes_before_inserts() {
+        let instances = [users()];
+        // Seqval order is delete, insert, delete, insert. Replaying that breaks a unique column.
+        let rows = vec![
+            command_row(1, 3, 1, 2),
+            command_row(3, 3, 2, 2),
+            command_row(2, 4, 1, 3),
+            command_row(4, 4, 2, 3),
+        ];
+
+        let events = to_events(rows, &instances, "shop").expect("events");
+
+        let ops: Vec<_> = events.iter().map(|event| event.event.op).collect();
+        assert_eq!(ops, ["delete", "delete", "insert", "insert"]);
+        let first = serde_json::to_value(&events[0].event).expect("json");
+        assert_eq!(first["command_id"], json!(1));
     }
 
     #[test]
@@ -816,12 +866,22 @@ mod tests {
         let table = TableName::new("dbo", "users");
 
         assert_eq!(
-            message_id("shop", &table, position(5, 1), 2),
-            message_id("shop", &table, position(5, 1), 2)
+            message_id("shop", &table, position(5, 1, 1), 2),
+            message_id("shop", &table, position(5, 1, 1), 2)
         );
         assert_ne!(
-            message_id("shop", &table, position(5, 1), 2),
-            message_id("shop", &table, position(5, 1), 1)
+            message_id("shop", &table, position(5, 1, 1), 2),
+            message_id("shop", &table, position(5, 1, 1), 1)
+        );
+    }
+
+    #[test]
+    fn given_same_seqval_and_operation_with_different_command_id_should_hash_to_different_ids() {
+        let table = TableName::new("dbo", "users");
+
+        assert_ne!(
+            message_id("shop", &table, position(5, 1, 3), 2),
+            message_id("shop", &table, position(5, 2, 3), 2)
         );
     }
 
@@ -830,8 +890,8 @@ mod tests {
         let table = TableName::new("dbo", "users");
 
         assert_ne!(
-            message_id("shop", &table, position(5, 1), 2),
-            message_id("billing", &table, position(5, 1), 2)
+            message_id("shop", &table, position(5, 1, 1), 2),
+            message_id("billing", &table, position(5, 1, 1), 2)
         );
     }
 }

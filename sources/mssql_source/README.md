@@ -52,8 +52,11 @@ job the connector stays `Running` but sees no new changes. The integration tests
 
 ## Features
 
-- **Commit order across tables.** Changes from all configured tables are merged by commit LSN, then by sequence
-  value. A transaction that touches two tables arrives in the order SQL Server applied it.
+- **Commit order across tables.** Changes from all configured tables are merged by commit LSN, then by command id.
+  A transaction that touches two tables arrives in the order SQL Server applied it.
+- **Replay-safe order inside a transaction.** An update that SQL Server logs as deletes and inserts, such as swapping
+  a unique value between two rows, arrives with every delete before the insert that reuses its value. Applying the
+  events one by one does not break a unique constraint.
 - **At-least-once delivery with stable ids.** The checkpoint advances only after Iggy accepts a batch. Every event
   carries a deterministic message id, so a batch read again after a failure has the same ids.
 - **Bounded batches.** `batch_size` limits the change rows per poll. A large transaction is split across batches
@@ -88,10 +91,10 @@ official container image, set `MSSQL_AGENT_ENABLED=true`.
 
 The connector login needs:
 
-- `SELECT` on the captured columns of every source table. `fn_cdc_get_all_changes_<instance>` requires it for users
-  outside `db_owner`.
-- Membership in the capture instance's gating role, when `@role_name` was set.
-- `SELECT` on the `cdc` schema, to read `cdc.change_tables` and `cdc.captured_columns`.
+- `SELECT` on the `cdc` schema, to read `cdc.change_tables`, `cdc.captured_columns` and the change tables
+  `cdc.<instance>_CT`. The connector reads the change tables directly, because `fn_cdc_get_all_changes_<instance>`
+  does not return `__$command_id`. A gating role set with `@role_name` grants access only to that function, so it
+  does not give the connector access.
 - `VIEW DATABASE STATE`, to read `sys.database_recovery_status` for the restore check.
 
 The integration tests run as `sa`. This minimal set has not been verified against a restricted login yet.
@@ -205,6 +208,7 @@ Each message payload is one JSON object (`schema = "json"`):
   "source": { "database": "shop", "schema": "dbo", "table": "users" },
   "op": "update",
   "lsn": "0x0000002C000002400003",
+  "command_id": 1,
   "seqval": "0x0000002C000002400002",
   "commit_time": "2026-10-20T22:42:52.530+00:00",
   "before": { "id": 1, "balance": "10.50" },
@@ -218,7 +222,8 @@ Each message payload is one JSON object (`schema = "json"`):
 | `source` | Database from `DB_NAME()`, and the canonical schema and table names. |
 | `op` | `insert`, `update` or `delete`. |
 | `lsn` | Commit LSN. Every change in one transaction shares it. |
-| `seqval` | Order of the change inside its transaction. |
+| `command_id` | Order of the change inside its transaction, across tables. |
+| `seqval` | Log sequence of the change. The delete and insert of one row in a deferred update can share it. |
 | `commit_time` | Commit time from `sys.fn_cdc_map_lsn_to_time`, with the UTC offset in effect at commit time. |
 | `before` | Row before the change. `null` for inserts. |
 | `after` | Row after the change. `null` for deletes. |
@@ -362,3 +367,5 @@ A connector first started while both instances exist reads `_v1` until it is dro
 - A batch holds up to `batch_size` full rows in memory. Lower `batch_size` for tables with wide `(max)` columns.
 - No initial snapshot of existing rows. Only changes captured by CDC are streamed.
 - Azure SQL Database redirects are not supported.
+- A change table that still holds rows from before SQL Server 2012 has no `__$command_id` for them. The connector
+  stops at such a row instead of guessing its order.

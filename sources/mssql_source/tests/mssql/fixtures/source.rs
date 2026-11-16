@@ -172,6 +172,21 @@ fixture_variant!(
 );
 
 fixture_variant!(
+    /// `dbo.codes` has a unique `code` column, seeded with (1, 10) and (2, 20).
+    MssqlUniqueSwapFixture,
+    Settings {
+        tables: "[dbo.codes]",
+        extra_sql: Some(
+            "CREATE TABLE dbo.codes (id INT PRIMARY KEY, code INT NOT NULL UNIQUE); \
+             EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'codes', \
+             @role_name = NULL; \
+             INSERT INTO dbo.codes (id, code) VALUES (1, 10), (2, 20)"
+        ),
+        ..Settings::default()
+    }
+);
+
+fixture_variant!(
     /// `dbo.variants` captures a `sql_variant` column, which the connector does not support.
     MssqlUnsupportedTypeFixture,
     Settings {

@@ -22,5 +22,6 @@ pub use source::{
     MSSQL_ORDERS_INSTANCE, MssqlAllTypesFixture, MssqlCdcDisabledFixture,
     MssqlDuplicateTableFixture, MssqlInvalidCredentialsFixture, MssqlLatestStartFixture,
     MssqlMissingTableFixture, MssqlOlderInstanceHistoryFixture, MssqlSourceFixture,
-    MssqlSourceManualScanFixture, MssqlUncapturedTableFixture, MssqlUnsupportedTypeFixture,
+    MssqlSourceManualScanFixture, MssqlUncapturedTableFixture, MssqlUniqueSwapFixture,
+    MssqlUnsupportedTypeFixture,
 };

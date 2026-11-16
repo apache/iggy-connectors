@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::encode::{ChangeRow, OPERATION_UPDATE_BEFORE, column_value};
-use crate::error::MssqlError;
+use crate::error::{ConversionError, MssqlError};
 use crate::lsn::{Lsn, Position};
 use crate::table::{TableName, quote_identifier};
 use chrono::{DateTime, FixedOffset};
@@ -28,6 +28,14 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
 const ROW_METADATA_COLUMNS: usize = 5;
+// T-SQL has no row-value comparison, so the position order is written out. ISNULL keeps a NULL
+// command id visible, so reading it fails loudly instead of the row being filtered out.
+const AFTER_FROM: &str = "(__$start_lsn > @P1 OR (__$start_lsn = @P1 AND \
+     (ISNULL(__$command_id, 0) > @P3 OR (ISNULL(__$command_id, 0) = @P3 AND __$seqval > @P4))))";
+const UP_TO_THROUGH: &str = "(__$start_lsn < @P5 OR (__$start_lsn = @P5 AND \
+     (ISNULL(__$command_id, 0) < @P6 OR (ISNULL(__$command_id, 0) = @P6 AND __$seqval <= @P7))))";
+/// `change_keys` selects `__$command_id` after the start LSN, seqval and operation.
+const KEY_COMMAND_ID_COLUMN: usize = 3;
 const UNKNOWN_BUILT_IN_FUNCTION: u32 = 195;
 // From the `times` join, with the offset in effect at commit time so changes before a DST switch stay correct.
 const COMMIT_TIME_BY_ZONE: &str = "times.tran_end_time AT TIME ZONE CURRENT_TIMEZONE_ID()";
@@ -330,12 +338,15 @@ impl CdcClient {
         if from.start_lsn > to {
             return Ok(Vec::new());
         }
+        // NOLOCK as in fn_cdc_get_all_changes. The bound @P2 is the committed max LSN, so rows up to it are complete.
         let sql = format!(
-            "SELECT TOP ({limit}) WITH TIES __$start_lsn, __$seqval, __$operation \
-             FROM cdc.{function}(@P1, @P2, N'all update old') \
-             WHERE __$start_lsn > @P1 OR (__$start_lsn = @P1 AND __$seqval > @P3) \
-             ORDER BY __$start_lsn, __$seqval",
-            function = change_function(&instance.name),
+            "SELECT TOP ({limit}) WITH TIES __$start_lsn, __$seqval, __$operation, __$command_id \
+             FROM cdc.{table} WITH (NOLOCK) \
+             WHERE __$operation IN (1, 2, 3, 4) AND __$start_lsn BETWEEN @P1 AND @P2 \
+             AND {after_from} \
+             ORDER BY __$start_lsn, __$command_id, __$seqval",
+            table = change_table(&instance.name),
+            after_from = AFTER_FROM,
         );
         let rows = self
             .rows(
@@ -343,6 +354,7 @@ impl CdcClient {
                 &[
                     &from.start_lsn.as_bytes(),
                     &to.as_bytes(),
+                    &from.command_id,
                     &from.seqval.as_bytes(),
                 ],
             )
@@ -350,7 +362,7 @@ impl CdcClient {
         rows.iter()
             .map(|row| {
                 Ok(ChangeKey {
-                    position: read_position(row)?,
+                    position: read_position(row, KEY_COMMAND_ID_COLUMN, instance)?,
                     operation: read_operation(row)?,
                     instance: instance_index,
                 })
@@ -370,18 +382,22 @@ impl CdcClient {
         if from.start_lsn > to || from >= through {
             return Ok(Vec::new());
         }
+        // The command id comes last, so the captured columns keep their indexes after the metadata.
         let sql = format!(
             "SELECT changes.__$start_lsn, changes.__$seqval, changes.__$operation, changes.__$update_mask, \
              {commit_time}, \
-             {columns} \
-             FROM cdc.{function}(@P1, @P2, N'all update old') AS changes \
+             {columns}, \
+             changes.__$command_id \
+             FROM cdc.{table} AS changes WITH (NOLOCK) \
              LEFT JOIN cdc.lsn_time_mapping AS times ON times.start_lsn = changes.__$start_lsn \
-             WHERE (changes.__$start_lsn > @P1 OR (changes.__$start_lsn = @P1 AND changes.__$seqval > @P3)) \
-             AND (changes.__$start_lsn < @P4 OR (changes.__$start_lsn = @P4 AND changes.__$seqval <= @P5)) \
-             ORDER BY changes.__$start_lsn, changes.__$seqval, changes.__$operation",
+             WHERE changes.__$operation IN (1, 2, 3, 4) AND changes.__$start_lsn BETWEEN @P1 AND @P2 \
+             AND {after_from} AND {up_to_through} \
+             ORDER BY changes.__$start_lsn, changes.__$command_id, changes.__$seqval, changes.__$operation",
             commit_time = self.commit_time,
             columns = instance.select_list,
-            function = change_function(&instance.name),
+            table = change_table(&instance.name),
+            after_from = AFTER_FROM,
+            up_to_through = UP_TO_THROUGH,
         );
         let rows = self
             .rows(
@@ -389,8 +405,10 @@ impl CdcClient {
                 &[
                     &from.start_lsn.as_bytes(),
                     &to.as_bytes(),
+                    &from.command_id,
                     &from.seqval.as_bytes(),
                     &through.start_lsn.as_bytes(),
+                    &through.command_id,
                     &through.seqval.as_bytes(),
                 ],
             )
@@ -475,12 +493,28 @@ impl CdcClient {
     }
 }
 
-fn change_function(capture_instance: &str) -> String {
-    quote_identifier(&format!("fn_cdc_get_all_changes_{capture_instance}"))
+fn change_table(capture_instance: &str) -> String {
+    quote_identifier(&format!("{capture_instance}_CT"))
 }
 
-fn read_position(row: &Row) -> Result<Position, MssqlError> {
-    Ok(Position::new(read_lsn(row, 0)?, read_lsn(row, 1)?))
+/// The start LSN, seqval and command id of a change row. A NULL command id, possible only in a
+/// change table from before SQL Server 2012, stops the read instead of being guessed.
+fn read_position(
+    row: &Row,
+    command_id_column: usize,
+    instance: &CaptureInstance,
+) -> Result<Position, MssqlError> {
+    let start_lsn = read_lsn(row, 0)?;
+    let seqval = read_lsn(row, 1)?;
+    match row.try_get::<i32, _>(command_id_column)? {
+        Some(command_id) => Ok(Position::new(start_lsn, command_id, seqval)),
+        None => Err(MssqlError::Conversion {
+            table: instance.table.to_string(),
+            column: "__$command_id".to_string(),
+            position: Position::new(start_lsn, 0, seqval),
+            reason: ConversionError::MissingCommandId,
+        }),
+    }
 }
 
 fn read_lsn(row: &Row, index: usize) -> Result<Lsn, MssqlError> {
@@ -501,7 +535,7 @@ fn read_change_row(
     instance: &CaptureInstance,
     instance_index: usize,
 ) -> Result<ChangeRow, MssqlError> {
-    let position = read_position(row)?;
+    let position = read_position(row, ROW_METADATA_COLUMNS + instance.columns.len(), instance)?;
     let operation = read_operation(row)?;
     // Only an update's before image reads the mask.
     let update_mask = if operation == OPERATION_UPDATE_BEFORE {
@@ -601,10 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn given_capture_instance_with_bracket_should_quote_change_function() {
-        assert_eq!(
-            change_function("sales_order]items"),
-            "[fn_cdc_get_all_changes_sales_order]]items]"
-        );
+    fn given_capture_instance_with_bracket_should_quote_change_table() {
+        assert_eq!(change_table("sales_order]items"), "[sales_order]]items_CT]");
     }
 }

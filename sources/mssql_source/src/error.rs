@@ -18,7 +18,6 @@
 use crate::lsn::{InvalidLsnLength, Lsn, Position};
 use std::fmt;
 
-const LSN_OUT_OF_RANGE: u32 = 313;
 const INVALID_OBJECT_NAME: u32 = 208;
 
 #[derive(Debug)]
@@ -114,12 +113,7 @@ impl MssqlError {
         }
     }
 
-    /// Cleanup raised the minimum LSN above the query's start. SQL Server reports it with a misleading message.
-    pub(crate) fn is_lsn_out_of_range(&self) -> bool {
-        matches!(self, Self::Server { number, .. } if *number == LSN_OUT_OF_RANGE)
-    }
-
-    /// The change function no longer exists, so the capture instance is gone.
+    /// The change table no longer exists, so the capture instance is gone.
     pub(crate) fn is_missing_object(&self) -> bool {
         matches!(self, Self::Server { number, .. } if *number == INVALID_OBJECT_NAME)
     }
@@ -128,9 +122,15 @@ impl MssqlError {
 /// Why one value could not become JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConversionError {
-    UnexpectedVariant { expected: &'static str },
+    UnexpectedVariant {
+        expected: &'static str,
+    },
     InvalidNumeric,
-    UnpairedUpdate { operation: u8 },
+    UnpairedUpdate {
+        operation: u8,
+    },
+    /// `__$command_id` is NULL, which only a change table from before SQL Server 2012 can hold.
+    MissingCommandId,
 }
 
 impl fmt::Display for ConversionError {
@@ -146,6 +146,10 @@ impl fmt::Display for ConversionError {
                     "update row with operation {operation} has no partner"
                 )
             }
+            Self::MissingCommandId => write!(
+                formatter,
+                "the command id is NULL. Change tables from before SQL Server 2012 are not supported"
+            ),
         }
     }
 }
@@ -321,7 +325,7 @@ mod tests {
         let error = MssqlError::Conversion {
             table: "dbo.users".to_string(),
             column: "balance".to_string(),
-            position: Position::new(Lsn::ZERO, Lsn::ZERO),
+            position: Position::start_of(Lsn::ZERO),
             reason: ConversionError::InvalidNumeric,
         };
 
@@ -345,12 +349,6 @@ mod tests {
         assert!(MssqlError::Protocol("bad token".to_string()).breaks_connection());
         assert!(MssqlError::Timeout.breaks_connection());
         assert!(!server(1205).breaks_connection());
-    }
-
-    #[test]
-    fn given_error_313_should_be_lsn_out_of_range() {
-        assert!(server(313).is_lsn_out_of_range());
-        assert!(!server(208).is_lsn_out_of_range());
     }
 
     #[test]
@@ -394,7 +392,7 @@ mod tests {
 
     #[test]
     fn given_undecodable_change_should_report_stuck_position() {
-        let after = Position::new(Lsn::ZERO, Lsn::MAX);
+        let after = Position::end_of(Lsn::ZERO);
         let error = MssqlError::Undecodable {
             table: "dbo.orders".to_string(),
             after,

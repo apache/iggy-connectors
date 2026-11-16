@@ -68,16 +68,33 @@ impl fmt::Display for Lsn {
     }
 }
 
-/// Position of one change. Derived `Ord` gives commit order across tables.
+/// Position of one change. Derived `Ord` gives commit order across tables, and inside a transaction
+/// the `__$command_id` order, which is the order of the change table's clustered index. Sequential
+/// replay needs it: a deferred update logs its deletes and inserts interleaved by `__$seqval`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct Position {
     pub(crate) start_lsn: Lsn,
+    pub(crate) command_id: i32,
     pub(crate) seqval: Lsn,
 }
 
 impl Position {
-    pub(crate) fn new(start_lsn: Lsn, seqval: Lsn) -> Self {
-        Self { start_lsn, seqval }
+    pub(crate) fn new(start_lsn: Lsn, command_id: i32, seqval: Lsn) -> Self {
+        Self {
+            start_lsn,
+            command_id,
+            seqval,
+        }
+    }
+
+    /// Before every change of the transaction at `start_lsn`. Command ids start at 1.
+    pub(crate) fn start_of(start_lsn: Lsn) -> Self {
+        Self::new(start_lsn, 0, Lsn::ZERO)
+    }
+
+    /// After every change of the transaction at `start_lsn`.
+    pub(crate) fn end_of(start_lsn: Lsn) -> Self {
+        Self::new(start_lsn, i32::MAX, Lsn::MAX)
     }
 }
 
@@ -85,8 +102,8 @@ impl fmt::Display for Position {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "start_lsn {} seqval {}",
-            self.start_lsn, self.seqval
+            "start_lsn {} command_id {} seqval {}",
+            self.start_lsn, self.command_id, self.seqval
         )
     }
 }
@@ -102,8 +119,8 @@ pub(crate) mod test_support {
         Lsn(bytes)
     }
 
-    pub(crate) fn position(start_lsn: u8, seqval: u8) -> Position {
-        Position::new(lsn(start_lsn), lsn(seqval))
+    pub(crate) fn position(start_lsn: u8, command_id: i32, seqval: u8) -> Position {
+        Position::new(lsn(start_lsn), command_id, lsn(seqval))
     }
 }
 
@@ -141,17 +158,42 @@ mod tests {
     }
 
     #[test]
-    fn given_interleaved_transactions_should_order_by_start_lsn_before_seqval() {
+    fn given_interleaved_transactions_should_order_by_start_lsn_before_command_id() {
         // The transaction that started first commits second: higher start LSN, lower seqval.
         let committed_second = Position::new(
             lsn([0, 0, 0, 0x2C, 0, 0, 0x02, 0x58, 0, 0x03]),
+            1,
             lsn([0, 0, 0, 0x2C, 0, 0, 0x02, 0x40, 0, 0x02]),
         );
         let committed_first = Position::new(
             lsn([0, 0, 0, 0x2C, 0, 0, 0x02, 0x50, 0, 0x03]),
+            9,
             lsn([0, 0, 0, 0x2C, 0, 0, 0x02, 0x48, 0, 0x02]),
         );
 
         assert!(committed_first < committed_second);
+    }
+
+    #[test]
+    fn given_lower_command_id_and_higher_seqval_should_sort_first() {
+        // A deferred update: the second delete has a higher seqval than the first insert.
+        let second_delete = test_support::position(5, 2, 4);
+        let first_insert = test_support::position(5, 3, 3);
+
+        assert!(second_delete < first_insert);
+    }
+
+    #[test]
+    fn given_same_seqval_should_order_by_command_id() {
+        assert!(test_support::position(5, 1, 3) < test_support::position(5, 3, 3));
+    }
+
+    #[test]
+    fn given_end_of_lsn_should_sort_after_every_change_at_it() {
+        let end = Position::end_of(test_support::lsn(5));
+
+        assert!(test_support::position(5, i32::MAX - 1, 0xFF) < end);
+        assert!(end < Position::start_of(test_support::lsn(6)));
+        assert!(Position::start_of(test_support::lsn(5)) < test_support::position(5, 1, 1));
     }
 }

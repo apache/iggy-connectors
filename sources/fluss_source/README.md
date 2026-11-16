@@ -21,7 +21,7 @@ After five rejected batches in a row the source stops and needs a manual connect
 | `request_timeout` | no | `30s` | How long the cluster may take to answer. Opening fails after that long without an answer. While reading, the connector asks each bucket leader for its end offset once per `request_timeout`, and when that request gets no answer in time it reports an error and connects again from the last acknowledged offsets. Must be greater than 0 and must not exceed `1day`. |
 | `batch_size` | no | `500` | Maximum records returned per poll (`scanner.log.max-poll-records`). Must be greater than 0. |
 | `payload_format` | no | `json` | Only `json` is accepted. See [Limitations](#limitations). |
-| `include_metadata` | no | `false` | Adds `_fluss_bucket`, `_fluss_offset` and `_fluss_timestamp` (the record timestamp in epoch milliseconds) to each JSON object. While it is on, a column whose name starts with `_fluss_` is rejected at startup, since it would be overwritten. |
+| `include_metadata` | no | `false` | Adds `_fluss_bucket`, `_fluss_offset` and `_fluss_timestamp` (the record timestamp in epoch milliseconds) to each JSON object. While it is on, a column that `columns` selects is rejected at startup when its name starts with `_fluss_`, since it would be overwritten. A column left out of `columns` is not checked. |
 | `sasl_username` | no | | Enables SASL/PLAIN together with `sasl_password`. Set both or neither. `fluss-rs` 1.0 has no TLS setting, so both cross the network in clear text. Use SASL only on a network you trust. |
 | `sasl_password` | no | | The connector never logs it and `/stats` never shows it, but the runtime does not redact it: it logs the raw plugin config at trace level and returns it from its config API, such as `GET /sources/{key}/configs/plugin`. |
 | `verbose_logging` | no | `false` | Logs per-batch counts at info instead of debug. |
@@ -68,7 +68,7 @@ Bring up a local cluster with the [official Docker compose recipe](https://fluss
 | `TIMESTAMP` | string without a timezone, `2023-11-14 22:13:20.123456` |
 | `TIMESTAMP_LTZ` | string in UTC, RFC 3339, `2023-11-14T22:13:20.123456+00:00` |
 | `BINARY`, `BYTES` | base64 string |
-| `ARRAY`, `MAP`, `ROW` | not supported, rejected at startup |
+| `ARRAY`, `MAP`, `ROW` | not supported. A column of these types that `columns` selects is rejected at startup, and one left out of `columns` is not checked |
 
 Temporal values keep every fractional digit the column holds, so the default `TIMESTAMP(6)` keeps its microseconds. They are formatted the same way the PostgreSQL source formats them: `TIMESTAMP` carries no timezone and is written without one, while `TIMESTAMP_LTZ` is an instant and is written in UTC.
 
@@ -89,7 +89,8 @@ These are limits of this connector, not of the `fluss-rs` client.
 - **Partitioned tables are not supported.** They are detected and rejected at startup.
 - **Do not set `exactly_once` for this source.** The runtime's [exactly-once mode](../../runtime/README.md#exactly-once-sources) needs the same messages from the same state, but after a restart the first poll from the saved offsets can return other rows than the batch in flight. A batch with another row count can land twice. On a table with several buckets, one with the same count passes as a duplicate, so its rows are dropped while the offsets move past them.
 - **Rows that cannot be converted are skipped.** A value the JSON mapping cannot hold, such as a date beyond what `chrono` represents, fails the same way on every read. Such a row is dropped and logged at error level with its bucket and offset, the offsets move past it, and the number of skipped rows is logged when the connector closes.
-- **A crash right after starting from `latest` can miss rows.** The resolved start offsets stay in memory until the batch that carries them alone is acknowledged, which normally takes one poll. If the connector crashes in that window, the next start resolves `latest` again and misses the rows written in between.
+- **A stop right after starting from `latest` can miss rows.** The resolved start offsets stay in memory until the batch that carries them alone is acknowledged, which normally takes one poll. If the connector crashes or is stopped in that window, the next start resolves `latest` again and misses the rows written in between.
+- **A state file that cannot be written keeps that window open.** That batch carries no rows, so rejected rows cannot hold it back. A failed state save does: the runtime rejects the batch, and after five rejections in a row it stops the source with the start offsets still unsaved.
 - **An unreadable saved state stops the connector at startup.** Starting over from `starting_offset` could skip rows that were never delivered, `latest` above all, so the connector refuses to open until the saved state is removed (the `source_<key>.state` file under the runtime's state path with the default file storage).
 - **A saved state only fits the table it was read from.** The state records the table name and id, and the connector refuses to open over a state saved for another table, or for a table dropped and created again under the same name, until that state is removed. Table ids start over in every cluster, so a table with the same name and id on another cluster is not told apart.
 - **The reason a start failed is only in the runtime log.** The runtime reports a failed start as a generic initialization error in `last_error`, so the connector logs the cause at error level.

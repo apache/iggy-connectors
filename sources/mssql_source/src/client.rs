@@ -34,8 +34,8 @@ const AFTER_FROM: &str = "(__$start_lsn > @P1 OR (__$start_lsn = @P1 AND \
      (ISNULL(__$command_id, 0) > @P3 OR (ISNULL(__$command_id, 0) = @P3 AND __$seqval > @P4))))";
 const UP_TO_THROUGH: &str = "(__$start_lsn < @P5 OR (__$start_lsn = @P5 AND \
      (ISNULL(__$command_id, 0) < @P6 OR (ISNULL(__$command_id, 0) = @P6 AND __$seqval <= @P7))))";
-/// `change_keys` selects `__$command_id` after the start LSN, seqval and operation.
-const KEY_COMMAND_ID_COLUMN: usize = 3;
+/// `change_keys` selects `__$command_id` after the start LSN and seqval.
+const KEY_COMMAND_ID_COLUMN: usize = 2;
 const UNKNOWN_BUILT_IN_FUNCTION: u32 = 195;
 // From the `times` join, with the offset in effect at commit time so changes before a DST switch stay correct.
 const COMMIT_TIME_BY_ZONE: &str = "times.tran_end_time AT TIME ZONE CURRENT_TIMEZONE_ID()";
@@ -83,7 +83,6 @@ pub(crate) struct CapturedColumn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChangeKey {
     pub(crate) position: Position,
-    pub(crate) operation: u8,
     pub(crate) instance: usize,
 }
 
@@ -340,7 +339,7 @@ impl CdcClient {
         }
         // NOLOCK as in fn_cdc_get_all_changes. The bound @P2 is the committed max LSN, so rows up to it are complete.
         let sql = format!(
-            "SELECT TOP ({limit}) WITH TIES __$start_lsn, __$seqval, __$operation, __$command_id \
+            "SELECT TOP ({limit}) WITH TIES __$start_lsn, __$seqval, __$command_id \
              FROM cdc.{table} WITH (NOLOCK) \
              WHERE __$operation IN (1, 2, 3, 4) AND __$start_lsn BETWEEN @P1 AND @P2 \
              AND {after_from} \
@@ -363,7 +362,6 @@ impl CdcClient {
             .map(|row| {
                 Ok(ChangeKey {
                     position: read_position(row, KEY_COMMAND_ID_COLUMN, instance)?,
-                    operation: read_operation(row)?,
                     instance: instance_index,
                 })
             })

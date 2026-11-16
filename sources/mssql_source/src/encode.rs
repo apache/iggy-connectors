@@ -85,9 +85,10 @@ pub(crate) struct Cut {
     pub(crate) left_behind: bool,
 }
 
-/// Sorts keys by (position, operation), takes `limit`, then extends to the end of the last group.
+/// Sorts keys by position, takes `limit`, then extends to the end of the last position group.
+/// Whole groups are kept, so the order inside a group cannot change the cut.
 pub(crate) fn cut(mut keys: Vec<ChangeKey>, limit: usize) -> Cut {
-    keys.sort_unstable_by_key(|key| (key.position, key.operation));
+    keys.sort_unstable_by_key(|key| key.position);
     let mut end = limit.min(keys.len());
     if end > 0 {
         let last = keys[end - 1].position;
@@ -388,10 +389,9 @@ mod tests {
     use tiberius::xml::XmlData;
     use tiberius::{IntoSql, Uuid};
 
-    fn key(start_lsn: u8, seqval: u8, operation: u8, instance: usize) -> ChangeKey {
+    fn key(start_lsn: u8, seqval: u8, instance: usize) -> ChangeKey {
         ChangeKey {
             position: position(start_lsn, i32::from(seqval), seqval),
-            operation,
             instance,
         }
     }
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn given_interleaved_transactions_cut_should_order_by_start_lsn() {
-        let keys = vec![key(9, 1, 2, 0), key(5, 7, 2, 0)];
+        let keys = vec![key(9, 1, 0), key(5, 7, 0)];
 
         let result = cut(keys, 1);
 
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn given_cross_table_transaction_cut_should_include_both_instances() {
-        let keys = vec![key(5, 1, 2, 0), key(5, 2, 2, 1), key(6, 1, 2, 0)];
+        let keys = vec![key(5, 1, 0), key(5, 2, 1), key(6, 1, 0)];
 
         let result = cut(keys, 2);
 
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn given_limit_one_cut_should_keep_update_pair_together() {
-        let keys = vec![key(5, 1, 3, 0), key(5, 1, 4, 0), key(6, 1, 2, 0)];
+        let keys = vec![key(5, 1, 0), key(5, 1, 0), key(6, 1, 0)];
 
         let result = cut(keys, 1);
 
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn given_limit_one_cut_should_keep_single_row_primary_key_update_together() {
-        let keys = vec![key(5, 1, 2, 0), key(5, 1, 1, 0)];
+        let keys = vec![key(5, 1, 0), key(5, 1, 0)];
 
         let result = cut(keys, 1);
 
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn given_multi_row_primary_key_update_cut_should_split_between_rows() {
-        let keys = (1..=6).map(|seqval| key(5, seqval, 1, 0)).collect();
+        let keys = (1..=6).map(|seqval| key(5, seqval, 0)).collect();
 
         let result = cut(keys, 5);
 
@@ -509,13 +509,12 @@ mod tests {
 
     #[test]
     fn given_cut_between_command_ids_at_one_seqval_should_end_on_lower_command_id() {
-        let at = |command_id, seqval, operation| ChangeKey {
+        let at = |command_id, seqval| ChangeKey {
             position: position(5, command_id, seqval),
-            operation,
             instance: 0,
         };
         // A deferred update: deletes 1 and 2 come before inserts 3 and 4, interleaved by seqval.
-        let keys = vec![at(3, 3, 2), at(1, 3, 1), at(4, 4, 2), at(2, 4, 1)];
+        let keys = vec![at(3, 3), at(1, 3), at(4, 4), at(2, 4)];
 
         let result = cut(keys, 2);
 

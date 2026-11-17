@@ -81,6 +81,10 @@ jobs:
       - name: Build test server
         run: ./scripts/build-test-server.sh
 
+      # The suites load the plugins from target/debug, and a test build does not put them there.
+      - name: Build runtime and plugins
+        run: cargo build --locked --workspace
+
       - name: Run full suite
         run: |
           # Doris requires this host setting before its testcontainers fixture starts.

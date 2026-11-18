@@ -1,0 +1,2547 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+mod mapping;
+
+use async_trait::async_trait;
+use fluss::client::{EARLIEST_OFFSET, FlussConnection, LogScanner};
+use fluss::config::Config;
+use fluss::metadata::{DataField, RowType, TablePath};
+use fluss::record::ScanRecords;
+use fluss::row::InternalRow;
+use fluss::rpc::message::OffsetSpec;
+use iggy_connector_sdk::{
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    source::SourceBatchResult, source_connector,
+};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::time::{Instant, sleep, timeout};
+use tracing::{debug, error, info, warn};
+
+source_connector!(FlussSource);
+
+const CONNECTOR_NAME: &str = "Apache Fluss source";
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_PAUSE_AFTER_FAILED_POLL: Duration = Duration::from_secs(1);
+const LOG_TABLE_TYPE: &str = "log";
+const JSON_PAYLOAD_FORMAT: &str = "json";
+const METADATA_BUCKET: &str = "_fluss_bucket";
+const METADATA_OFFSET: &str = "_fluss_offset";
+const METADATA_TIMESTAMP: &str = "_fluss_timestamp";
+const METADATA_PREFIX: &str = "_fluss_";
+const NANOS_PER_MILLI: u64 = 1_000_000;
+const INITIAL_PAYLOAD_CAPACITY: usize = 128;
+/// Set on every message id. Sending replaces a zero id with a random one, which bucket 0,
+/// offset 0 would otherwise get on every delivery.
+const MESSAGE_ID_TAG: u128 = 1 << 127;
+
+/// Deliberately not `Serialize`. The runtime hands plugin configuration over as raw JSON and
+/// never serializes this struct, so leaving it out keeps `sasl_password` unserializable.
+#[derive(Debug, Deserialize)]
+pub struct FlussSourceConfig {
+    pub bootstrap_servers: String,
+    pub database: String,
+    pub table: String,
+    /// Only `log` is accepted today. A primary-key table streams a changelog whose change
+    /// types need their own mapping onto messages, so the value is validated rather than
+    /// silently ignored.
+    pub table_type: Option<String>,
+    /// `earliest` (default), `latest`, or an explicit numeric offset applied to every bucket.
+    pub starting_offset: Option<StartingOffsetValue>,
+    /// Columns written to each message, in this order. Omit to write every column. An empty
+    /// list or a repeated name is rejected.
+    pub columns: Option<Vec<String>>,
+    pub poll_interval: Option<String>,
+    pub poll_timeout: Option<String>,
+    /// How long the cluster may take to answer, when the connector opens and while it reads.
+    pub request_timeout: Option<String>,
+    pub batch_size: Option<u32>,
+    /// Only `json` is accepted today. `arrow_ipc` needs the batch scanner and a different
+    /// offset-tracking path, so it is rejected rather than quietly downgraded.
+    pub payload_format: Option<String>,
+    /// Adds the bucket, offset and timestamp of each row under the `_fluss_` prefix, so a column
+    /// under that prefix is rejected while it is on.
+    pub include_metadata: Option<bool>,
+    pub sasl_username: Option<String>,
+    pub sasl_password: Option<SecretString>,
+    pub verbose_logging: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct State {
+    /// Next offset to read per bucket. Absent buckets fall back to the configured start.
+    bucket_offsets: HashMap<i32, i64>,
+    messages_produced: u64,
+    /// The table the offsets were read from, set by `open()` before anything is saved.
+    table: Option<TableIdentity>,
+    /// Unconvertible rows this run dropped, reported when the connector closes. It moves with
+    /// the offsets on ACK, so rows read again after a NACK are not counted twice, and it is
+    /// not persisted.
+    #[serde(skip)]
+    rows_skipped: u64,
+}
+
+/// Offsets only mean something for the table they were read from. A table dropped and created
+/// again under the same name gets a new id, while ids start over in every cluster, so the name
+/// and the id are kept together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TableIdentity {
+    database: String,
+    table: String,
+    table_id: i64,
+}
+
+impl TableIdentity {
+    fn new(table_path: &TablePath, table_id: i64) -> Self {
+        Self {
+            database: table_path.database().to_owned(),
+            table: table_path.table().to_owned(),
+            table_id,
+        }
+    }
+}
+
+impl std::fmt::Display for TableIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "'{}.{}' (id {})",
+            self.database, self.table, self.table_id
+        )
+    }
+}
+
+/// The scanner and the connection it reads through. The connection is kept for the check that
+/// the cluster still answers.
+struct Reader {
+    connection: FlussConnection,
+    scanner: LogScanner,
+    /// When the cluster last answered that check, or when the reader was made.
+    checked_at: Instant,
+}
+
+/// A batch handed to the runtime and not acknowledged yet, kept with the records it was built
+/// from so that a rejected batch can be built again from the same rows.
+struct StagedBatch {
+    state: State,
+    records: ScanRecords,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StartingOffset {
+    Earliest,
+    Latest,
+    Explicit(i64),
+}
+
+/// `starting_offset` as written in the configuration. A TOML integer, or an environment
+/// override made of digits, reaches the connector as a number rather than a string.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StartingOffsetValue {
+    Offset(i64),
+    Name(String),
+}
+
+impl FromStr for StartingOffset {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "earliest" => Ok(StartingOffset::Earliest),
+            "latest" => Ok(StartingOffset::Latest),
+            other => other
+                .parse::<i64>()
+                .map_err(|_| invalid_starting_offset(other))
+                .and_then(StartingOffset::try_from),
+        }
+    }
+}
+
+impl TryFrom<i64> for StartingOffset {
+    type Error = Error;
+
+    fn try_from(offset: i64) -> Result<Self, Self::Error> {
+        if offset >= 0 {
+            Ok(StartingOffset::Explicit(offset))
+        } else {
+            Err(invalid_starting_offset(offset))
+        }
+    }
+}
+
+impl TryFrom<&StartingOffsetValue> for StartingOffset {
+    type Error = Error;
+
+    fn try_from(value: &StartingOffsetValue) -> Result<Self, Self::Error> {
+        match value {
+            StartingOffsetValue::Offset(offset) => StartingOffset::try_from(*offset),
+            StartingOffsetValue::Name(name) => name.parse(),
+        }
+    }
+}
+
+fn invalid_starting_offset(value: impl std::fmt::Display) -> Error {
+    Error::InitError(format!(
+        "invalid starting_offset '{value}' for {CONNECTOR_NAME}, expected 'earliest', 'latest' or \
+         a non-negative offset"
+    ))
+}
+
+pub struct FlussSource {
+    id: u32,
+    config: FlussSourceConfig,
+    table_path: TablePath,
+    poll_interval: Duration,
+    poll_timeout: Duration,
+    request_timeout: Duration,
+    /// The most records one scanner poll returns, `batch_size` or the client default.
+    max_poll_records: usize,
+    include_metadata: bool,
+    verbose_logging: bool,
+    /// Set when a saved state was handed over but could not be decoded. `open()` refuses to
+    /// resolve start offsets without it, since starting over from `latest` would skip whatever
+    /// arrived after the last acknowledged batch.
+    unreadable_state: bool,
+    reader: Mutex<Option<Reader>>,
+    columns: Vec<mapping::Column>,
+    state: Mutex<State>,
+    staged: Mutex<Option<StagedBatch>>,
+    /// Records of a batch the runtime rejected, or of one whose state could not be staged. The
+    /// next poll builds its batch from them instead of reading the scanner. Rewinding the scanner
+    /// instead is not safe here: a fetch response is credited to the bucket's position when it
+    /// lands, so one requested before the rewind would pass for the rewound fetch and skip the
+    /// rejected rows.
+    replay: Mutex<Option<ScanRecords>>,
+    /// Set when the scanner fails a poll. It can fail after moving past the records it had
+    /// collected, dropping them, so the next poll points it back at the committed offsets
+    /// before reading again.
+    rewind_required: AtomicBool,
+    /// Set when the cluster did not answer within `request_timeout`. fluss-rs 1.0 puts no
+    /// deadline on a request, so a connection that stays open without answering is never given
+    /// up: the scanner keeps waiting on it and every poll comes back empty. The next poll drops
+    /// the client and connects again at the committed offsets.
+    connection_lost: AtomicBool,
+    /// Set when the last scanner poll returned `max_poll_records` records, so more are likely
+    /// waiting and the next poll reads without waiting for `poll_interval`.
+    full_batch_read: AtomicBool,
+    /// Set when `open()` resolved start offsets that are not on disk yet. Polls send them alone,
+    /// holding back any rows read, until a batch is acknowledged, so a restart does not resolve
+    /// `latest` again and skip what was written in between.
+    start_offsets_unsaved: AtomicBool,
+}
+
+/// `LogScanner` and `ScanRecords` do not implement `Debug`, so the derive is replaced by a
+/// hand-written one that reports whether the source is open instead of client internals.
+impl std::fmt::Debug for FlussSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FlussSource")
+            .field("id", &self.id)
+            .field("table_path", &self.table_path)
+            .field("poll_interval", &self.poll_interval)
+            .field("poll_timeout", &self.poll_timeout)
+            .field("include_metadata", &self.include_metadata)
+            .field("columns", &self.columns.len())
+            .field("request_timeout", &self.request_timeout)
+            .field(
+                "opened",
+                &self.reader.try_lock().is_ok_and(|reader| reader.is_some()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl FlussSource {
+    pub fn new(id: u32, config: FlussSourceConfig, state: Option<ConnectorState>) -> Self {
+        let poll_interval = parse_duration(
+            config.poll_interval.as_deref(),
+            DEFAULT_POLL_INTERVAL,
+            "poll_interval",
+            id,
+        );
+        let poll_timeout = parse_duration(
+            config.poll_timeout.as_deref(),
+            DEFAULT_POLL_TIMEOUT,
+            "poll_timeout",
+            id,
+        );
+        let request_timeout = parse_duration(
+            config.request_timeout.as_deref(),
+            DEFAULT_REQUEST_TIMEOUT,
+            "request_timeout",
+            id,
+        );
+        let max_poll_records = config.batch_size.map_or_else(
+            || Config::default().scanner_log_max_poll_records,
+            |batch_size| batch_size as usize,
+        );
+        let include_metadata = config.include_metadata.unwrap_or(false);
+        let verbose_logging = config.verbose_logging.unwrap_or(false);
+        let table_path = TablePath::new(config.database.clone(), config.table.clone());
+
+        let state_handed_over = state.is_some();
+        let restored_state = state
+            .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, id))
+            .inspect(|state| {
+                info!(
+                    "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
+                     Buckets tracked: {}, messages produced: {}",
+                    state.bucket_offsets.len(),
+                    state.messages_produced
+                );
+            });
+        let unreadable_state = state_handed_over && restored_state.is_none();
+
+        FlussSource {
+            id,
+            config,
+            table_path,
+            poll_interval,
+            poll_timeout,
+            request_timeout,
+            max_poll_records,
+            include_metadata,
+            verbose_logging,
+            unreadable_state,
+            reader: Mutex::new(None),
+            columns: Vec::new(),
+            state: Mutex::new(restored_state.unwrap_or_default()),
+            staged: Mutex::new(None),
+            replay: Mutex::new(None),
+            rewind_required: AtomicBool::new(false),
+            connection_lost: AtomicBool::new(false),
+            full_batch_read: AtomicBool::new(false),
+            start_offsets_unsaved: AtomicBool::new(false),
+        }
+    }
+
+    /// After a failed poll `poll()` waits at least [`MIN_PAUSE_AFTER_FAILED_POLL`]. The SDK
+    /// polls again as soon as `poll()` returns an error, so with a zero `poll_interval` an error
+    /// that repeats, such as an offset out of range or a cluster that cannot be reached again,
+    /// would be retried at network speed.
+    ///
+    /// After a full batch it reads again at once, since waiting `poll_interval` between full
+    /// batches would cap the source at `batch_size` rows per interval. An idle table still
+    /// waits on the server for up to `poll_timeout`.
+    fn pause_before_poll(&self) -> Duration {
+        if self.rewind_required.load(Ordering::Acquire)
+            || self.connection_lost.load(Ordering::Acquire)
+        {
+            self.poll_interval.max(MIN_PAUSE_AFTER_FAILED_POLL)
+        } else if self.full_batch_read.load(Ordering::Acquire) {
+            Duration::ZERO
+        } else {
+            self.poll_interval
+        }
+    }
+
+    fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
+        ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
+    }
+
+    fn client_config(&self) -> Config {
+        let mut config = Config {
+            bootstrap_servers: self.config.bootstrap_servers.clone(),
+            ..Config::default()
+        };
+        config.scanner_log_max_poll_records = self.max_poll_records;
+        if let (Some(username), Some(password)) =
+            (&self.config.sasl_username, &self.config.sasl_password)
+        {
+            config.security_protocol = "sasl".to_owned();
+            config.security_sasl_mechanism = "PLAIN".to_owned();
+            config.security_sasl_username = username.clone();
+            config.security_sasl_password = password.expose_secret().to_owned();
+        }
+        config
+    }
+
+    fn validate_config(&self) -> Result<StartingOffset, Error> {
+        for (field, value) in [
+            ("bootstrap_servers", &self.config.bootstrap_servers),
+            ("database", &self.config.database),
+            ("table", &self.config.table),
+        ] {
+            if value.trim().is_empty() {
+                return Err(Error::InitError(format!(
+                    "{field} for {CONNECTOR_NAME} must not be empty"
+                )));
+            }
+        }
+
+        let table_type = self.config.table_type.as_deref().unwrap_or(LOG_TABLE_TYPE);
+        if table_type != LOG_TABLE_TYPE {
+            return Err(Error::InitError(format!(
+                "{CONNECTOR_NAME} supports only table_type '{LOG_TABLE_TYPE}', got '{table_type}'. \
+                 Primary-key changelog tables are not supported yet"
+            )));
+        }
+
+        let payload_format = self
+            .config
+            .payload_format
+            .as_deref()
+            .unwrap_or(JSON_PAYLOAD_FORMAT);
+        if payload_format != JSON_PAYLOAD_FORMAT {
+            return Err(Error::InitError(format!(
+                "{CONNECTOR_NAME} supports only payload_format '{JSON_PAYLOAD_FORMAT}', got '{payload_format}'"
+            )));
+        }
+
+        if let Some(columns) = &self.config.columns {
+            if columns.is_empty() {
+                return Err(Error::InitError(format!(
+                    "columns for {CONNECTOR_NAME} must name at least one column, or be left out to \
+                     read every column"
+                )));
+            }
+            let mut seen = HashSet::with_capacity(columns.len());
+            if let Some(duplicate) = columns.iter().find(|column| !seen.insert(column.as_str())) {
+                return Err(Error::InitError(format!(
+                    "column '{duplicate}' is listed more than once in columns for {CONNECTOR_NAME}"
+                )));
+            }
+        }
+
+        // The client accepts a zero limit, which makes every poll come back empty.
+        if self.config.batch_size == Some(0) {
+            return Err(Error::InitError(format!(
+                "batch_size for {CONNECTOR_NAME} must be greater than 0"
+            )));
+        }
+        // One without the other would connect without SASL and only fail at the server.
+        if self.config.sasl_username.is_some() != self.config.sasl_password.is_some() {
+            return Err(Error::InitError(format!(
+                "sasl_username and sasl_password for {CONNECTOR_NAME} must be set together"
+            )));
+        }
+        // With neither a pause before the poll nor a server-side wait, an idle table would be
+        // polled in a tight loop.
+        if self.poll_interval.is_zero() && self.poll_timeout.is_zero() {
+            return Err(Error::InitError(format!(
+                "poll_interval and poll_timeout for {CONNECTOR_NAME} cannot both be zero"
+            )));
+        }
+
+        // A zero limit would count every request as unanswered.
+        if self.request_timeout.is_zero() {
+            return Err(Error::InitError(format!(
+                "request_timeout for {CONNECTOR_NAME} must be greater than 0"
+            )));
+        }
+
+        self.config
+            .starting_offset
+            .as_ref()
+            .map_or(Ok(StartingOffset::Earliest), StartingOffset::try_from)
+    }
+
+    /// Only the table's current buckets are subscribed. A bucket already present in the restored
+    /// state keeps its offset and every other one starts at the given default, so a widened
+    /// bucket count does not rewind buckets that were already consumed, and an offset saved for
+    /// a bucket the table no longer has is dropped.
+    fn resolve_start_offsets(
+        bucket_count: i32,
+        start_offset: i64,
+        tracked: &HashMap<i32, i64>,
+    ) -> HashMap<i32, i64> {
+        (0..bucket_count)
+            .map(|bucket| {
+                (
+                    bucket,
+                    tracked.get(&bucket).copied().unwrap_or(start_offset),
+                )
+            })
+            .collect()
+    }
+
+    /// Same rule as [`Self::resolve_start_offsets`], with each untracked bucket starting at its
+    /// current tail.
+    async fn resolve_latest_offsets(
+        &self,
+        connection: &FlussConnection,
+        bucket_count: i32,
+        tracked: &HashMap<i32, i64>,
+    ) -> Result<HashMap<i32, i64>, Error> {
+        let missing: Vec<i32> = (0..bucket_count)
+            .filter(|bucket| !tracked.contains_key(bucket))
+            .collect();
+        let tails = if missing.is_empty() {
+            HashMap::new()
+        } else {
+            let admin = connection.get_admin().map_err(connection_error)?;
+            admin
+                .list_offsets(&self.table_path, &missing, OffsetSpec::Latest)
+                .await
+                .map_err(connection_error)?
+        };
+        (0..bucket_count)
+            .map(|bucket| {
+                let offset = match tracked.get(&bucket) {
+                    Some(offset) => *offset,
+                    None => tails.get(&bucket).copied().ok_or_else(|| {
+                        Error::InitError(format!(
+                            "Apache Fluss returned no latest offset for bucket {bucket} of table '{}'",
+                            self.table_path
+                        ))
+                    })?,
+                };
+                Ok((bucket, offset))
+            })
+            .collect()
+    }
+
+    /// A row that cannot be converted fails the same way on every read, so failing the batch
+    /// would read it again forever. That includes a failed column read, since the scanner hands
+    /// rows over already decoded in memory. Such a row is dropped and logged with its position
+    /// instead, and the offsets still move past it.
+    async fn build_batch(
+        &self,
+        records: ScanRecords,
+    ) -> Result<(Vec<ProducedMessage>, Option<ConnectorState>), Error> {
+        let buckets = records.records_by_buckets();
+        let mut messages = Vec::with_capacity(records.count());
+        let mut polled_offsets = HashMap::with_capacity(buckets.len());
+        let mut skipped = 0;
+        // Rows of one table come out at about the same size, so each payload starts at the size
+        // of the one before it instead of growing from serde_json's 128 bytes.
+        let mut payload_capacity = INITIAL_PAYLOAD_CAPACITY;
+        for (bucket, bucket_records) in buckets {
+            let bucket_id = bucket.bucket_id();
+            for record in bucket_records {
+                match self.build_message(
+                    bucket_id,
+                    record.offset(),
+                    record.timestamp(),
+                    record.row(),
+                    payload_capacity,
+                ) {
+                    Ok(message) => {
+                        payload_capacity = message.payload.len();
+                        messages.push(message);
+                    }
+                    Err(error) => {
+                        skipped += 1;
+                        error!(
+                            "{CONNECTOR_NAME} connector with ID: {} skipped the row at bucket \
+                             {bucket_id}, offset {}, which it cannot convert: {error}",
+                            self.id,
+                            record.offset()
+                        );
+                    }
+                }
+            }
+            if let Some(last) = bucket_records.last() {
+                polled_offsets.insert(bucket_id, last.offset() + 1);
+            }
+        }
+
+        match self
+            .stage_batch_state(polled_offsets, messages.len(), skipped)
+            .await
+        {
+            Ok(Some((state, persisted))) => {
+                *self.staged.lock().await = Some(StagedBatch { state, records });
+                Ok((messages, Some(persisted)))
+            }
+            Ok(None) => Ok((messages, None)),
+            Err(error) => {
+                // The scanner is already past these records, so they are built again on the
+                // next poll rather than skipped along with the error. A batch of start offsets
+                // alone leaves the rows it held back in place.
+                if !records.is_empty() {
+                    *self.replay.lock().await = Some(records);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn build_message<R: InternalRow + ?Sized>(
+        &self,
+        bucket: i32,
+        offset: i64,
+        timestamp_millis: i64,
+        row: &R,
+        payload_capacity: usize,
+    ) -> Result<ProducedMessage, Error> {
+        let record_metadata = [
+            (METADATA_BUCKET, i64::from(bucket)),
+            (METADATA_OFFSET, offset),
+            (METADATA_TIMESTAMP, timestamp_millis),
+        ];
+        let metadata: &[(&str, i64)] = if self.include_metadata {
+            &record_metadata
+        } else {
+            &[]
+        };
+
+        let mut payload = Vec::with_capacity(payload_capacity);
+        serde_json::to_writer(
+            &mut payload,
+            &mapping::JsonRow::new(row, &self.columns, metadata),
+        )
+        .map_err(|error| Error::InvalidRecordValue(error.to_string()))?;
+
+        Ok(ProducedMessage {
+            id: Some(message_id(bucket, offset)),
+            headers: None,
+            checksum: None,
+            timestamp: None,
+            origin_timestamp: origin_timestamp_nanos(timestamp_millis),
+            payload,
+        })
+    }
+
+    /// Builds the state a polled batch would leave behind, to be committed once the runtime
+    /// acknowledges the batch. A poll that read no rows changes no offset, so it carries no state
+    /// unless the start offsets from `open()` still have to reach disk. A poll whose rows were
+    /// all skipped still moves the offsets past them.
+    async fn stage_batch_state(
+        &self,
+        polled_offsets: HashMap<i32, i64>,
+        produced: usize,
+        skipped: usize,
+    ) -> Result<Option<(State, ConnectorState)>, Error> {
+        if polled_offsets.is_empty() && !self.start_offsets_unsaved.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+
+        let mut candidate = self.state.lock().await.clone();
+        candidate.bucket_offsets.extend(polled_offsets);
+        candidate.messages_produced += produced as u64;
+        candidate.rows_skipped += skipped as u64;
+        let persisted = self.serialize_state(&candidate).ok_or_else(|| {
+            Error::Serialization(format!(
+                "failed to serialize state for {CONNECTOR_NAME} connector with ID: {}",
+                self.id
+            ))
+        })?;
+        Ok(Some((candidate, persisted)))
+    }
+
+    /// Reads the next records, first connecting again if the cluster stopped answering, and
+    /// pointing the scanner back at the committed offsets if its last poll failed. A failed poll
+    /// can drop records it already collected, either when a later fetch in the same poll fails
+    /// or when sending the next fetches fails. The rewind is safe in both cases: the scanner
+    /// never fetches a bucket that still has buffered records, and sends nothing between
+    /// collecting them and failing, so no fetch is in flight for those buckets.
+    async fn read(&self) -> Result<ScanRecords, Error> {
+        let mut reader = self.reader.lock().await;
+        if self.connection_lost.load(Ordering::Acquire) {
+            // Dropped before connecting, so a failed attempt does not leave the old client in
+            // place. Its fetch tasks stay parked on the silent connections.
+            *reader = None;
+            *reader = Some(self.connect_again().await?);
+            self.connection_lost.store(false, Ordering::Release);
+            self.rewind_required.store(false, Ordering::Release);
+            info!(
+                "{CONNECTOR_NAME} connector with ID: {} connected again and reads on from the \
+                 last acknowledged offsets",
+                self.id
+            );
+        }
+        let Some(reader) = reader.as_mut() else {
+            return Err(Error::InitError(format!(
+                "{CONNECTOR_NAME} connector with ID: {} polled before it was opened",
+                self.id
+            )));
+        };
+        self.ensure_cluster_answers(reader).await?;
+
+        if self.rewind_required.load(Ordering::Acquire) {
+            let committed = { self.state.lock().await.bucket_offsets.clone() };
+            self.answered(
+                "the rewind of its scanner",
+                self.request_timeout,
+                reader.scanner.subscribe_buckets(&committed),
+            )
+            .await?
+            .map_err(|error| {
+                Error::Connection(format!(
+                    "failed to rewind the Apache Fluss scanner to the last acknowledged \
+                     offsets: {error}"
+                ))
+            })?;
+            self.rewind_required.store(false, Ordering::Release);
+            info!(
+                "{CONNECTOR_NAME} connector with ID: {} rewound its scanner to the last \
+                 acknowledged offsets after a failed poll",
+                self.id
+            );
+        }
+
+        // An idle table answers after `poll_timeout`, so the limit starts where that ends.
+        self.answered(
+            "a poll",
+            self.poll_timeout + self.request_timeout,
+            reader.scanner.poll(self.poll_timeout),
+        )
+        .await?
+        .map_err(|error| {
+            self.rewind_required.store(true, Ordering::Release);
+            Error::Connection(format!("failed to poll Apache Fluss: {error}"))
+        })
+    }
+
+    /// Waits for `call` up to `limit`. Past it the cluster counts as lost, and the next poll
+    /// connects again.
+    async fn answered<T>(
+        &self,
+        request: &str,
+        limit: Duration,
+        call: impl Future<Output = T>,
+    ) -> Result<T, Error> {
+        timeout(limit, call).await.map_err(|_| {
+            self.connection_lost.store(true, Ordering::Release);
+            Error::Connection(format!(
+                "Apache Fluss did not answer {request} within {limit:?}, so the connector \
+                 connects again"
+            ))
+        })
+    }
+
+    /// Asks every bucket leader for its end offset once per `request_timeout`. The scanner
+    /// cannot tell an idle table from a connection that went silent, since both give empty
+    /// polls, and rows of one bucket can keep arriving while the leader of another is silent.
+    /// A request that fails was answered, or failed on a connection the client replaces by
+    /// itself, so only one that gets no answer counts.
+    async fn ensure_cluster_answers(&self, reader: &mut Reader) -> Result<(), Error> {
+        if reader.checked_at.elapsed() < self.request_timeout {
+            return Ok(());
+        }
+        let buckets: Vec<i32> = {
+            let state = self.state.lock().await;
+            state.bucket_offsets.keys().copied().collect()
+        };
+        let checked = self
+            .answered(
+                "a request for its end offsets",
+                self.request_timeout,
+                async {
+                    let admin = reader.connection.get_admin()?;
+                    admin
+                        .list_offsets(&self.table_path, &buckets, OffsetSpec::Latest)
+                        .await
+                },
+            )
+            .await?;
+        if let Err(error) = checked {
+            warn!(
+                "{CONNECTOR_NAME} connector with ID: {} could not read the end offsets of table \
+                 '{}': {error}",
+                self.id, self.table_path
+            );
+        }
+        reader.checked_at = Instant::now();
+        Ok(())
+    }
+
+    /// Builds a new client and subscribes it at the committed offsets. The columns chosen by
+    /// `open()` stay in use, so the table has to be the one it opened, with those columns still
+    /// in place. A column added since then stays out, as it does without a reconnect.
+    async fn connect_again(&self) -> Result<Reader, Error> {
+        let limit = self.request_timeout;
+        timeout(limit, self.connect_at_committed_offsets())
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::Connection(format!(
+                    "Apache Fluss did not answer within {limit:?} while the connector connected \
+                     again"
+                )))
+            })
+    }
+
+    async fn connect_at_committed_offsets(&self) -> Result<Reader, Error> {
+        let connection = FlussConnection::new(self.client_config())
+            .await
+            .map_err(connection_error)?;
+        let (committed, opened_table) = {
+            let state = self.state.lock().await;
+            (state.bucket_offsets.clone(), state.table.clone())
+        };
+        let scanner = {
+            let table = connection
+                .get_table(&self.table_path)
+                .await
+                .map_err(connection_error)?;
+            let table_info = table.get_table_info();
+            ensure_same_table(
+                opened_table.as_ref(),
+                &TableIdentity::new(&self.table_path, table_info.get_table_id()),
+            )?;
+            ensure_same_columns(&self.columns, table_info.get_row_type(), &self.table_path)?;
+            table.new_scan().create_log_scanner().map_err(|error| {
+                Error::Connection(format!("failed to create log scanner: {error}"))
+            })?
+        };
+        scanner
+            .subscribe_buckets(&committed)
+            .await
+            .map_err(connection_error)?;
+        Ok(Reader {
+            connection,
+            scanner,
+            checked_at: Instant::now(),
+        })
+    }
+
+    async fn open_inner(&mut self) -> Result<(), Error> {
+        let start = self.validate_config()?;
+        if self.unreadable_state {
+            return Err(Error::InitError(
+                "the saved state cannot be decoded. Starting over could skip rows that were never \
+                 delivered, so remove the saved state to start again from starting_offset"
+                    .to_owned(),
+            ));
+        }
+
+        let connection = FlussConnection::new(self.client_config())
+            .await
+            .map_err(connection_error)?;
+
+        // The scanner aligns every row to the schema it was created with, so the columns used to
+        // decode rows come from the same table snapshot rather than from a second lookup that a
+        // schema change could land between.
+        let (scanner, columns, bucket_count, table) = {
+            let table = connection
+                .get_table(&self.table_path)
+                .await
+                .map_err(connection_error)?;
+            let table_info = table.get_table_info();
+
+            if table_info.has_primary_key() {
+                return Err(Error::InitError(format!(
+                    "table '{}' is a primary-key table. {CONNECTOR_NAME} supports log tables only",
+                    self.table_path
+                )));
+            }
+            if table_info.is_partitioned() {
+                return Err(Error::InitError(format!(
+                    "table '{}' is partitioned, which {CONNECTOR_NAME} does not support yet",
+                    self.table_path
+                )));
+            }
+
+            // `columns` is applied here rather than pushed down to the server. A projected scan
+            // in fluss-rs 1.0 decodes every remote batch with the schema it started with, so a
+            // batch tiered before a column was added fails on every poll. A full scan aligns
+            // each batch to that schema instead, and the columns are picked from the result.
+            let table_row_type = table_info.get_row_type();
+            let positions = match self.config.columns.as_deref() {
+                Some(columns) => projection_indices(table_row_type, columns, &self.table_path)?,
+                None => (0..table_row_type.fields().len()).collect(),
+            };
+            let columns: Vec<mapping::Column> = positions
+                .into_iter()
+                .map(|position| {
+                    mapping::Column::new(position, table_row_type.fields()[position].clone())
+                })
+                .collect();
+            mapping::ensure_supported_types(columns.iter().map(mapping::Column::field))?;
+            if self.include_metadata {
+                ensure_no_metadata_collision(columns.iter().map(mapping::Column::field))?;
+            }
+
+            let scanner = table.new_scan().create_log_scanner().map_err(|error| {
+                Error::InitError(format!("failed to create log scanner: {error}"))
+            })?;
+            (
+                scanner,
+                columns,
+                table_info.get_num_buckets(),
+                TableIdentity::new(&self.table_path, table_info.get_table_id()),
+            )
+        };
+
+        let (restored, restored_table) = {
+            let state = self.state.lock().await;
+            (state.bucket_offsets.clone(), state.table.clone())
+        };
+        ensure_same_table(restored_table.as_ref(), &table)?;
+        let mut stale: Vec<i32> = restored
+            .keys()
+            .copied()
+            .filter(|bucket| !(0..bucket_count).contains(bucket))
+            .collect();
+        if !stale.is_empty() {
+            stale.sort_unstable();
+            warn!(
+                "{CONNECTOR_NAME} connector with ID: {} ignores the saved offsets of buckets \
+                 {stale:?}, which table '{}' no longer has",
+                self.id, self.table_path
+            );
+        }
+        let offsets = match start {
+            StartingOffset::Earliest => {
+                Self::resolve_start_offsets(bucket_count, EARLIEST_OFFSET, &restored)
+            }
+            StartingOffset::Explicit(offset) => {
+                Self::resolve_start_offsets(bucket_count, offset, &restored)
+            }
+            StartingOffset::Latest => {
+                self.resolve_latest_offsets(&connection, bucket_count, &restored)
+                    .await?
+            }
+        };
+        scanner
+            .subscribe_buckets(&offsets)
+            .await
+            .map_err(connection_error)?;
+
+        self.start_offsets_unsaved.store(
+            offsets != restored || restored_table.is_none(),
+            Ordering::Release,
+        );
+        {
+            let mut state = self.state.lock().await;
+            state.bucket_offsets = offsets;
+            state.table = Some(table);
+        }
+
+        self.columns = columns;
+        *self.reader.get_mut() = Some(Reader {
+            connection,
+            scanner,
+            checked_at: Instant::now(),
+        });
+
+        info!(
+            "Opened {CONNECTOR_NAME} connector with ID: {}, table: {}, buckets: {bucket_count}, \
+             columns: {}, poll interval: {:?}",
+            self.id,
+            self.table_path,
+            self.columns.len(),
+            self.poll_interval
+        );
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Source for FlussSource {
+    async fn open(&mut self) -> Result<(), Error> {
+        // Without the limit a server that accepts the connection and never answers would keep
+        // `open()`, and with it the start of the whole runtime, waiting forever.
+        let limit = self.request_timeout;
+        let opened = timeout(limit, self.open_inner()).await.unwrap_or_else(|_| {
+            Err(Error::Connection(format!(
+                "Apache Fluss did not answer within {limit:?}"
+            )))
+        });
+        // The SDK reports only whether `open` failed and the runtime records a generic
+        // "Plugin initialization failed", so the reason reaches the operator through this log.
+        if let Err(error) = &opened {
+            error!(
+                "Failed to open {CONNECTOR_NAME} connector with ID: {}: {error}",
+                self.id
+            );
+        }
+        opened
+    }
+
+    async fn poll(&self) -> Result<ProducedMessages, Error> {
+        sleep(self.pause_before_poll()).await;
+
+        let replayed = self.replay.lock().await.take();
+        let records = match replayed {
+            Some(records) => records,
+            None => {
+                let records = self.read().await?;
+                self.full_batch_read
+                    .store(records.count() >= self.max_poll_records, Ordering::Release);
+                records
+            }
+        };
+        // Unsaved start offsets go out alone first. A batch without rows has nothing for the
+        // runtime to encode or send, so they reach disk even when every row would be rejected,
+        // and a restart after the NACK limit does not resolve `latest` again past these rows.
+        let records = if self.start_offsets_unsaved.load(Ordering::Acquire) && !records.is_empty() {
+            *self.replay.lock().await = Some(records);
+            ScanRecords::empty()
+        } else {
+            records
+        };
+        let (messages, state) = self.build_batch(records).await?;
+
+        let produced = messages.len();
+        if produced > 0 {
+            if self.verbose_logging {
+                info!(
+                    "{CONNECTOR_NAME} connector with ID: {} produced {produced} messages from table: {}",
+                    self.id, self.table_path
+                );
+            } else {
+                debug!(
+                    "{CONNECTOR_NAME} connector with ID: {} produced {produced} messages from table: {}",
+                    self.id, self.table_path
+                );
+            }
+        }
+
+        Ok(ProducedMessages {
+            schema: Schema::Json,
+            messages,
+            state,
+        })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let Some(staged) = self.staged.lock().await.take() else {
+            return Ok(());
+        };
+        match result {
+            SourceBatchResult::Ack => {
+                *self.state.lock().await = staged.state;
+                self.start_offsets_unsaved.store(false, Ordering::Release);
+            }
+            SourceBatchResult::Nack => {
+                // A batch of start offsets alone has no rows to send again. The offsets still
+                // ride the next poll while they are unsaved.
+                if !staged.records.is_empty() {
+                    warn!(
+                        "{CONNECTOR_NAME} connector with ID: {} will send a rejected batch of {} \
+                         rows again",
+                        self.id,
+                        staged.records.count()
+                    );
+                    *self.replay.lock().await = Some(staged.records);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        // `FlussConnection::close` only drains the writer client, which a source never creates,
+        // so dropping the scanner and the connection is what releases the client.
+        *self.reader.get_mut() = None;
+        let state = self.state.lock().await;
+        info!(
+            "Closed {CONNECTOR_NAME} connector with ID: {}, total messages produced: {}, rows \
+             skipped: {}",
+            self.id, state.messages_produced, state.rows_skipped
+        );
+        Ok(())
+    }
+}
+
+/// Buckets are per-table and offsets are per-bucket, so the pair is unique within a table and
+/// stable across restarts. A consumer can use it to spot a record replayed after an
+/// at-least-once redelivery. The Apache Iggy server does not dedupe on it. The offset fills the
+/// low 64 bits, the bucket the next 32, and [`MESSAGE_ID_TAG`] keeps the id from being zero.
+fn message_id(bucket: i32, offset: i64) -> u128 {
+    MESSAGE_ID_TAG | ((bucket as u32 as u128) << 64) | (offset as u64 as u128)
+}
+
+fn origin_timestamp_nanos(timestamp_millis: i64) -> Option<u64> {
+    u64::try_from(timestamp_millis)
+        .ok()
+        .and_then(|millis| millis.checked_mul(NANOS_PER_MILLI))
+}
+
+/// `new()` cannot fail (the FFI macro fixes its signature), so an unparsable duration falls
+/// back to the default. It is logged at warn so a typo does not silently change the cadence.
+fn parse_duration(value: Option<&str>, default: Duration, field: &str, id: u32) -> Duration {
+    let Some(raw) = value else {
+        return default;
+    };
+    match humantime::Duration::from_str(raw) {
+        Ok(duration) => *duration,
+        Err(error) => {
+            warn!(
+                "Invalid {field} '{raw}' for {CONNECTOR_NAME} connector with ID: {id}, \
+                 falling back to {default:?}. {error}"
+            );
+            default
+        }
+    }
+}
+
+fn connection_error(error: fluss::error::Error) -> Error {
+    Error::Connection(format!("Apache Fluss client failure: {error}"))
+}
+
+/// Resolves the configured names to their positions in the table's rows, in the order they
+/// are listed.
+fn projection_indices(
+    row_type: &RowType,
+    columns: &[String],
+    table_path: &TablePath,
+) -> Result<Vec<usize>, Error> {
+    columns
+        .iter()
+        .map(|column| {
+            row_type.get_field_index(column).ok_or_else(|| {
+                Error::InitError(format!(
+                    "column '{column}' from columns does not exist in table '{table_path}'"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Offsets saved for another table, or for a table dropped and created again under the same
+/// name, would start this one past rows it never delivered, so they are refused before any
+/// bucket is subscribed. A state without a table has not been saved yet.
+fn ensure_same_table(saved: Option<&TableIdentity>, current: &TableIdentity) -> Result<(), Error> {
+    match saved {
+        Some(saved) if saved != current => Err(Error::InitError(format!(
+            "the saved state was read from table {saved}, not from table {current}. Its offsets \
+             could skip rows of this table, so remove the saved state to start again from \
+             starting_offset"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Rows are decoded by the positions and types the columns had when the connector opened, so a
+/// scanner made later is only usable while each of them is still there.
+fn ensure_same_columns(
+    opened: &[mapping::Column],
+    current: &RowType,
+    table_path: &TablePath,
+) -> Result<(), Error> {
+    let fields = current.fields();
+    match opened.iter().find(|column| {
+        fields.get(column.position()).is_none_or(|field| {
+            field.name() != column.field().name() || field.data_type() != column.field().data_type()
+        })
+    }) {
+        Some(column) => Err(Error::InitError(format!(
+            "column '{}' of table '{table_path}' changed since the connector opened. Restart the \
+             connector to read the table as it is now",
+            column.field().name()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// `include_metadata` writes its fields into the same object as the columns, so a column under
+/// the reserved prefix would be overwritten.
+fn ensure_no_metadata_collision<'a>(
+    fields: impl IntoIterator<Item = &'a DataField>,
+) -> Result<(), Error> {
+    match fields
+        .into_iter()
+        .find(|field| field.name().starts_with(METADATA_PREFIX))
+    {
+        Some(field) => Err(Error::InitError(format!(
+            "column '{}' starts with '{METADATA_PREFIX}', which include_metadata reserves for its \
+             own fields. Rename the column, leave it out of columns, or turn include_metadata off",
+            field.name()
+        ))),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluss::metadata::{DataTypes, TableBucket};
+    use fluss::record::{ArrowReader, ChangeType, RowAppendRecordBatchBuilder, ScanRecord};
+    use fluss::row::{Date, GenericRow};
+    use serde_json::Value;
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::thread;
+
+    /// Far past the request timeout under test, so a hang fails the test instead of stalling it.
+    const SILENT_SERVER_LIMIT: Duration = Duration::from_secs(30);
+
+    fn test_config() -> FlussSourceConfig {
+        FlussSourceConfig {
+            bootstrap_servers: "localhost:9123".to_owned(),
+            database: "analytics".to_owned(),
+            table: "events".to_owned(),
+            table_type: None,
+            starting_offset: None,
+            columns: None,
+            poll_interval: Some("100ms".to_owned()),
+            poll_timeout: Some("1s".to_owned()),
+            request_timeout: None,
+            batch_size: Some(500),
+            payload_format: None,
+            include_metadata: None,
+            sasl_username: None,
+            sasl_password: None,
+            verbose_logging: None,
+        }
+    }
+
+    fn state_with(offsets: &[(i32, i64)], produced: u64) -> State {
+        State {
+            bucket_offsets: offsets.iter().copied().collect(),
+            messages_produced: produced,
+            ..State::default()
+        }
+    }
+
+    fn staged_without_rows(state: State) -> StagedBatch {
+        StagedBatch {
+            state,
+            records: ScanRecords::empty(),
+        }
+    }
+
+    /// Records for a table with a single `id` column, decoded from Arrow the way the scanner
+    /// hands them over.
+    fn scan_records(bucket: i32, first_offset: i64, ids: &[i32]) -> ScanRecords {
+        scan_records_in(&[(bucket, first_offset, ids.to_vec())])
+    }
+
+    /// The same records spread over several buckets, each given as its id, the offset of its
+    /// first row and the ids of its rows.
+    fn scan_records_in(buckets: &[(i32, i64, Vec<i32>)]) -> ScanRecords {
+        let row_type = RowType::new(vec![field("id")]);
+        let records = buckets
+            .iter()
+            .map(|(bucket, first_offset, ids)| {
+                let rows: Vec<GenericRow> = ids
+                    .iter()
+                    .map(|id| {
+                        let mut row = GenericRow::new(1);
+                        row.set_field(0, *id);
+                        row
+                    })
+                    .collect();
+                (
+                    TableBucket::new(1, *bucket),
+                    bucket_records(&row_type, *first_offset, &rows),
+                )
+            })
+            .collect();
+        ScanRecords::new(records)
+    }
+
+    fn bucket_records(
+        row_type: &RowType,
+        first_offset: i64,
+        rows: &[GenericRow<'_>],
+    ) -> Vec<ScanRecord> {
+        let mut builder =
+            RowAppendRecordBatchBuilder::new(row_type).expect("Failed to create batch builder");
+        for row in rows {
+            builder.append(row).expect("Failed to append row");
+        }
+        let batch = builder
+            .build_arrow_record_batch()
+            .expect("Failed to build record batch");
+        let reader =
+            ArrowReader::new(batch, Arc::new(row_type.clone())).expect("Failed to read batch");
+        (0..rows.len())
+            .map(|row_id| {
+                ScanRecord::new(
+                    reader.read(row_id),
+                    first_offset + row_id as i64,
+                    1_700_000_000_000,
+                    ChangeType::AppendOnly,
+                )
+            })
+            .collect()
+    }
+
+    fn events_table(table_id: i64) -> TableIdentity {
+        TableIdentity::new(&TablePath::new("analytics", "events"), table_id)
+    }
+
+    #[test]
+    fn given_persisted_state_should_restore_bucket_offsets() {
+        let mut state = state_with(&[(0, 42), (1, 7)], 500);
+        state.table = Some(events_table(3));
+        let serialized = rmp_serde::to_vec(&state).expect("Failed to serialize state");
+
+        let source = FlussSource::new(1, test_config(), Some(ConnectorState(serialized)));
+
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to build runtime");
+        runtime.block_on(async {
+            let restored = source.state.lock().await;
+            assert_eq!(restored.messages_produced, 500);
+            assert_eq!(restored.bucket_offsets.get(&0), Some(&42));
+            assert_eq!(restored.bucket_offsets.get(&1), Some(&7));
+            assert_eq!(restored.table, Some(events_table(3)));
+        });
+    }
+
+    #[test]
+    fn given_no_state_should_start_fresh() {
+        let source = FlussSource::new(1, test_config(), None);
+
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to build runtime");
+        runtime.block_on(async {
+            let state = source.state.lock().await;
+            assert_eq!(state.messages_produced, 0);
+            assert!(state.bucket_offsets.is_empty());
+        });
+    }
+
+    /// The state is a per-bucket cursor, but starting over without it is not always a repeat.
+    /// With `latest` it resumes at the tail and skips whatever arrived after the last
+    /// acknowledged batch, so an unreadable state stops the source before it resolves offsets.
+    #[test]
+    fn given_invalid_state_should_refuse_to_open() {
+        let invalid = ConnectorState(b"not valid msgpack".to_vec());
+        let mut config = test_config();
+        config.starting_offset = Some(StartingOffsetValue::Name("latest".to_owned()));
+
+        let mut source = FlussSource::new(1, config, Some(invalid));
+
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to build runtime");
+        let error = runtime
+            .block_on(source.open())
+            .expect_err("An unreadable state should keep the source from opening");
+        assert!(
+            matches!(&error, Error::InitError(message) if message.contains("cannot be decoded")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn state_should_be_serializable_and_deserializable() {
+        let mut original = state_with(&[(0, 100), (3, 250)], 1000);
+        original.table = Some(events_table(7));
+
+        let serialized = rmp_serde::to_vec(&original).expect("Failed to serialize");
+        let deserialized: State =
+            rmp_serde::from_slice(&serialized).expect("Failed to deserialize");
+
+        assert_eq!(original.messages_produced, deserialized.messages_produced);
+        assert_eq!(original.bucket_offsets, deserialized.bucket_offsets);
+        assert_eq!(original.table, deserialized.table);
+    }
+
+    #[test]
+    fn given_state_saved_for_the_same_table_should_accept_it() {
+        assert!(ensure_same_table(Some(&events_table(3)), &events_table(3)).is_ok());
+    }
+
+    #[test]
+    fn given_state_not_saved_yet_should_accept_any_table() {
+        assert!(ensure_same_table(None, &events_table(3)).is_ok());
+    }
+
+    #[test]
+    fn given_state_saved_for_a_table_created_again_under_the_same_name_should_refuse_it() {
+        let error = ensure_same_table(Some(&events_table(3)), &events_table(4))
+            .expect_err("Offsets of the dropped table should be refused");
+
+        assert!(
+            matches!(&error, Error::InitError(message)
+                if message.contains("'analytics.events' (id 3)")
+                    && message.contains("'analytics.events' (id 4)")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn given_state_saved_for_another_table_should_refuse_it() {
+        let other = TableIdentity::new(&TablePath::new("analytics", "orders"), 3);
+
+        let error = ensure_same_table(Some(&other), &events_table(3))
+            .expect_err("Offsets of another table should be refused");
+
+        assert!(
+            matches!(&error, Error::InitError(message) if message.contains("'analytics.orders'")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn given_default_config_should_accept_log_table_and_earliest_offset() {
+        let source = FlussSource::new(1, test_config(), None);
+
+        let start = source
+            .validate_config()
+            .expect("Default config should be valid");
+
+        assert!(matches!(start, StartingOffset::Earliest));
+    }
+
+    #[test]
+    fn given_primary_key_table_type_should_be_rejected() {
+        let mut config = test_config();
+        config.table_type = Some("primary_key".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        let error = source
+            .validate_config()
+            .expect_err("Primary key tables are not supported yet");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("primary_key")));
+    }
+
+    #[test]
+    fn given_arrow_ipc_payload_format_should_be_rejected() {
+        let mut config = test_config();
+        config.payload_format = Some("arrow_ipc".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        let error = source
+            .validate_config()
+            .expect_err("arrow_ipc is not supported yet");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("arrow_ipc")));
+    }
+
+    #[test]
+    fn given_latest_starting_offset_should_be_parsed() {
+        let mut config = test_config();
+        config.starting_offset = Some(StartingOffsetValue::Name("latest".to_owned()));
+        let source = FlussSource::new(1, config, None);
+
+        let start = source.validate_config().expect("latest should be accepted");
+
+        assert!(matches!(start, StartingOffset::Latest));
+    }
+
+    #[test]
+    fn given_explicit_starting_offset_should_be_parsed() {
+        let mut config = test_config();
+        config.starting_offset = Some(StartingOffsetValue::Name("128".to_owned()));
+        let source = FlussSource::new(1, config, None);
+
+        let start = source
+            .validate_config()
+            .expect("Explicit offset should parse");
+
+        assert!(matches!(start, StartingOffset::Explicit(128)));
+    }
+
+    #[test]
+    fn given_unparsable_starting_offset_should_be_rejected() {
+        let mut config = test_config();
+        config.starting_offset = Some(StartingOffsetValue::Name("beginning".to_owned()));
+        let source = FlussSource::new(1, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_negative_starting_offset_should_be_rejected() {
+        let mut config = test_config();
+        config.starting_offset = Some(StartingOffsetValue::Name("-1".to_owned()));
+        let source = FlussSource::new(1, config, None);
+
+        let error = source
+            .validate_config()
+            .expect_err("A negative offset should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("-1")));
+    }
+
+    /// The runtime hands plugin configuration over as JSON, where a TOML integer and an
+    /// environment override made of digits both become numbers.
+    fn config_with_starting_offset(starting_offset: Value) -> FlussSourceConfig {
+        serde_json::from_value(serde_json::json!({
+            "bootstrap_servers": "localhost:9123",
+            "database": "analytics",
+            "table": "events",
+            "starting_offset": starting_offset,
+        }))
+        .expect("The configuration should deserialize")
+    }
+
+    #[test]
+    fn given_numeric_starting_offset_should_be_parsed() {
+        let source = FlussSource::new(1, config_with_starting_offset(Value::from(128)), None);
+
+        let start = source
+            .validate_config()
+            .expect("A numeric offset should be accepted");
+
+        assert!(matches!(start, StartingOffset::Explicit(128)));
+    }
+
+    #[test]
+    fn given_negative_numeric_starting_offset_should_be_rejected() {
+        let source = FlussSource::new(1, config_with_starting_offset(Value::from(-5)), None);
+
+        let error = source
+            .validate_config()
+            .expect_err("A negative offset should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("-5")));
+    }
+
+    #[test]
+    fn given_named_starting_offset_in_json_should_be_parsed() {
+        let source = FlussSource::new(1, config_with_starting_offset(Value::from("latest")), None);
+
+        let start = source.validate_config().expect("latest should be accepted");
+
+        assert!(matches!(start, StartingOffset::Latest));
+    }
+
+    #[test]
+    fn given_zero_batch_size_should_be_rejected() {
+        let mut config = test_config();
+        config.batch_size = Some(0);
+        let source = FlussSource::new(1, config, None);
+
+        let error = source
+            .validate_config()
+            .expect_err("A zero batch size should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("batch_size")));
+    }
+
+    #[test]
+    fn given_sasl_username_without_password_should_be_rejected() {
+        let mut config = test_config();
+        config.sasl_username = Some("user".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        let error = source
+            .validate_config()
+            .expect_err("Half of the SASL credentials should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("sasl_password")));
+    }
+
+    #[test]
+    fn given_sasl_password_without_username_should_be_rejected() {
+        let mut config = test_config();
+        config.sasl_password = Some(SecretString::from("secret"));
+        let source = FlussSource::new(1, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_sasl_credentials_should_build_a_client_config_the_client_accepts() {
+        let mut config = test_config();
+        config.sasl_username = Some("user".to_owned());
+        config.sasl_password = Some(SecretString::from("secret"));
+        let source = FlussSource::new(1, config, None);
+
+        let client_config = source.client_config();
+
+        assert!(client_config.is_sasl_enabled());
+        assert_eq!(client_config.validate_security(), Ok(()));
+        assert_eq!(client_config.security_sasl_username, "user");
+        assert_eq!(client_config.scanner_log_max_poll_records, 500);
+    }
+
+    #[test]
+    fn given_no_sasl_credentials_should_build_a_plaintext_client_config() {
+        let source = FlussSource::new(1, test_config(), None);
+
+        assert!(!source.client_config().is_sasl_enabled());
+    }
+
+    #[test]
+    fn given_tracked_buckets_should_keep_their_offsets_and_fill_the_rest() {
+        let tracked = HashMap::from([(0, 42)]);
+
+        let offsets = FlussSource::resolve_start_offsets(3, EARLIEST_OFFSET, &tracked);
+
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(offsets[&0], 42);
+        assert_eq!(offsets[&1], EARLIEST_OFFSET);
+        assert_eq!(offsets[&2], EARLIEST_OFFSET);
+    }
+
+    #[test]
+    fn given_explicit_start_should_apply_to_untracked_buckets_only() {
+        let tracked = HashMap::from([(1, 900)]);
+
+        let offsets = FlussSource::resolve_start_offsets(2, 50, &tracked);
+
+        assert_eq!(offsets[&0], 50);
+        assert_eq!(offsets[&1], 900);
+    }
+
+    #[test]
+    fn message_id_should_be_unique_per_bucket_and_offset() {
+        assert_ne!(message_id(0, 1), message_id(1, 0));
+        assert_ne!(message_id(0, 1), message_id(0, 2));
+        assert_eq!(message_id(2, 5), message_id(2, 5));
+        assert_eq!(message_id(2, 5), (1 << 127) | (2 << 64) | 5);
+    }
+
+    #[test]
+    fn given_first_row_of_first_bucket_should_get_a_nonzero_message_id() {
+        assert_ne!(message_id(0, 0), 0);
+    }
+
+    #[test]
+    fn origin_timestamp_should_convert_milliseconds_to_nanoseconds() {
+        assert_eq!(
+            origin_timestamp_nanos(1_785_655_133_842),
+            Some(1_785_655_133_842_000_000)
+        );
+        assert_eq!(origin_timestamp_nanos(0), Some(0));
+        assert_eq!(origin_timestamp_nanos(-1), None);
+    }
+
+    #[test]
+    fn given_invalid_duration_should_fall_back_to_default() {
+        assert_eq!(
+            parse_duration(Some("nonsense"), DEFAULT_POLL_INTERVAL, "poll_interval", 1),
+            DEFAULT_POLL_INTERVAL
+        );
+        assert_eq!(
+            parse_duration(None, DEFAULT_POLL_TIMEOUT, "poll_timeout", 1),
+            DEFAULT_POLL_TIMEOUT
+        );
+        assert_eq!(
+            parse_duration(Some("250ms"), DEFAULT_POLL_INTERVAL, "poll_interval", 1),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn given_ack_when_batch_is_staged_should_commit_candidate_state() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.staged.lock().await = Some(staged_without_rows(state_with(&[(0, 42)], 42)));
+
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+
+            let state = source.state.lock().await;
+            assert_eq!(state.messages_produced, 42);
+            assert_eq!(state.bucket_offsets.get(&0), Some(&42));
+            assert!(source.staged.lock().await.is_none());
+        });
+    }
+
+    #[test]
+    fn given_nack_when_batch_is_staged_should_keep_committed_state() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.staged.lock().await = Some(staged_without_rows(state_with(&[(0, 42)], 42)));
+
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("NACK should be applied");
+
+            let state = source.state.lock().await;
+            assert_eq!(state.messages_produced, 0);
+            assert!(state.bucket_offsets.is_empty());
+            assert!(source.staged.lock().await.is_none());
+            assert!(
+                source.replay.lock().await.is_none(),
+                "A batch without rows has nothing to send again"
+            );
+        });
+    }
+
+    #[test]
+    fn given_empty_poll_when_start_offsets_are_saved_should_carry_no_state() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 42)], 42);
+
+            let state = source
+                .stage_batch_state(HashMap::new(), 0, 0)
+                .await
+                .expect("An empty batch should stage");
+
+            assert!(state.is_none());
+        });
+    }
+
+    #[test]
+    fn given_empty_poll_when_start_offsets_are_unsaved_should_stage_them() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 42)], 0);
+            source.start_offsets_unsaved.store(true, Ordering::Release);
+
+            let state = source
+                .stage_batch_state(HashMap::new(), 0, 0)
+                .await
+                .expect("An empty batch should stage");
+
+            let persisted = state
+                .and_then(|(_, state)| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                .expect("Unsaved start offsets should ride the empty batch");
+            assert_eq!(persisted.bucket_offsets.get(&0), Some(&42));
+        });
+    }
+
+    #[test]
+    fn given_polled_records_should_stage_advanced_offsets_without_committing_them() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 42), (1, 7)], 42);
+
+            let state = source
+                .stage_batch_state(HashMap::from([(0, 45)]), 3, 0)
+                .await
+                .expect("A polled batch should stage");
+
+            let persisted = state
+                .and_then(|(_, state)| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                .expect("A batch with rows should carry state");
+            assert_eq!(persisted.bucket_offsets.get(&0), Some(&45));
+            assert_eq!(persisted.bucket_offsets.get(&1), Some(&7));
+            assert_eq!(persisted.messages_produced, 45);
+
+            let committed = source.state.lock().await;
+            assert_eq!(committed.bucket_offsets.get(&0), Some(&42));
+            assert_eq!(committed.messages_produced, 42);
+        });
+    }
+
+    #[test]
+    fn given_unsaved_start_offsets_should_stay_unsaved_until_a_batch_is_acked() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            source.start_offsets_unsaved.store(true, Ordering::Release);
+
+            *source.staged.lock().await = Some(staged_without_rows(state_with(&[(0, 42)], 0)));
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("NACK should be applied");
+            assert!(source.start_offsets_unsaved.load(Ordering::Acquire));
+
+            *source.staged.lock().await = Some(staged_without_rows(state_with(&[(0, 42)], 0)));
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+            assert!(!source.start_offsets_unsaved.load(Ordering::Acquire));
+        });
+    }
+
+    /// The runtime can reject every row of a batch, for example under a `raw` stream schema,
+    /// so rows sent with unsaved start offsets could keep them off disk until the source stops.
+    #[test]
+    fn given_unsaved_start_offsets_when_rows_are_read_should_send_the_offsets_alone_first() {
+        let (source, _) = source_with_id_column(false);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 10)], 0);
+            source.start_offsets_unsaved.store(true, Ordering::Release);
+            *source.replay.lock().await = Some(scan_records(0, 10, &[1, 2, 3]));
+
+            for result in [SourceBatchResult::Nack, SourceBatchResult::Ack] {
+                let batch = source
+                    .poll()
+                    .await
+                    .expect("The start offsets should be polled");
+                assert!(batch.messages.is_empty());
+                let staged = batch
+                    .state
+                    .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                    .expect("The start offsets should be staged");
+                assert_eq!(staged.bucket_offsets.get(&0), Some(&10));
+                source
+                    .on_batch_result(result)
+                    .await
+                    .expect("The batch result should be applied");
+            }
+            assert!(!source.start_offsets_unsaved.load(Ordering::Acquire));
+
+            let rows = source.poll().await.expect("The held rows should be polled");
+            assert_eq!(rows.messages.len(), 3);
+        });
+    }
+
+    #[test]
+    fn given_skipped_rows_sent_again_after_a_nack_should_count_them_once() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let (state, _) = source
+                .stage_batch_state(HashMap::from([(0, 3)]), 1, 2)
+                .await
+                .expect("A batch with skipped rows should stage")
+                .expect("A batch with rows should carry state");
+            *source.staged.lock().await = Some(staged_without_rows(state));
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("NACK should be applied");
+            assert_eq!(source.state.lock().await.rows_skipped, 0);
+
+            let (state, _) = source
+                .stage_batch_state(HashMap::from([(0, 3)]), 1, 2)
+                .await
+                .expect("The rejected batch should stage again")
+                .expect("A batch with rows should carry state");
+            *source.staged.lock().await = Some(staged_without_rows(state));
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+            assert_eq!(source.state.lock().await.rows_skipped, 2);
+        });
+    }
+
+    /// Rewinding the scanner after a NACK could let a fetch requested before the rewind skip
+    /// the rejected rows, so the source keeps them and builds the same batch again.
+    #[test]
+    fn given_nack_when_batch_has_rows_should_send_the_same_rows_again() {
+        let (source, _) = source_with_id_column(true);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 10)], 10);
+
+            let (rejected, _) = source
+                .build_batch(scan_records(0, 10, &[1, 2, 3]))
+                .await
+                .expect("The batch should build");
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("NACK should be applied");
+            assert_eq!(source.state.lock().await.bucket_offsets.get(&0), Some(&10));
+
+            let replayed = source
+                .poll()
+                .await
+                .expect("The rejected rows should be polled again");
+            let summary = |messages: &[ProducedMessage]| {
+                messages
+                    .iter()
+                    .map(|message| (message.id, message.payload.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(summary(&replayed.messages), summary(&rejected));
+            assert!(replayed.state.is_some());
+
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+            let committed = source.state.lock().await;
+            assert_eq!(committed.bucket_offsets.get(&0), Some(&13));
+            assert_eq!(committed.messages_produced, 13);
+        });
+    }
+
+    #[test]
+    fn given_failed_poll_when_poll_interval_is_zero_should_pause_before_the_next() {
+        let mut config = test_config();
+        config.poll_interval = Some("0s".to_owned());
+        let source = FlussSource::new(1, config, None);
+        assert_eq!(source.pause_before_poll(), Duration::ZERO);
+
+        source.rewind_required.store(true, Ordering::Release);
+
+        assert_eq!(source.pause_before_poll(), MIN_PAUSE_AFTER_FAILED_POLL);
+    }
+
+    #[test]
+    fn given_full_batch_should_read_again_without_pausing() {
+        let source = FlussSource::new(1, test_config(), None);
+        source.full_batch_read.store(true, Ordering::Release);
+
+        assert_eq!(source.pause_before_poll(), Duration::ZERO);
+
+        source.rewind_required.store(true, Ordering::Release);
+        assert_eq!(source.pause_before_poll(), MIN_PAUSE_AFTER_FAILED_POLL);
+    }
+
+    #[test]
+    fn given_no_batch_size_should_count_a_full_batch_at_the_client_default() {
+        let mut config = test_config();
+        config.batch_size = None;
+        let source = FlussSource::new(1, config, None);
+
+        assert_eq!(
+            source.max_poll_records,
+            Config::default().scanner_log_max_poll_records
+        );
+        assert_eq!(
+            source.client_config().scanner_log_max_poll_records,
+            source.max_poll_records
+        );
+    }
+
+    #[test]
+    fn given_lost_connection_when_poll_interval_is_zero_should_pause_before_connecting_again() {
+        let mut config = test_config();
+        config.poll_interval = Some("0s".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        source.connection_lost.store(true, Ordering::Release);
+
+        assert_eq!(source.pause_before_poll(), MIN_PAUSE_AFTER_FAILED_POLL);
+    }
+
+    #[test]
+    fn given_failed_poll_when_poll_interval_is_longer_should_keep_it() {
+        let mut config = test_config();
+        config.poll_interval = Some("5s".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        source.rewind_required.store(true, Ordering::Release);
+
+        assert_eq!(source.pause_before_poll(), Duration::from_secs(5));
+    }
+
+    fn field(name: &str) -> DataField {
+        DataField::new(name, DataTypes::int(), None)
+    }
+
+    fn source_with_id_column(include_metadata: bool) -> (FlussSource, GenericRow<'static>) {
+        let mut config = test_config();
+        config.include_metadata = Some(include_metadata);
+        let mut source = FlussSource::new(1, config, None);
+        source.columns = vec![mapping::Column::new(0, field("id"))];
+        let mut row = GenericRow::new(1);
+        row.set_field(0, 7i32);
+        (source, row)
+    }
+
+    #[test]
+    fn given_empty_connection_setting_should_be_rejected() {
+        let mut blank_servers = test_config();
+        blank_servers.bootstrap_servers.clear();
+        let mut blank_database = test_config();
+        blank_database.database = "  ".to_owned();
+        let mut blank_table = test_config();
+        blank_table.table.clear();
+
+        for (setting, config) in [
+            ("bootstrap_servers", blank_servers),
+            ("database", blank_database),
+            ("table", blank_table),
+        ] {
+            let source = FlussSource::new(1, config, None);
+
+            let error = source
+                .validate_config()
+                .expect_err("An empty connection setting should be rejected");
+
+            assert!(
+                matches!(&error, Error::InitError(message) if message.contains(setting)),
+                "{setting}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_empty_columns_should_be_rejected() {
+        let mut config = test_config();
+        config.columns = Some(Vec::new());
+        let source = FlussSource::new(1, config, None);
+
+        let error = source
+            .validate_config()
+            .expect_err("An empty projection should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("columns")));
+    }
+
+    #[test]
+    fn given_repeated_column_should_be_rejected() {
+        let mut config = test_config();
+        config.columns = Some(vec!["id".to_owned(), "payload".to_owned(), "id".to_owned()]);
+        let source = FlussSource::new(1, config, None);
+
+        let error = source
+            .validate_config()
+            .expect_err("A repeated column should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("'id'")));
+    }
+
+    #[test]
+    fn given_zero_poll_interval_and_timeout_should_be_rejected() {
+        let mut config = test_config();
+        config.poll_interval = Some("0s".to_owned());
+        config.poll_timeout = Some("0s".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        let error = source
+            .validate_config()
+            .expect_err("A tight poll loop should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("poll_timeout")));
+    }
+
+    #[test]
+    fn given_zero_request_timeout_should_be_rejected() {
+        let mut config = test_config();
+        config.request_timeout = Some("0s".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        let error = source
+            .validate_config()
+            .expect_err("A limit that no request can meet should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("request_timeout")));
+    }
+
+    #[test]
+    fn given_request_timeout_should_use_it_in_place_of_the_default() {
+        let mut config = test_config();
+        config.request_timeout = Some("45s".to_owned());
+
+        let source = FlussSource::new(1, config, None);
+
+        assert_eq!(source.request_timeout, Duration::from_secs(45));
+    }
+
+    /// The server takes the connection and reads the request, and never writes back.
+    #[test]
+    fn given_server_that_never_answers_should_fail_to_open_after_the_request_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to listen");
+        let port = listener
+            .local_addr()
+            .expect("Failed to read the listener's address")
+            .port();
+        thread::spawn(move || {
+            let mut connections = Vec::new();
+            while let Ok((connection, _)) = listener.accept() {
+                connections.push(connection);
+            }
+        });
+        let mut config = test_config();
+        config.bootstrap_servers = format!("127.0.0.1:{port}");
+        config.request_timeout = Some("300ms".to_owned());
+        let mut source = FlussSource::new(1, config, None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+
+        let opened = runtime.block_on(async { timeout(SILENT_SERVER_LIMIT, source.open()).await });
+
+        let Ok(Err(error)) = opened else {
+            panic!("open() should fail by itself, got {opened:?}");
+        };
+        assert!(
+            matches!(&error, Error::Connection(message) if message.contains("did not answer within 300ms")),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn opened_columns(fields: &[DataField]) -> Vec<mapping::Column> {
+        fields
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(position, field)| mapping::Column::new(position, field))
+            .collect()
+    }
+
+    #[test]
+    fn given_column_added_since_open_should_keep_the_opened_columns_usable() {
+        let table_path = TablePath::new("analytics", "events");
+        let opened = opened_columns(&[field("id"), field("amount")]);
+
+        for current in [
+            RowType::new(vec![field("id"), field("amount")]),
+            RowType::new(vec![field("id"), field("amount"), field("added")]),
+        ] {
+            ensure_same_columns(&opened, &current, &table_path)
+                .expect("The opened columns are still in place");
+        }
+    }
+
+    #[test]
+    fn given_opened_column_that_changed_should_refuse_the_new_scanner() {
+        let table_path = TablePath::new("analytics", "events");
+        let opened = opened_columns(&[field("id"), field("amount")]);
+
+        for (reason, current) in [
+            ("dropped", RowType::new(vec![field("id")])),
+            ("renamed", RowType::new(vec![field("id"), field("total")])),
+            (
+                "of another type",
+                RowType::new(vec![
+                    field("id"),
+                    DataField::new("amount", DataTypes::string(), None),
+                ]),
+            ),
+            (
+                "moved",
+                RowType::new(vec![field("added"), field("id"), field("amount")]),
+            ),
+        ] {
+            let error = ensure_same_columns(&opened, &current, &table_path)
+                .expect_err("A changed column should be refused");
+
+            assert!(
+                matches!(&error, Error::InitError(message) if message.contains("changed since the connector opened")),
+                "column {reason}: unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_zero_poll_interval_with_a_server_wait_should_be_accepted() {
+        let mut config = test_config();
+        config.poll_interval = Some("0s".to_owned());
+        let source = FlussSource::new(1, config, None);
+
+        assert!(source.validate_config().is_ok());
+    }
+
+    #[test]
+    fn given_saved_offset_for_a_bucket_the_table_no_longer_has_should_drop_it() {
+        let tracked = HashMap::from([(0, 42), (5, 9)]);
+
+        let offsets = FlussSource::resolve_start_offsets(2, EARLIEST_OFFSET, &tracked);
+
+        assert_eq!(offsets, HashMap::from([(0, 42), (1, EARLIEST_OFFSET)]));
+    }
+
+    #[test]
+    fn given_projected_columns_should_resolve_positions_in_the_requested_order() {
+        let row_type = RowType::new(vec![field("id"), field("payload"), field("amount")]);
+        let columns = vec!["amount".to_owned(), "id".to_owned()];
+
+        let indices = projection_indices(&row_type, &columns, &TablePath::new("db", "events"))
+            .expect("Known columns should resolve");
+
+        assert_eq!(indices, vec![2, 0]);
+    }
+
+    #[test]
+    fn given_unknown_projected_column_should_be_rejected() {
+        let row_type = RowType::new(vec![field("id")]);
+        let columns = vec!["missing".to_owned()];
+
+        let error = projection_indices(&row_type, &columns, &TablePath::new("db", "events"))
+            .expect_err("An unknown column should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("'missing'")));
+    }
+
+    #[test]
+    fn given_include_metadata_should_add_bucket_offset_and_timestamp() {
+        let (source, row) = source_with_id_column(true);
+
+        let message = source
+            .build_message(2, 41, 1_700_000_000_123, &row, INITIAL_PAYLOAD_CAPACITY)
+            .expect("The row should build");
+
+        let payload: Value =
+            serde_json::from_slice(&message.payload).expect("The payload should be JSON");
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "id": 7,
+                "_fluss_bucket": 2,
+                "_fluss_offset": 41,
+                "_fluss_timestamp": 1_700_000_000_123_i64,
+            })
+        );
+        assert_eq!(message.id, Some(message_id(2, 41)));
+        assert_eq!(message.origin_timestamp, Some(1_700_000_000_123_000_000));
+    }
+
+    #[test]
+    fn given_metadata_left_off_should_emit_only_the_columns() {
+        let (source, row) = source_with_id_column(false);
+
+        let message = source
+            .build_message(2, 41, 1_700_000_000_123, &row, INITIAL_PAYLOAD_CAPACITY)
+            .expect("The row should build");
+
+        let payload: Value =
+            serde_json::from_slice(&message.payload).expect("The payload should be JSON");
+        assert_eq!(payload, serde_json::json!({ "id": 7 }));
+    }
+
+    #[test]
+    fn given_column_under_the_metadata_prefix_should_be_rejected() {
+        let fields = [field("id"), field("_fluss_offset")];
+
+        let error = ensure_no_metadata_collision(&fields)
+            .expect_err("A column under the reserved prefix should be rejected");
+
+        assert!(matches!(error, Error::InitError(message) if message.contains("_fluss_offset")));
+    }
+
+    #[test]
+    fn given_columns_outside_the_metadata_prefix_should_be_accepted() {
+        let fields = [field("id"), field("fluss_offset")];
+
+        assert!(ensure_no_metadata_collision(&fields).is_ok());
+    }
+
+    #[test]
+    fn metadata_fields_should_sit_under_the_reserved_prefix() {
+        for name in [METADATA_BUCKET, METADATA_OFFSET, METADATA_TIMESTAMP] {
+            assert!(name.starts_with(METADATA_PREFIX), "{name}");
+        }
+    }
+
+    #[test]
+    fn given_polled_rows_that_were_all_skipped_should_still_stage_the_offsets_past_them() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 42)], 42);
+
+            let (candidate, persisted) = source
+                .stage_batch_state(HashMap::from([(0, 45)]), 0, 3)
+                .await
+                .expect("A batch of skipped rows should stage")
+                .expect("Offsets past skipped rows should be staged");
+
+            let persisted = persisted
+                .deserialize::<State>(CONNECTOR_NAME, 1)
+                .expect("The staged state should decode");
+            assert_eq!(persisted.bucket_offsets.get(&0), Some(&45));
+            assert_eq!(persisted.messages_produced, 42);
+            assert_eq!(candidate.rows_skipped, 3);
+        });
+    }
+
+    #[test]
+    fn given_poll_before_open_should_fail() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+
+        let Err(error) = runtime.block_on(source.poll()) else {
+            panic!("A source that was never opened should not poll");
+        };
+
+        assert!(
+            matches!(&error, Error::InitError(message) if message.contains("before it was opened")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn given_batch_result_when_nothing_is_staged_should_change_nothing() {
+        let source = FlussSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 42)], 42);
+            source.start_offsets_unsaved.store(true, Ordering::Release);
+
+            for result in [SourceBatchResult::Ack, SourceBatchResult::Nack] {
+                source
+                    .on_batch_result(result)
+                    .await
+                    .expect("The batch result should be applied");
+
+                let state = source.state.lock().await;
+                assert_eq!(state.bucket_offsets, HashMap::from([(0, 42)]));
+                assert_eq!(state.messages_produced, 42);
+                assert!(source.replay.lock().await.is_none());
+                assert!(source.start_offsets_unsaved.load(Ordering::Acquire));
+            }
+        });
+    }
+
+    #[test]
+    fn given_batch_rejected_several_times_should_send_the_same_rows_each_time() {
+        let (source, _) = source_with_id_column(true);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 10)], 10);
+            let summary = |messages: &[ProducedMessage]| {
+                messages
+                    .iter()
+                    .map(|message| (message.id, message.payload.clone()))
+                    .collect::<Vec<_>>()
+            };
+
+            let (rejected, _) = source
+                .build_batch(scan_records(0, 10, &[1, 2, 3]))
+                .await
+                .expect("The batch should build");
+            for _ in 0..3 {
+                source
+                    .on_batch_result(SourceBatchResult::Nack)
+                    .await
+                    .expect("NACK should be applied");
+                let replayed = source
+                    .poll()
+                    .await
+                    .expect("The rejected rows should be polled again");
+                assert_eq!(summary(&replayed.messages), summary(&rejected));
+                let committed = source.state.lock().await;
+                assert_eq!(committed.bucket_offsets.get(&0), Some(&10));
+                assert_eq!(committed.messages_produced, 10);
+            }
+
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+            let committed = source.state.lock().await;
+            assert_eq!(committed.bucket_offsets.get(&0), Some(&13));
+            assert_eq!(committed.messages_produced, 13);
+            assert!(source.replay.lock().await.is_none());
+        });
+    }
+
+    #[test]
+    fn given_rows_of_several_buckets_should_stage_the_next_offset_of_each() {
+        let (source, _) = source_with_id_column(true);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 10), (1, 20), (2, 30)], 0);
+
+            let (messages, persisted) = source
+                .build_batch(scan_records_in(&[
+                    (0, 10, vec![1, 2]),
+                    (2, 30, vec![3, 4, 5]),
+                ]))
+                .await
+                .expect("The batch should build");
+
+            let positions: HashSet<(i64, i64)> = messages
+                .iter()
+                .map(|message| {
+                    let payload: Value = serde_json::from_slice(&message.payload)
+                        .expect("The payload should be JSON");
+                    let bucket = payload[METADATA_BUCKET]
+                        .as_i64()
+                        .expect("The bucket should be a number");
+                    let offset = payload[METADATA_OFFSET]
+                        .as_i64()
+                        .expect("The offset should be a number");
+                    assert_eq!(message.id, Some(message_id(bucket as i32, offset)));
+                    (bucket, offset)
+                })
+                .collect();
+            assert_eq!(
+                positions,
+                HashSet::from([(0, 10), (0, 11), (2, 30), (2, 31), (2, 32)])
+            );
+            let persisted = persisted
+                .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                .expect("A batch with rows should carry state");
+            assert_eq!(
+                persisted.bucket_offsets,
+                HashMap::from([(0, 12), (1, 20), (2, 33)])
+            );
+            assert_eq!(persisted.messages_produced, 5);
+        });
+    }
+
+    #[test]
+    fn given_row_that_cannot_be_converted_between_good_rows_should_skip_only_that_row() {
+        let row_type = RowType::new(vec![
+            field("id"),
+            DataField::new("day", DataTypes::date(), None),
+        ]);
+        let mut source = FlussSource::new(1, test_config(), None);
+        source.columns = row_type
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(position, field)| mapping::Column::new(position, field.clone()))
+            .collect();
+        let rows: Vec<GenericRow> = [(0, 19_782), (1, i32::MAX), (2, 19_783)]
+            .into_iter()
+            .map(|(id, days)| {
+                let mut row = GenericRow::new(2);
+                row.set_field(0, id);
+                row.set_field(1, Date::new(days));
+                row
+            })
+            .collect();
+        let records = ScanRecords::new(HashMap::from([(
+            TableBucket::new(1, 0),
+            bucket_records(&row_type, 5, &rows),
+        )]));
+
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 5)], 5);
+
+            let (messages, persisted) = source
+                .build_batch(records)
+                .await
+                .expect("The batch should build");
+
+            let ids: Vec<Option<u128>> = messages.iter().map(|message| message.id).collect();
+            assert_eq!(
+                ids,
+                vec![Some(message_id(0, 5)), Some(message_id(0, 7))],
+                "The rows around the unconvertible one should be kept"
+            );
+            let persisted = persisted
+                .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                .expect("A batch with rows should carry state");
+            assert_eq!(persisted.bucket_offsets, HashMap::from([(0, 8)]));
+            assert_eq!(persisted.messages_produced, 7);
+
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+            assert_eq!(source.state.lock().await.rows_skipped, 1);
+        });
+    }
+
+    /// Each of these would otherwise start over from `starting_offset`.
+    #[test]
+    fn given_state_that_does_not_fit_the_layout_should_refuse_to_open() {
+        let mut complete = state_with(&[(0, 42)], 500);
+        complete.table = Some(events_table(3));
+        let complete = rmp_serde::to_vec(&complete).expect("Failed to serialize state");
+        let without_table = rmp_serde::to_vec(&(HashMap::from([(0i32, 42i64)]), 500u64))
+            .expect("Failed to serialize state");
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to build runtime");
+
+        for (case, bytes) in [
+            ("empty", Vec::new()),
+            ("cut short", complete[..complete.len() / 2].to_vec()),
+            ("without the table", without_table),
+        ] {
+            let mut source = FlussSource::new(1, test_config(), Some(ConnectorState(bytes)));
+
+            let error = runtime
+                .block_on(source.open())
+                .expect_err("A state that does not decode should keep the source from opening");
+
+            assert!(
+                matches!(&error, Error::InitError(message) if message.contains("cannot be decoded")),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_largest_bucket_and_offset_should_keep_both_in_the_message_id() {
+        let id = message_id(i32::MAX, i64::MAX);
+
+        assert_eq!(id >> 127, 1);
+        assert_eq!((id >> 64) as u32, i32::MAX as u32);
+        assert_eq!(id as u64, i64::MAX as u64);
+        assert_ne!(message_id(1, 0), message_id(0, i64::MAX));
+    }
+
+    #[test]
+    fn given_timestamp_too_large_for_nanoseconds_should_leave_the_origin_timestamp_unset() {
+        let largest = (u64::MAX / NANOS_PER_MILLI) as i64;
+
+        assert_eq!(
+            origin_timestamp_nanos(largest),
+            Some(largest as u64 * NANOS_PER_MILLI)
+        );
+        assert_eq!(origin_timestamp_nanos(largest + 1), None);
+        assert_eq!(origin_timestamp_nanos(i64::MAX), None);
+        assert_eq!(origin_timestamp_nanos(i64::MIN), None);
+    }
+
+    /// The shipped configurations are what users copy, so each has to pass the same checks as
+    /// a configuration the runtime hands over.
+    #[test]
+    fn given_shipped_configurations_should_deserialize_and_validate() {
+        for (name, raw) in [
+            ("config.toml", include_str!("../config.toml")),
+            (
+                "example_config/fluss_source.toml",
+                include_str!("../../../runtime/example_config/connectors/fluss_source.toml"),
+            ),
+        ] {
+            let document: toml::Value =
+                toml::from_str(raw).unwrap_or_else(|error| panic!("{name} must parse: {error}"));
+            let plugin_config = document
+                .get("plugin_config")
+                .unwrap_or_else(|| panic!("{name} must carry a plugin_config table"))
+                .clone();
+            let config: FlussSourceConfig = plugin_config
+                .try_into()
+                .unwrap_or_else(|error| panic!("{name} plugin_config must deserialize: {error}"));
+
+            FlussSource::new(1, config, None)
+                .validate_config()
+                .unwrap_or_else(|error| panic!("{name} must pass validation: {error}"));
+        }
+    }
+
+    fn connection_settings() -> Value {
+        serde_json::json!({
+            "bootstrap_servers": "localhost:9123",
+            "database": "analytics",
+            "table": "events",
+        })
+    }
+
+    #[test]
+    fn given_only_the_connection_settings_should_use_the_defaults() {
+        let config: FlussSourceConfig = serde_json::from_value(connection_settings())
+            .expect("The connection settings alone should deserialize");
+
+        let source = FlussSource::new(1, config, None);
+
+        assert_eq!(source.poll_interval, DEFAULT_POLL_INTERVAL);
+        assert_eq!(source.poll_timeout, DEFAULT_POLL_TIMEOUT);
+        assert_eq!(source.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(
+            source.max_poll_records,
+            Config::default().scanner_log_max_poll_records
+        );
+        assert!(!source.include_metadata);
+        assert!(!source.client_config().is_sasl_enabled());
+        assert!(matches!(
+            source.validate_config(),
+            Ok(StartingOffset::Earliest)
+        ));
+    }
+
+    #[test]
+    fn given_missing_connection_setting_should_fail_to_deserialize() {
+        for missing in ["bootstrap_servers", "database", "table"] {
+            let mut config = connection_settings();
+            config
+                .as_object_mut()
+                .expect("The settings should be an object")
+                .remove(missing);
+
+            assert!(
+                serde_json::from_value::<FlussSourceConfig>(config).is_err(),
+                "{missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_setting_of_the_wrong_type_should_fail_to_deserialize() {
+        for (setting, value) in [
+            ("starting_offset", serde_json::json!(1.5)),
+            ("starting_offset", serde_json::json!(true)),
+            ("starting_offset", serde_json::json!(u64::MAX)),
+            ("batch_size", serde_json::json!(-1)),
+            ("batch_size", serde_json::json!("many")),
+            ("batch_size", serde_json::json!(u64::MAX)),
+            ("columns", serde_json::json!("id")),
+            ("include_metadata", serde_json::json!("yes")),
+        ] {
+            let mut config = connection_settings();
+            config[setting] = value.clone();
+
+            assert!(
+                serde_json::from_value::<FlussSourceConfig>(config).is_err(),
+                "{setting} = {value}"
+            );
+        }
+    }
+}

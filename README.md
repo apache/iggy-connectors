@@ -209,6 +209,7 @@ A source produces messages to an Iggy stream and topic. Configure one `[[streams
 | Source                                                  | Origin                                                                                       |
 | ------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | [Elasticsearch](sources/elasticsearch_source/README.md) | documents of Elasticsearch indices, by polling with timestamp tracking                       |
+| [Apache Fluss](sources/fluss_source/README.md)          | Apache Fluss log tables, with per-bucket offsets and column projection                       |
 | [HTTP](sources/http_source/README.md)                   | `POST` bodies on the paths of an embedded webhook server, with bearer or HMAC authentication |
 | [InfluxDB](sources/influxdb_source/README.md)           | InfluxDB V2 (Flux) and V3 (SQL), by polling                                                  |
 | [MQTT](sources/mqtt_source/README.md)                   | the topics of an MQTT 3.1.1 or MQTT 5 broker, with QoS 0, 1 or 2                             |

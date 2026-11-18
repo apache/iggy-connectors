@@ -212,12 +212,23 @@ jobs:
             crates=$(grep -vx "$key" <<< "$crates" || true)
           done
 
+          # A component may declare flavors (e.g. fat and slim), each built from
+          # its own Dockerfile stage. One without flavors builds its default
+          # stage, with an empty suffix, so its tags stay unchanged.
           docker_components=$(jq -nc --argjson cfg "$COMPONENTS" --arg list "$docker" '
-            [$list | split("\n")[] | select(. != "") | {key: ., image: $cfg[.].image}] | {include: .}')
+            [$list | split("\n")[] | select(. != "")
+             | {key: ., image: $cfg[.].image,
+                flavors: ($cfg[.].flavors // [{name: "", suffix: "", stage: ""}])}]
+            | if any(.[]; (.flavors | map(.suffix // "") | unique | length) != (.flavors | length))
+              then error("publish.yml has duplicate flavor suffixes") else {include: .} end')
           docker_matrix=$(jq -nc --argjson cfg "$COMPONENTS" --arg list "$docker" '
             {"linux/amd64": "ubuntu-26.04", "linux/arm64": "ubuntu-26.04-arm"} as $runners
-            | [$list | split("\n")[] | select(. != "") as $key | $cfg[$key].platforms[]
-               | {key: $key, platform: ., arch: (split("/")[1]), runner: $runners[.]}]
+            | [$list | split("\n")[] | select(. != "") as $key
+               | ($cfg[$key].flavors // [{name: "", suffix: "", stage: ""}])[] as $flavor
+               | $cfg[$key].platforms[]
+               | {key: $key, platform: ., arch: (split("/")[1]), runner: $runners[.],
+                  flavor_name: $flavor.name, flavor_suffix: ($flavor.suffix // ""),
+                  flavor_stage: ($flavor.stage // ""), timeout_minutes: ($flavor.timeout_minutes // 60)}]
             | if any(.[]; .runner == null) then error("publish.yml names a platform without a runner") else {include: .} end')
 
           {
@@ -242,7 +253,7 @@ jobs:
 
   # Each platform builds on a native runner, without QEMU.
   publish-docker:
-    name: Docker ${{ matrix.key }} (${{ matrix.arch }})
+    name: Docker ${{ matrix.key }}${{ matrix.flavor_suffix }} (${{ matrix.arch }})
     needs: [validate, plan, publish-rust-crates]
     if: |
       !cancelled() &&
@@ -250,7 +261,7 @@ jobs:
       needs.plan.outputs.has_docker == 'true' &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.docker_matrix) }}
@@ -280,6 +291,9 @@ jobs:
         with:
           task: publish
           component: ${{ matrix.key }}
+          target: ${{ matrix.flavor_stage }}
+          flavor: ${{ matrix.flavor_name }}
+          flavor_suffix: ${{ matrix.flavor_suffix }}
           version: ${{ steps.ver.outputs.version }}
           platform: ${{ matrix.platform }}
           dry_run: ${{ inputs.dry_run }}
@@ -302,14 +316,16 @@ jobs:
         if: ${{ !inputs.dry_run }}
         uses: actions/upload-artifact@v7
         with:
-          name: docker-digest-${{ matrix.key }}-${{ matrix.arch }}
+          # flavor_suffix keeps each flavor's per-arch digests in a distinct
+          # artifact so the manifest job never merges flavors into one image.
+          name: docker-digest-${{ matrix.key }}${{ matrix.flavor_suffix }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   # Joins the platform images of each component into one multi-arch manifest.
   docker-manifests:
-    name: Docker manifests
+    name: Docker manifests ${{ matrix.key }}
     needs: [validate, plan, publish-docker]
     if: |
       !cancelled() &&
@@ -359,9 +375,9 @@ jobs:
       - name: Download digests
         uses: actions/download-artifact@v8
         with:
-          pattern: docker-digest-${{ matrix.key }}-*
+          pattern: docker-digest-${{ matrix.key }}*
           path: ${{ runner.temp }}/digests
-          merge-multiple: true
+          merge-multiple: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -372,52 +388,84 @@ jobs:
           username: ${{ env.DOCKERHUB_USER }}
           password: ${{ env.DOCKERHUB_TOKEN }}
 
-      - name: Create and push manifest
+      - name: Create and push manifests
         working-directory: ${{ runner.temp }}/digests
         env:
           IMAGE: ${{ matrix.image }}
           VERSION: ${{ steps.ver.outputs.version }}
           SHOULD_TAG: ${{ steps.ver.outputs.should_tag }}
           AUTO_PUBLISH: ${{ inputs.create_edge_docker_tag }}
+          MATRIX_KEY: ${{ matrix.key }}
+          FLAVORS_JSON: ${{ toJSON(matrix.flavors) }}
         run: |
           set -euo pipefail
-          sources=()
-          for digest in *; do
-            sources+=("${IMAGE}@sha256:${digest}")
-          done
-          echo "Creating manifests for $IMAGE from ${sources[*]}"
 
-          push() {
-            docker buildx imagetools create -t "${IMAGE}:$1" "${sources[@]}"
-            echo "Pushed manifest: ${IMAGE}:$1"
-          }
-
-          if [[ "$AUTO_PUBLISH" == true ]]; then
-            push edge
-            # The :version manifest ships only with a new git tag.
-            if [[ "$SHOULD_TAG" == true ]]; then
-              push "$VERSION"
-            fi
-          else
-            push "$VERSION"
-            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
-              push latest
-            fi
+          # Each flavor owns two per-arch digest artifacts, downloaded without
+          # merging so every one lands in its own directory. Assert that the
+          # directories match the configured flavors before pushing anything,
+          # so a missing digest or a pattern prefix collision cannot ship a
+          # partial release.
+          expected=$(jq -r --arg key "$MATRIX_KEY" \
+            '.[] | "docker-digest-\($key)\(.suffix // "")-amd64", "docker-digest-\($key)\(.suffix // "")-arm64"' \
+            <<<"$FLAVORS_JSON" | sort)
+          found=$(find . -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+          if [[ "$expected" != "$found" ]]; then
+            echo "::error::Digest directories do not match the configured flavors for ${MATRIX_KEY}"
+            echo "Expected:"
+            echo "$expected"
+            echo "Found:"
+            echo "$found"
+            exit 1
           fi
 
-      - name: Inspect manifest
+          while IFS= read -r SUFFIX; do
+            sources=()
+            for arch in amd64 arm64; do
+              for digest_file in "docker-digest-${MATRIX_KEY}${SUFFIX}-${arch}"/*; do
+                sources+=("${IMAGE}@sha256:$(basename "$digest_file")")
+              done
+            done
+            echo "Creating manifests for ${IMAGE} (flavor '${SUFFIX:-default}') from ${sources[*]}"
+
+            push() {
+              docker buildx imagetools create -t "${IMAGE}:$1${SUFFIX}" "${sources[@]}"
+              echo "Pushed manifest: ${IMAGE}:$1${SUFFIX}"
+            }
+
+            if [[ "$AUTO_PUBLISH" == true ]]; then
+              push edge
+              # The :version manifest ships only with a new git tag.
+              if [[ "$SHOULD_TAG" == true ]]; then
+                push "$VERSION"
+              fi
+            else
+              push "$VERSION"
+              if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+                push latest
+              fi
+            fi
+          done < <(jq -r '.[].suffix // ""' <<<"$FLAVORS_JSON")
+
+      - name: Inspect manifests
         env:
           IMAGE: ${{ matrix.image }}
           VERSION: ${{ steps.ver.outputs.version }}
           SHOULD_TAG: ${{ steps.ver.outputs.should_tag }}
           AUTO_PUBLISH: ${{ inputs.create_edge_docker_tag }}
+          FLAVORS_JSON: ${{ toJSON(matrix.flavors) }}
         run: |
-          if [[ "$AUTO_PUBLISH" == true && "$SHOULD_TAG" != true ]]; then
-            docker buildx imagetools inspect "${IMAGE}:edge"
-          else
-            docker buildx imagetools inspect "${IMAGE}:${VERSION}"
-          fi
+          set -euo pipefail
+          while IFS= read -r SUFFIX; do
+            if [[ "$AUTO_PUBLISH" == true && "$SHOULD_TAG" != true ]]; then
+              docker buildx imagetools inspect "${IMAGE}:edge${SUFFIX}"
+            else
+              docker buildx imagetools inspect "${IMAGE}:${VERSION}${SUFFIX}"
+            fi
+          done < <(jq -r '.[].suffix // ""' <<<"$FLAVORS_JSON")
 
+      # The git release tag does not depend on the flavor. It is created once
+      # per component, after every flavor's manifests are pushed, so a failed
+      # flavor push leaves no tag and the next run retries the release.
       - name: Tag Docker release (${{ matrix.key }})
         if: success() && inputs.skip_tag_creation == false && steps.ver.outputs.should_tag == 'true'
         uses: apache/iggy/.github/actions/utils/create-git-tag@fe822af6bef32a2630f70688756618d2b3d060e5

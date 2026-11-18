@@ -13,4 +13,5 @@
 /scripts/*.sh
 /scripts/ci/*
 !/scripts/ci/third-party-licenses.sh
+!/scripts/ci/connector-plugins.sh
 **/target

@@ -51,6 +51,15 @@ Did you install `prek`? It runs on every commit and covers all project languages
 [CONTRIBUTING.md](https://github.com/apache/iggy-connectors/blob/master/CONTRIBUTING.md) has the setup steps.
 -->
 
+## Docs
+
+- Updated `docs/` / no user-facing change
+
+<!--
+A user-facing change, for example a new connector, configuration key or runtime option, updates `docs/` in the same PR. The other docs pages live in apache/iggy.
+See https://github.com/apache/iggy-connectors/blob/master/CONTRIBUTING.md#docs
+-->
+
 ## AI Usage
 
 <!--

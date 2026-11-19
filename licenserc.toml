@@ -36,6 +36,7 @@ excludes = [
     "**/.dockerignore",
     "**/CODEOWNERS",
     "**/*.md",
+    "**/*.mdx",
     "**/*.hbs",
     "**/*.json",
     "**/*.pem",

@@ -115,6 +115,7 @@ iggy-connectors/
 ├── sinks/<name>/         one sink plugin, iggy_connector_<name>, with its tests/
 ├── sources/<name>/       one source plugin, iggy_connector_<name>, with its tests/
 ├── testing/              iggy_connector_testing: fixtures that several test targets share
+├── docs/                 Docs pages (MDX) of iggy.apache.org/docs/connectors
 ├── scripts/              CI checks, test server build, core pin bump
 ├── .config/              nextest.toml, rail.toml
 ├── .github/              workflows, actions, components.yml, publish.yml
@@ -156,6 +157,7 @@ pin, and `scripts/ci/check-core-pin.sh` fails otherwise.
 | `harness` module, server     | `core/integration/`, `core/server/` in apache/iggy   |
 | CI test scope                | `.config/rail.toml`, `.github/config/components.yml` |
 | Releases and publishing      | `.github/config/publish.yml`                         |
+| Docs pages                   | `docs/`                                              |
 
 ## Skills
 
@@ -266,6 +268,7 @@ Created by the runtime or tests. Gitignored. Safe to delete to reset:
 - Conventional commits with scope: `feat(sink): ...`. Subject <= 72 chars. Allowed types/scopes enforced by `.github/workflows/pr-title.yml`.
 - Body: why before what. No bullet lists of files changed.
 - If a change has co-authors, add a `Co-authored-by` trailer for each.
+- A user-facing change updates `docs/` in the same PR, for example a new connector, configuration key or runtime option. See the Docs section of CONTRIBUTING.md.
 - The runtime ships only as the image `apache/iggy-connect`, tagged `connectors-X.Y.Z`. The SDK goes to crates.io, tagged `connectors-sdk-X.Y.Z`. Sinks and sources are `publish = false`.
 - Post-merge publishes an `edge` SDK version that has no tag yet, and then tags it. A version without a suffix is a release and goes out only after the vote.
 - A release that ships with a core release has one vote for both. A connectors-only release has its own vote, with the core pin at the last core release.

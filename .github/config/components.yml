@@ -98,3 +98,12 @@ components:
       - "scripts/ci/runtime-image-smoke.sh"
     tasks:
       - "build-image"
+
+  # The docs pages, which apache/iggy-website builds into
+  # iggy.apache.org/docs/connectors
+  docs:
+    paths:
+      - "docs/**"
+      - ".github/workflows/_test_docs.yml"
+    tasks:
+      - "build"

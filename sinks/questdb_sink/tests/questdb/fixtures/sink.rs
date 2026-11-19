@@ -27,10 +27,12 @@ use uuid::Uuid;
 
 use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_ACK_LEVEL, ENV_SINK_BATCH_SIZE,
-    ENV_SINK_CONNECTION_STRING, ENV_SINK_FLUSH_TIMEOUT, ENV_SINK_INCLUDE_HEADERS,
-    ENV_SINK_INCLUDE_OFFSET_COLUMN, ENV_SINK_INCLUDE_PARTITION_COLUMN,
-    ENV_SINK_INCLUDE_STREAM_COLUMN, ENV_SINK_INCLUDE_TOPIC_COLUMN, ENV_SINK_INTEGER_COLUMNS,
-    ENV_SINK_LOG_REJECTED_PAYLOAD, ENV_SINK_NUMBERS_AS_DOUBLE, ENV_SINK_PATH,
+    ENV_SINK_CONNECTION_STRING, ENV_SINK_DELIVERY_GUARANTEE,
+    ENV_SINK_DELIVERY_RETRY_INITIAL_BACKOFF, ENV_SINK_DELIVERY_RETRY_MAX_BACKOFF,
+    ENV_SINK_FLUSH_TIMEOUT, ENV_SINK_INCLUDE_HEADERS, ENV_SINK_INCLUDE_OFFSET_COLUMN,
+    ENV_SINK_INCLUDE_PARTITION_COLUMN, ENV_SINK_INCLUDE_STREAM_COLUMN,
+    ENV_SINK_INCLUDE_TOPIC_COLUMN, ENV_SINK_INTEGER_COLUMNS, ENV_SINK_LOG_REJECTED_PAYLOAD,
+    ENV_SINK_MAX_FLUSH_BYTES, ENV_SINK_NUMBERS_AS_DOUBLE, ENV_SINK_PATH,
     ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
     ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_SYMBOL_COLUMNS, ENV_SINK_TABLE, ENV_SINK_TIMESTAMP_FIELD,
     ENV_SINK_TIMESTAMP_SOURCE, ENV_SINK_TIMESTAMP_UNIT, ENV_SINK_UUID_COLUMNS,
@@ -50,6 +52,10 @@ const TABLE_PREFIX: &str = "iggy_events_";
 /// so the sweep never races a test that is still running.
 const STALE_TABLE_MAX_AGE_MS: u128 = 30 * 60 * 1000;
 
+/// The frame cap of the oversized fixtures. A message must be wider than this
+/// to fail alone.
+pub const OVERSIZED_FRAME_CAP: u32 = 64 * 1024;
+
 /// Knobs the individual tests vary. Everything not set here falls back to the
 /// connector's own defaults, so a default fixture also exercises those.
 #[derive(Debug, Clone, Default)]
@@ -68,10 +74,14 @@ pub struct QuestDbSinkOptions {
     pub numbers_as_double: Option<bool>,
     pub log_rejected_payload: Option<bool>,
     pub batch_size: Option<u32>,
+    pub max_flush_bytes: Option<u32>,
     pub flush_timeout: Option<String>,
     pub ack_level: Option<String>,
     /// Appended to the connect string as `request_durable_ack=<value>`.
     pub request_durable_ack: Option<String>,
+    /// Appended to the connect string as `max_buf_size=<value>`, which caps
+    /// the size of one frame.
+    pub max_buf_size: Option<u32>,
     /// Schema the runtime decodes the stream with. `None` → "json".
     pub schema: Option<String>,
     /// Enable QWP store-and-forward against a temp directory owned by the
@@ -86,6 +96,9 @@ pub struct QuestDbSinkOptions {
     /// Run on a QuestDB server of its own instead of the shared one, for a
     /// test that pauses the server.
     pub dedicated_container: bool,
+    /// Run the connector with the runtime's at-least-once delivery, and a
+    /// short retry backoff so that a retried batch lands within the test.
+    pub at_least_once: bool,
     /// `RUST_LOG` for the connectors runtime, for a test that asserts a
     /// `debug` line. `None` keeps the runtime's `INFO` default.
     pub runtime_log_level: Option<String>,
@@ -410,6 +423,9 @@ impl TestFixture for QuestDbSinkFixture {
         if let Some(value) = &self.options.request_durable_ack {
             connection_string.push_str(&format!("request_durable_ack={value};"));
         }
+        if let Some(value) = self.options.max_buf_size {
+            connection_string.push_str(&format!("max_buf_size={value};"));
+        }
         envs.insert(ENV_SINK_CONNECTION_STRING.to_string(), connection_string);
         envs.insert(ENV_SINK_TABLE.to_string(), self.table());
         envs.insert(
@@ -483,6 +499,23 @@ impl TestFixture for QuestDbSinkFixture {
         }
         if let Some(value) = self.options.batch_size {
             envs.insert(ENV_SINK_BATCH_SIZE.to_string(), value.to_string());
+        }
+        if self.options.at_least_once {
+            envs.insert(
+                ENV_SINK_DELIVERY_GUARANTEE.to_string(),
+                "at_least_once".to_string(),
+            );
+            envs.insert(
+                ENV_SINK_DELIVERY_RETRY_INITIAL_BACKOFF.to_string(),
+                "200ms".to_string(),
+            );
+            envs.insert(
+                ENV_SINK_DELIVERY_RETRY_MAX_BACKOFF.to_string(),
+                "1s".to_string(),
+            );
+        }
+        if let Some(value) = self.options.max_flush_bytes {
+            envs.insert(ENV_SINK_MAX_FLUSH_BYTES.to_string(), value.to_string());
         }
         if let Some(value) = &self.options.flush_timeout {
             envs.insert(ENV_SINK_FLUSH_TIMEOUT.to_string(), value.clone());
@@ -592,6 +625,92 @@ delegate_fixture!(
         store_and_forward: true,
         flush_timeout: Some("5s".to_string()),
         dedicated_container: true,
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// At-least-once delivery on a QuestDB server of its own, without
+    /// `sf_dir`, into a table whose DEDUP keys absorb a retried batch. The
+    /// test pauses the server, so it cannot share one.
+    QuestDbSinkAtLeastOnceFixture,
+    QuestDbSinkOptions {
+        at_least_once: true,
+        flush_timeout: Some("2s".to_string()),
+        include_partition_column: Some(true),
+        include_offset_column: Some(true),
+        dedicated_container: true,
+        // The key set that the README names for at least once.
+        pre_create_ddl: Some(|table| {
+            format!(
+                "create table {table} (iggy_stream SYMBOL, iggy_topic SYMBOL, \
+                 iggy_partition_id LONG, iggy_offset LONG, seq DOUBLE, timestamp TIMESTAMP) \
+                 timestamp(timestamp) partition by DAY WAL \
+                 DEDUP UPSERT KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset)"
+            )
+        }),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// At-least-once delivery with a `UUID` column, so a malformed value is a
+    /// record that the sink rejects.
+    QuestDbSinkAtLeastOnceRejectionFixture,
+    QuestDbSinkOptions {
+        at_least_once: true,
+        uuid_columns: Some(vec!["trade_id".to_string()]),
+        include_offset_column: Some(true),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// A 64 KiB frame cap, so a message with a wider field cannot fit in any
+    /// frame. `max_flush_bytes` stays below the cap, as the default does
+    /// below the default cap, so smaller rows share a frame.
+    QuestDbSinkOversizedFixture,
+    QuestDbSinkOptions {
+        max_buf_size: Some(OVERSIZED_FRAME_CAP),
+        max_flush_bytes: Some(OVERSIZED_FRAME_CAP / 4),
+        include_offset_column: Some(true),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// The frame cap of [`QuestDbSinkOversizedFixture`], at least once.
+    QuestDbSinkAtLeastOnceOversizedFixture,
+    QuestDbSinkOptions {
+        at_least_once: true,
+        max_buf_size: Some(OVERSIZED_FRAME_CAP),
+        max_flush_bytes: Some(OVERSIZED_FRAME_CAP / 4),
+        include_offset_column: Some(true),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// The frame cap of [`QuestDbSinkOversizedFixture`] below a
+    /// `max_flush_bytes` of four caps, so the client refuses a window of
+    /// several rows before the byte bound fires.
+    QuestDbSinkSplitFixture,
+    QuestDbSinkOptions {
+        max_buf_size: Some(OVERSIZED_FRAME_CAP),
+        max_flush_bytes: Some(OVERSIZED_FRAME_CAP * 4),
+        include_offset_column: Some(true),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// [`QuestDbSinkSplitFixture`], at least once.
+    QuestDbSinkAtLeastOnceSplitFixture,
+    QuestDbSinkOptions {
+        at_least_once: true,
+        max_buf_size: Some(OVERSIZED_FRAME_CAP),
+        max_flush_bytes: Some(OVERSIZED_FRAME_CAP * 4),
+        include_offset_column: Some(true),
         ..Default::default()
     }
 );
@@ -721,7 +840,20 @@ delegate_fixture!(
         ack_level: Some("local_durable".to_string()),
         request_durable_ack: Some("local".to_string()),
         flush_timeout: Some("3s".to_string()),
-        // The confirmation of each acknowledged flush is a `debug` line.
+        // The confirmation of each acknowledged chunk is a `debug` line.
+        runtime_log_level: Some("debug".to_string()),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// A one-byte `max_flush_bytes`, so every row of a chunk is a window of its
+    /// own and the chunk's one `wait` has to cover all of them.
+    QuestDbSinkWindowedFixture,
+    QuestDbSinkOptions {
+        max_flush_bytes: Some(1),
+        flush_timeout: Some("3s".to_string()),
+        // The confirmation of each acknowledged chunk is a `debug` line.
         runtime_log_level: Some("debug".to_string()),
         ..Default::default()
     }

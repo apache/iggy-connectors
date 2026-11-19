@@ -47,8 +47,10 @@ default = []
 insecure-skip-verify = ["questdb-rs/insecure-skip-verify"]
 
 [dependencies]
+ahash = { workspace = true }
 async-trait = { workspace = true }
 humantime = { workspace = true }
+iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 questdb-rs = { workspace = true }
 rustls = { workspace = true }
@@ -64,7 +66,6 @@ bytes = { workspace = true }
 ctor = { workspace = true }
 dtor = { workspace = true }
 iggy = { workspace = true }
-iggy_common = { workspace = true }
 iggy_connector_testing = { workspace = true }
 integration = { workspace = true }
 reqwest = { workspace = true }

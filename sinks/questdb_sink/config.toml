@@ -27,7 +27,7 @@ verbose = false
 stream = "events"
 topics = ["questdb_events"]
 schema = "json"
-batch_length = 100
+batch_length = 1000
 consumer_group = "questdb_sink"
 
 [plugin_config]
@@ -73,10 +73,12 @@ include_headers = false
 # follow the connect string.
 # ack_level = "ok"
 
-# How long a flush waits for its ack without progress. "0s" means fire and
+# How long a chunk waits for its ack without progress. "0s" means fire and
 # forget with ack_level = "ok", and is not allowed with "durable" or
-# "local_durable". Shutdown can wait this long for a flush in progress.
+# "local_durable". Shutdown waits for a chunk in progress until this long
+# passes without progress.
 flush_timeout = "30s"
+# Maximum rows per chunk. Each chunk waits once for its ack.
 batch_size = 1000
 
 # Flush when the buffer reaches this many bytes, so wide rows stay under the

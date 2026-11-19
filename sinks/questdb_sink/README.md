@@ -69,10 +69,10 @@ verbose_logging = false
 | `include_partition_column` | `false` | Write the partition as a `LONG` column named `iggy_partition_id`. |
 | `include_offset_column` | `false` | Write the offset as a `LONG` column named `iggy_offset`. |
 | `include_headers` | `false` | Write each header as a `VARCHAR` column named `header_<name>`, so `content-type` is written to `header_content_type`. See [Headers](#headers). |
-| `ack_level` | from the connect string | `ok` waits for the server to accept a flush. `durable` waits for the Enterprise durable ack. `local_durable` waits until the server flushed the rows to its own disk. If you do not set it, the connect string decides: `request_durable_ack` set to `on`, `replicated` or `local,replicated` gives `durable`, `local` gives `local_durable`, and no `request_durable_ack` gives `ok`. |
-| `flush_timeout` | `30s` | How long a flush waits for its ack without progress. `0s` with `ack_level = "ok"` means fire and forget. `0s` is not allowed with `durable` or `local_durable`. |
-| `batch_size` | `1000` | Maximum rows per flush. |
-| `max_flush_bytes` | `1000000` | Flush when the buffer reaches this size, even before `batch_size` rows. |
+| `ack_level` | from the connect string | `ok` waits for the server to accept the rows of a chunk. `durable` waits for the Enterprise durable ack. `local_durable` waits until the server flushed the rows to its own disk. If you do not set it, the connect string decides: `request_durable_ack` set to `on`, `replicated` or `local,replicated` gives `durable`, `local` gives `local_durable`, and `off` or no `request_durable_ack` gives `ok`. |
+| `flush_timeout` | `30s` | How long a chunk waits for its ack without progress. See [Batch sizing](#batch-sizing). `0s` with `ack_level = "ok"` means fire and forget. `0s` is not allowed with `durable` or `local_durable`. |
+| `batch_size` | `1000` | Maximum rows per chunk. |
+| `max_flush_bytes` | `1000000` | Flush when the buffer reaches this size, even before `batch_size` rows. Keep it below the frame cap, see [Batch sizing](#batch-sizing). |
 | `numbers_as_double` | `true` | Write every JSON number as a `DOUBLE`. See [Numbers](#numbers). |
 | `log_rejected_payload` | `false` | Add a truncated payload to the log line of a rejected record. |
 | `verbose_logging` | `false` | Log per-batch details at `info` instead of `debug`. |
@@ -82,6 +82,9 @@ Field names in the column lists match without regard to case, as in QuestDB.
 Credentials, TLS, store-and-forward, reconnect and multi-host failover are set
 in the connect string. See the
 [connect string reference](https://questdb.com/docs/connect/clients/connect-string/).
+
+The delivery guarantee is set in the runtime's `[delivery]` table of the
+connector, not in `plugin_config`. See [Delivery semantics](#delivery-semantics).
 
 ### Batch sizing
 
@@ -94,10 +97,25 @@ is the smaller of `max_buf_size` (100 MiB by default) and the segment size
 defaults you raise the cap through `sf_max_segment_bytes`. The server's own
 maximum batch size still applies.
 
-The check runs before each row is added. A message larger than the frame cap
-minus `max_flush_bytes` can therefore push one frame over the cap. That flush
-fails, and the connector does not write the rows buffered with the message or
-the rest of its chunk. It logs their offsets.
+The sink splits each batch into chunks of up to `batch_size` rows. It
+publishes each flush of a chunk without a wait, and then waits once for the
+acknowledgement of all of them, so a chunk of wide rows costs one server round
+trip.
+
+The check runs after each row is added. A row that takes the buffer to
+`max_flush_bytes` is taken out again, the rows in front of it are published,
+and the row starts the next frame. So a message larger than the frame cap is
+alone in its frame, and only that flush fails. The sink then rejects the
+message as a [rejected record](#rejected-records). At most once, it loses
+the message, logs its offset, and goes on with the rest of the chunk. At least
+once, it first waits for the acknowledgement of the rows in front of the
+message, and then fails the call at the message with a permanent error.
+
+If the frame cap is below `max_flush_bytes`, the client refuses a frame of
+several rows before the check fires. The sink then builds the rows of that frame
+again in two halves, and halves again until each frame fits or holds one row.
+Every refused frame costs one more build of its rows, so keep `max_flush_bytes`
+below the frame cap.
 
 ## Store-and-forward
 
@@ -109,10 +127,13 @@ restart.
 connection_string = "ws::addr=localhost:9000;sf_dir=/var/lib/iggy/questdb-sf;sender_id=iggy;"
 ```
 
-Use it in production. This sink does not support the runtime's
-`[delivery] guarantee = "at_least_once"`, so the runtime commits the offset of
-each poll before `consume()` runs and does not replay a failed batch. The
-queue of the client is the only copy of rows that `consume()` reported.
+Use it in production with the runtime's default at-most-once delivery. The
+runtime then commits the offset of each poll before `consume()` runs and does
+not replay a failed batch, so the queue of the client is the only copy of rows
+that `consume()` reported. With `guarantee = "at_least_once"`, `consume()`
+reports success only after QuestDB acknowledged the rows, and the runtime
+delivers a failed batch again, so `sf_dir` only spares a replay. See
+[Delivery semantics](#delivery-semantics).
 
 `sf_dir` keeps frames across a process crash or restart, but not across a host
 failure. By default the client does not fsync the frames, so a power loss or a
@@ -139,15 +160,36 @@ mismatch is the usual cause, for example a producer that sends text in a field
 that the table stores as a number. The client cannot catch it before it sends
 the frame, because it does not know the table schema.
 
-Without `sf_dir`, the rejection fails the batch that holds the frame, and the
-later batches are written.
+Without `sf_dir`, the rejection fails the batch that holds the frame. At most
+once, the later batches are written. At least once, the error is permanent, so
+the runtime stops the delivery of the topic at that batch. Fix the cause, for example the
+column type in the table, and restart the connector: the runtime then delivers
+the batch again.
+
+A chunk whose acknowledgement timed out returns its connection to the pool with
+its frames still queued, and QuestDB can reject one of those frames later:
+
+- If the rejection arrives while the connection is idle, the pool retires the
+  connection at the next borrow. The rejection then fails the next batch, of
+  any topic on this connector, that has no error of its own. At least once,
+  that failure is transient.
+- If it arrives while another chunk holds the connection, perhaps of another
+  topic, it fails that chunk. At least once, the sink sees that the rejection
+  starts at a frame that is not its own and reports a transient error, so the
+  runtime delivers that batch again on a fresh connection. This also holds
+  when QuestDB rejects the same frame too many times and the client closes the
+  connection, because that rejection names every unacknowledged frame, the
+  chunk's own frames included.
 
 With `sf_dir`, the client keeps the rejected frame in its slot directory and
 sends it first after every reconnect and every restart. QuestDB rejects it
 again, so every later batch of the connector fails behind it. The QuestDB
 clients do this by design: a schema problem stops ingestion instead of dropping
 rows silently. The sink logs each blocked batch with its offsets, in a line
-that starts with `QuestDB did not confirm writing`. To recover:
+that starts with `QuestDB did not confirm writing`. At least once, the frame
+belongs to an earlier batch, so each blocked batch fails with a transient
+error, and the runtime retries it until you delete the slot or
+`retry_max_attempts` in `[delivery]` runs out. To recover:
 
 1. Stop the connectors runtime.
 2. Fix the cause, for example the producer or the column type in the table.
@@ -160,7 +202,9 @@ that starts with `QuestDB did not confirm writing`. To recover:
    to the lowest offset in the sink's `QuestDB did not confirm writing` and
    `acknowledgement has not arrived yet` lines since the rejection. With fire
    and forget, those offsets are logged only at `debug`, so rewind to a point
-   before the rejection.
+   before the rejection. The logged range can start up to one chunk early, at
+   rows that QuestDB acknowledged just before the failure. Without DEDUP, the
+   table then holds those rows twice.
 5. Start the connectors runtime.
 
 If you fixed the cause, the rejected record is written again with the rest. If
@@ -173,7 +217,8 @@ and the value, not the offset, so finding it can take a search of the topic.
 The connector borrows a pooled connection for each chunk it writes, and the
 runtime writes each topic in its own task. `sender_pool_max` caps the pool and
 defaults to 4. When the pool is full, a borrow waits `acquire_timeout_ms`
-(5 s by default) and then fails, and the rest of that batch is lost. Set
+(5 s by default) and then fails. At most once, the rest of that batch is lost.
+At least once, the runtime delivers the batch again after a backoff. Set
 `sender_pool_max` to at least the number of topics the connector consumes:
 
 ```toml
@@ -198,17 +243,17 @@ connection_string = "ws::addr=localhost:9000;sender_pool_max=16;"
   sink then waits for the durable ack, unless you set `ack_level = "ok"`, which
   logs a warning at start. The connector does not start with
   `ack_level = "durable"` alone, because the client would refuse every wait.
-  The server also needs replication configured. Without it no flush is ever
+  The server also needs replication configured. Without it no chunk is ever
   acknowledged.
 
 ### Choosing an ack level
 
-`ok` returns when the server accepts a flush. `durable` also waits until the
+`ok` returns when the server accepts a chunk. `durable` also waits until the
 write-ahead log is shipped. With `ok`, a primary that fails before shipping can
 lose rows it already acknowledged. Use `durable` when losing that tail matters.
 
-`durable` adds one wait for log shipping to every flush, whatever the batch
-size, so throughput grows with rows per batch.
+`durable` adds one wait for log shipping to every chunk, whatever its size,
+so throughput grows with `batch_size`.
 
 `local_durable` waits until the server flushed the rows to its own disk, so
 they survive a power loss on the QuestDB host but not the loss of its disk. It
@@ -234,12 +279,13 @@ to flush every commit before QuestDB acknowledges it. QuestDB 10.0 and 10.1 and
 QuestDB Enterprise 4.0 and 4.1 do not have this mode. See the
 [durability documentation](https://questdb.com/docs/concepts/durability/).
 
-The commit mode is a server setting. To make each flush of the sink wait until
+The commit mode is a server setting. To make each chunk of the sink wait until
 the server flushed its rows to disk, add `request_durable_ack=local` to the
 connect string. `ack_level` then defaults to `local_durable`. A row whose
-flush QuestDB acknowledged then survives a power loss, also within the group
-window. A flush whose acknowledgement does not arrive within `flush_timeout`
-is logged and stays queued, and `consume()` still reports success. See
+chunk QuestDB acknowledged then survives a power loss, also within the group
+window. At most once, a chunk whose acknowledgement does not arrive within
+`flush_timeout` is logged and stays queued, and `consume()` still reports
+success. At least once, the call fails, and the runtime retries the batch. See
 [Delivery semantics](#delivery-semantics). A server without the `adaptive` mode
 refuses the connection with
 `server did not enable durable ACK [requested=local, ...]`, and the connector
@@ -296,8 +342,8 @@ of value with the column name.
 With `numbers_as_double = false`, each value takes its type from its JSON shape:
 integers become `LONG` and fractions `DOUBLE`. Two problems follow:
 
-- The client fixes a column's type from the first row of each flush. Later rows
-  in that flush with the other number shape are rejected.
+- The client fixes a column's type from the first row of each chunk. Later rows
+  in that chunk with the other number shape are rejected.
 - If the first rows of an auto-created column are all whole numbers, QuestDB
   creates it as `LONG` for good.
 
@@ -366,10 +412,68 @@ each value came from.
 
 Two boundaries decide delivery.
 
-Between Iggy and the sink, delivery is at most once. The sink does not support
-the runtime's `[delivery] guarantee = "at_least_once"`, and a connector that
-sets it fails to start. The runtime commits the offset of each poll before
-`consume()` runs and does not replay a batch.
+Between Iggy and the sink, the runtime's `[delivery]` table decides. The
+default is at most once: the runtime commits the offset of each poll before
+`consume()` runs and does not replay a batch. For at least once, set:
+
+```toml
+[delivery]
+guarantee = "at_least_once"
+```
+
+The runtime then stores an offset only after `consume()` succeeds, and it
+delivers a failed batch again after a backoff. The sink reports success only
+when QuestDB acknowledged every chunk of the batch at `ack_level`:
+
+- A chunk whose acknowledgement does not arrive within `flush_timeout` fails
+  the call with a transient error, and the runtime retries the batch. The
+  frames of the failed attempt stay queued, and QuestDB still writes them when
+  it catches up. So each retry during an acknowledgement stall queues one more
+  copy of the batch. `retry_max_attempts` in `[delivery]` has no limit by
+  default. Set it to bound the copies: when it runs out, the runtime stops the
+  delivery of the topic, and a restart delivers the batch again. Declare the
+  DEDUP keys below to keep one copy of each row.
+- A failed chunk ends the batch, because the runtime delivers all of it again.
+- A record that the sink rejects fails the call with a permanent error. The
+  runtime stops the delivery of the whole topic at the record instead of
+  skipping it. It first stores the offsets that the other partitions of the
+  topic proved, and the other topics of the connector keep delivering. See
+  [Rejected records](#rejected-records) for the recovery.
+- Fire and forget, `flush_timeout = "0s"`, never waits for an acknowledgement,
+  so a connector that sets it does not start with at least once.
+
+A retried batch writes the chunks that QuestDB already took a second time. To
+keep one copy, write the message identity and declare it as the DEDUP keys:
+
+1. Set `include_partition_column = true` and `include_offset_column = true`.
+2. Create the table with
+   `DEDUP UPSERT KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset)`,
+   with the name of your designated timestamp in place of `timestamp`.
+
+The offset alone is not enough. Iggy gives every message of one producer batch
+the same timestamp, so keys on the timestamp and the default columns merge
+distinct messages into one row, without an error.
+
+```sql
+CREATE TABLE iggy_events (
+  iggy_stream SYMBOL, iggy_topic SYMBOL, iggy_partition_id LONG,
+  iggy_offset LONG, timestamp TIMESTAMP
+) TIMESTAMP(timestamp) PARTITION BY DAY WAL
+DEDUP UPSERT KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset);
+```
+
+DEDUP keys must include the designated timestamp, so a retried row is a
+duplicate only if it gets the same timestamp again. With
+`timestamp_source = "server"`, QuestDB stamps each copy on arrival, and the
+connector logs a warning at start. The same holds with `origin` for a message
+without an origin timestamp, because the connector then uses its own clock.
+Use `message` or `payload` for a table that must not have duplicates.
+
+Each batch waits for its own acknowledgement. `flush_interval` and
+`flush_max_messages` in `[delivery]` delay only when the runtime stores the
+offsets, so they do not spread that wait over more messages. Raise
+`batch_length` of the stream and `batch_size` in `[plugin_config]` to amortize
+it.
 
 Between the sink and QuestDB, delivery is at least once. A reconnect, a failover
 or a replay of queued frames can send the same rows again. Declare
@@ -377,23 +481,27 @@ or a replay of queued frames can send the same rows again. Declare
 tables that must not have duplicates.
 
 The client queues unacknowledged frames in memory, or on disk when `sf_dir` is
-set. Rows can be lost in these cases:
+set. Rows can be lost in the cases below. The cases marked "at most once" do
+not apply with at least once, because `consume()` then succeeds only after
+QuestDB acknowledged the rows, and the runtime delivers a failed batch again.
 
 - With `ack_level = "ok"` or `"local_durable"` on a cluster, a primary that
   fails before it ships its write-ahead log can lose rows it accepted. See
   [Choosing an ack level](#choosing-an-ack-level).
-- Without `sf_dir`, a crash, or a shutdown that outlasts
+- At most once: without `sf_dir`, a crash, or a shutdown that outlasts
   `close_flush_timeout_millis` in the connect string, loses the queue even
   though `consume()` already reported success.
-- With `sf_dir`, a host failure loses the frames that the client did not fsync.
-  See [Store-and-forward](#store-and-forward).
-- A crash of the runtime after a poll and before the sink flushes loses that
-  batch, also with `sf_dir`, because the runtime already committed its offset.
-- A flush that is not acknowledged yet, or any flush with fire and forget,
+- At most once: with `sf_dir`, a host failure loses the frames that the client
+  did not fsync. See [Store-and-forward](#store-and-forward).
+- At most once: a crash of the runtime after a poll and before the sink
+  flushes loses that batch, also with `sf_dir`, because the runtime already
+  committed its offset.
+- At most once: a chunk that is not acknowledged yet, or any chunk with fire
+  and forget,
   stays queued while `consume()` reports success. If the connection later
   fails for good, for example on a terminal rejection of an earlier frame or an
   authentication error, the client drops the frames queued in memory. The sink
-  logs the offsets of each unacknowledged flush, at `warn` for a pending ack
+  logs the offsets of each unacknowledged chunk, at `warn` for a pending ack
   and at `debug` for fire and forget, so that you can rewind to them.
 - With `ack_level = "ok"`, an OS crash or a power loss on the QuestDB host can
   lose acknowledged rows. See [Server durability](#server-durability).
@@ -401,44 +509,80 @@ set. Rows can be lost in these cases:
   batch fail until you delete its slot directory. The sink logs the offsets of
   each of those batches. See
   [Frames that QuestDB rejects](#frames-that-questdb-rejects).
-- Rows the sink does not write, such as a rejected record or a failed chunk,
-  are lost, as the rest of this section describes.
+- At most once: rows the sink does not write, such as a rejected record or a
+  failed chunk, are lost, as the rest of this section describes.
 
 A batch fails when:
 
 - QuestDB rejects a frame terminally. The client reports some rejections after
   the flush that caused them returned, without saying which topic sent the
   frame. Such a rejection fails the next batch, of any topic on this connector,
-  that has no error of its own.
+  that has no error of its own. The client can also report a terminal
+  rejection of a frame that QuestDB already acknowledged, without ending the
+  connection. That report fails one later batch, although no rows were lost.
+  At least once, these failures are transient, so the runtime retries the
+  batch instead of stopping.
 - A chunk fails to write. If the cause is the connection, the connector skips
   the remaining chunks of the batch. It logs the offsets and message ids of the
   messages it did not write.
-- 10 batches in a row on one topic each leave a flush unacknowledged within
+- 10 batches in a row on one topic each leave a chunk unacknowledged within
   `flush_timeout`. A single late ack is only a warning, because the frames stay
   queued and are delivered later.
 - The client's inbox of rejection reports overflows and drops events. A terminal
   rejection may then be unreported, so the next batch fails although its own
   rows were written.
 
-The runtime counts a failed batch in `iggy_connector_errors_total`. It does not
-retry it.
+The runtime counts a failed batch in `iggy_connector_errors_total`. At most
+once, it does not retry it. At least once, it retries a transient failure after
+a backoff and stops the delivery at a permanent one.
 
-`flush_timeout` also bounds shutdown. The runtime does not interrupt a flush in
-progress. A batch in flight can wait up to `flush_timeout` for each of its
-remaining flushes, so shutdown can take several times `flush_timeout`.
+At most once, the first chunk of a batch whose acknowledgement does not arrive
+within `flush_timeout` ends the waits of that batch: its later chunks are
+published without a wait and logged as unacknowledged. Otherwise a stalled
+server would hold the batch for `flush_timeout` once per chunk.
+
+`flush_timeout` also bounds shutdown. The runtime does not interrupt a chunk in
+progress. A batch in flight waits for each of its remaining chunks until
+`flush_timeout` passes without progress, so shutdown can take several times
+`flush_timeout`, and longer while acknowledgements still arrive.
 
 ### Rejected records
 
-A rejected record is lost, and its log line is the only record of it. The
-runtime has already committed its offset, and there is no dead-letter queue.
+At most once, a rejected record is lost, and its log line is the only record
+of it. The runtime has already committed its offset, and there is no
+dead-letter queue. At least once, the record fails the call with a permanent
+error, and the runtime stops the delivery of its topic there, so the record
+and the records behind it stay in Iggy. The cases below then stop the
+batch instead of letting the rest of it be written. `invalid_messages` in
+`[delivery]` covers only the runtime's own decode and transform errors, so
+`invalid_messages = "skip"` does not skip a record that the sink rejects.
+
+At least once, a restart alone does not get past a rejected record. The
+runtime stored no offset for its batch, so it delivers the same record again,
+and the record is rejected again. Before the call fails, the sink writes and
+confirms every row in front of the record, so you can skip the record alone.
+To recover:
+
+1. Stop the connectors runtime.
+2. Read the offset of the record in the `rejected message` log line.
+3. If a change to the configuration or the table makes the record valid, make
+   that change. Otherwise, set the stored offset of the partition to the offset
+   of the record, as
+   [Recovery after a host failure](#recovery-after-a-host-failure) describes.
+   Iggy resumes after the stored offset, so this skips the record alone.
+4. Start the connectors runtime.
+
+The sink has no option to skip rejected records by itself at least once. A skip
+loses the record, so it stays a decision that you make by offset.
 
 Each rejection is logged with its stream, topic, partition, offset and message
 id. The first 20 per batch are logged at `error` and the rest at `debug`.
 
-Rejections are not counted in the runtime metrics. A batch that writes some
-rows and rejects others counts as a success, so `iggy_connector_errors_total`
-stays at zero. The plugin cannot report per-row counts through the current SDK.
-Alert on the connector's logs instead.
+At most once, rejections are not counted in the runtime metrics. A batch that
+writes some rows and rejects others counts as a success, so
+`iggy_connector_errors_total` stays at zero. The plugin cannot report per-row
+counts through the current SDK. Alert on the connector's logs instead. At least
+once, the first rejection fails the batch, and the runtime counts it.
 
 A record is rejected when:
 
@@ -446,9 +590,18 @@ A record is rejected when:
   UTF-8, a malformed UUID, a bad array, a value of the wrong type in a listed
   column, a symbol value longer than 1 MiB, a missing or out-of-range
   timestamp field, an invalid or duplicate
-  column name, or a row with no columns. The rest of the batch is written.
+  column name, or a row with no columns. At most once, the rest of the batch
+  is written.
 - **The client rejects it while writing**, usually because a column already has
-  another type in this flush. The rest of the batch is written.
+  another type in this chunk. At most once, the rest of the batch is written.
+  At least once, the call fails with a permanent error at the record. After a
+  restart, the runtime delivers the batch again from its first message, so the
+  same conflict usually returns. Keep `numbers_as_double = true`, the default, or
+  list the column in `integer_columns`, so that every value of a numeric column
+  has one type.
+- **The message alone is larger than a frame.** The client refuses the frame
+  that holds only this message, see [Batch sizing](#batch-sizing). At most
+  once, the rest of the batch is written.
 - **The server rejects the frame.** QuestDB rejects whole frames, so the
   connector fails the batch and cannot name the record.
 
@@ -465,7 +618,7 @@ set.
 The highest `iggy_offset` in the table is not a safe place to start. The sink
 writes the chunks of a topic through several pooled connections, so rows below
 that offset can be missing. Start from an offset before the failure, with a
-margin, and let `DEDUP UPSERT KEYS` drop the rows that are written twice.
+margin, and let the DEDUP keys drop the rows that are written twice.
 
 1. Stop the connectors runtime.
 2. For each partition, find the first offset to write again, before the failure.
@@ -482,8 +635,9 @@ margin, and let `DEDUP UPSERT KEYS` drop the rows that are written twice.
 
 4. Start the connectors runtime.
 
-The sink writes some rows a second time. Declare `DEDUP UPSERT KEYS` on the
-table to keep one copy of each row. This does not work with
+The sink writes some rows a second time. To keep one copy of each row, write
+the partition and offset columns and declare the DEDUP keys that
+[Delivery semantics](#delivery-semantics) names. This does not work with
 `timestamp_source = "server"`, because the second copy gets a new timestamp.
 
 ### Reserved column names

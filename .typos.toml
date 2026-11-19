@@ -21,6 +21,8 @@
 NdJson = "NdJson"
 # Rust serialization framework in CamelCase ("Ser" misread as "Set")
 SerDe = "SerDe"
+# questdb-rs trait for n-dimensional arrays ("Nd" misread as "And")
+NdArrayView = "NdArrayView"
 
 # Whitelist valid technical terms to avoid typos false positives
 [default.extend-words]

@@ -26,13 +26,17 @@ use tokio::time::sleep;
 
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::fixtures::{
-    QuestDbOps, QuestDbSinkCoercionFixture, QuestDbSinkCustomTimestampFixture,
-    QuestDbSinkDedupFixture, QuestDbSinkFixture, QuestDbSinkHeadersFixture,
-    QuestDbSinkLocalDurableFixture, QuestDbSinkOriginTimestampFixture, QuestDbSinkOutageFixture,
-    QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerRejectionFixture,
+    OVERSIZED_FRAME_CAP, QuestDbOps, QuestDbSinkAtLeastOnceFixture,
+    QuestDbSinkAtLeastOnceOversizedFixture, QuestDbSinkAtLeastOnceRejectionFixture,
+    QuestDbSinkAtLeastOnceSplitFixture, QuestDbSinkCoercionFixture,
+    QuestDbSinkCustomTimestampFixture, QuestDbSinkDedupFixture, QuestDbSinkFixture,
+    QuestDbSinkHeadersFixture, QuestDbSinkLocalDurableFixture, QuestDbSinkOriginTimestampFixture,
+    QuestDbSinkOutageFixture, QuestDbSinkOversizedFixture, QuestDbSinkPayloadTimestampFixture,
+    QuestDbSinkRawFixture, QuestDbSinkServerRejectionFixture,
     QuestDbSinkServerRejectionStoreAndForwardFixture, QuestDbSinkServerTimestampFixture,
-    QuestDbSinkSmallBatchFixture, QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture,
-    QuestDbSinkTypedFixture, QuestDbSinkTypedNumbersFixture,
+    QuestDbSinkSmallBatchFixture, QuestDbSinkSplitFixture, QuestDbSinkStoreAndForwardFixture,
+    QuestDbSinkTextFixture, QuestDbSinkTypedFixture, QuestDbSinkTypedNumbersFixture,
+    QuestDbSinkWindowedFixture,
 };
 
 fn message(id: u128, payload: serde_json::Value) -> IggyMessage {
@@ -1432,7 +1436,7 @@ async fn send_record_the_server_refuses(harness: &TestHarness) -> IggyClient {
         vec![message(1, json!({"reading": 1.5, "label": "not a number"}))],
     )
     .await;
-    let logs = wait_for_runtime_log(harness, "rejected a batch terminally").await;
+    let logs = wait_for_runtime_log(harness, "connection ended on a terminal error").await;
     assert!(
         logs.contains("Failed to consume"),
         "the runtime must count the rejected batch as failed: {logs}"
@@ -1455,4 +1459,362 @@ async fn wait_for_runtime_log(harness: &TestHarness, needle: &str) -> String {
         sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
     panic!("the runtime never logged {needle:?}: {logs}");
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_a_chunk_split_into_windows_when_consumed_should_acknowledge_every_window(
+    harness: &TestHarness,
+    fixture: QuestDbSinkWindowedFixture,
+) {
+    // Every row is a window of its own, and only the chunk's last `wait` asks
+    // for an acknowledgement. Every row has to land, and the chunk has to be
+    // confirmed with no window left unacknowledged.
+    let fixture = &fixture.0;
+    let messages = (1..=TEST_MESSAGE_COUNT as u32)
+        .map(|i| message(i as u128, json!({"seq": i})))
+        .collect();
+    send(&harness.root_client().await.unwrap(), messages).await;
+
+    fixture
+        .wait_for_rows(TEST_MESSAGE_COUNT)
+        .await
+        .expect("Failed to wait for QuestDB rows");
+    let seqs = fixture.column_values("seq").await.expect("no values");
+    let mut seqs: Vec<f64> = seqs.iter().filter_map(serde_json::Value::as_f64).collect();
+    seqs.sort_by(f64::total_cmp);
+    assert_eq!(
+        seqs,
+        (1..=TEST_MESSAGE_COUNT)
+            .map(|i| i as f64)
+            .collect::<Vec<_>>()
+    );
+    wait_for_runtime_log(harness, "QuestDB acknowledged at ack_level ok").await;
+    // Past the 3 s flush timeout, so a missing acknowledgement has been logged.
+    sleep(Duration::from_secs(5)).await;
+
+    let (stdout, stderr) = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available")
+        .collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
+    for needle in [
+        "acknowledgement has not arrived yet",
+        "QuestDB did not confirm writing",
+    ] {
+        assert!(!logs.contains(needle), "the sink logged {needle:?}: {logs}");
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_at_least_once_when_questdb_stalls_should_deliver_every_message_once(
+    harness: &TestHarness,
+    fixture: QuestDbSinkAtLeastOnceFixture,
+) {
+    // Without `sf_dir`, at-most-once delivery would hold the stalled rows only
+    // in the client's memory queue. At least once, a batch that QuestDB does
+    // not acknowledge fails, the runtime keeps its offsets and delivers it
+    // again, and the DEDUP keys of the table keep one copy of each row.
+    let fixture = &fixture.0;
+    let client = harness.root_client().await.unwrap();
+    send(
+        &client,
+        (1..=5u32)
+            .map(|i| message(i as u128, json!({"seq": i})))
+            .collect(),
+    )
+    .await;
+    fixture.wait_for_rows(5).await.expect("first batch missing");
+
+    fixture.simulate_outage().await.expect("failed to pause");
+    send(
+        &client,
+        (6..=15u32)
+            .map(|i| message(i as u128, json!({"seq": i})))
+            .collect(),
+    )
+    .await;
+    // Past the 2 s flush timeout, so the batch failed and was retried while
+    // QuestDB did not answer.
+    wait_for_runtime_log(
+        harness,
+        "QuestDB did not confirm writing, and the runtime delivers the batch again",
+    )
+    .await;
+    fixture.resume().await.expect("failed to unpause");
+
+    fixture
+        .wait_for_rows(15)
+        .await
+        .expect("a message sent during the stall was lost");
+    // Let any retried copy land before the count is final.
+    sleep(Duration::from_secs(3)).await;
+    let seqs = fixture.column_values("seq").await.expect("no values");
+    let mut seqs: Vec<f64> = seqs.iter().filter_map(serde_json::Value::as_f64).collect();
+    seqs.sort_by(f64::total_cmp);
+    assert_eq!(
+        seqs,
+        (1..=15).map(f64::from).collect::<Vec<_>>(),
+        "every message must land exactly once"
+    );
+}
+
+/// Four messages whose third is wider than the frame cap of the oversized
+/// fixtures, so that it fails alone at offset 2.
+fn messages_with_an_oversized_third() -> Vec<IggyMessage> {
+    let wide = "x".repeat(OVERSIZED_FRAME_CAP as usize * 2);
+    vec![
+        message(1, json!({"seq": 1})),
+        message(2, json!({"seq": 2})),
+        message(3, json!({"seq": 3, "blob": wide})),
+        message(4, json!({"seq": 4})),
+    ]
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_a_message_wider_than_a_frame_when_written_should_lose_only_that_message(
+    harness: &TestHarness,
+    fixture: QuestDbSinkOversizedFixture,
+) {
+    // The rows in front of the wide message share its chunk. They must not
+    // share its frame, which the client refuses.
+    let fixture = &fixture.0;
+    send(
+        &harness.root_client().await.unwrap(),
+        messages_with_an_oversized_third(),
+    )
+    .await;
+
+    let logs = wait_for_runtime_log(harness, "rejected message,").await;
+    let rejection = logs
+        .lines()
+        .find(|line| line.contains("rejected message,"))
+        .expect("no rejection was logged");
+    assert!(
+        rejection.contains("offset: 2") && rejection.contains("per-frame cap"),
+        "the rejection must name the wide message and why: {rejection}"
+    );
+    assert!(
+        !logs.contains("did not take a window"),
+        "the rows in front of the wide message must not share its frame"
+    );
+    fixture
+        .wait_for_rows(3)
+        .await
+        .expect("the rows around the wide message are missing");
+    let seqs = fixture.column_values("seq").await.expect("no values");
+    let mut seqs: Vec<f64> = seqs.iter().filter_map(serde_json::Value::as_f64).collect();
+    seqs.sort_by(f64::total_cmp);
+    assert_eq!(seqs, vec![1.0, 2.0, 4.0]);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_at_least_once_when_a_message_is_wider_than_a_frame_should_write_the_rows_before_it_and_stop(
+    harness: &TestHarness,
+    fixture: QuestDbSinkAtLeastOnceOversizedFixture,
+) {
+    // The wide message is a record that the sink cannot write. The rows in
+    // front of it must land, and the stop must name its offset, so that the
+    // recovery for a rejected record skips it alone.
+    let fixture = &fixture.0;
+    send(
+        &harness.root_client().await.unwrap(),
+        messages_with_an_oversized_third(),
+    )
+    .await;
+
+    let logs = wait_for_runtime_log(
+        harness,
+        "the sink rejected a record, and the runtime stops the delivery at this batch",
+    )
+    .await;
+    let rejection = logs
+        .lines()
+        .find(|line| line.contains("rejected message,"))
+        .expect("no rejection was logged");
+    assert!(
+        rejection.contains("offset: 2"),
+        "the rejection must name the offset to skip: {rejection}"
+    );
+    wait_for_runtime_log(harness, "rejected message at offset 2").await;
+    fixture
+        .wait_for_rows(2)
+        .await
+        .expect("the rows in front of the wide message are missing");
+    // Give a wrongly continued delivery the time to write the last record.
+    sleep(Duration::from_secs(3)).await;
+    let seqs = fixture.column_values("seq").await.expect("no values");
+    let mut seqs: Vec<f64> = seqs.iter().filter_map(serde_json::Value::as_f64).collect();
+    seqs.sort_by(f64::total_cmp);
+    assert_eq!(
+        seqs,
+        vec![1.0, 2.0],
+        "the delivery must stop at the wide message"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_a_frame_cap_below_max_flush_bytes_when_written_at_least_once_should_write_every_row(
+    harness: &TestHarness,
+    fixture: QuestDbSinkAtLeastOnceSplitFixture,
+) {
+    // Twelve rows of 16 KiB stay below `max_flush_bytes`, so they form one
+    // window that the client refuses. Each row fits a frame, so the sink must
+    // write all of them instead of stopping the delivery.
+    let fixture = &fixture.0;
+    let blob = "x".repeat(OVERSIZED_FRAME_CAP as usize / 4);
+    let messages = (1..=12u32)
+        .map(|seq| message(u128::from(seq), json!({"seq": seq, "blob": blob})))
+        .collect();
+    send(&harness.root_client().await.unwrap(), messages).await;
+
+    fixture
+        .wait_for_rows(12)
+        .await
+        .expect("the rows of the refused window are missing");
+    let seqs = fixture.column_values("seq").await.expect("no values");
+    let mut seqs: Vec<f64> = seqs.iter().filter_map(serde_json::Value::as_f64).collect();
+    seqs.sort_by(f64::total_cmp);
+    assert_eq!(
+        seqs,
+        (1..=12).map(f64::from).collect::<Vec<_>>(),
+        "every message must land exactly once"
+    );
+    let (stdout, stderr) = harness
+        .connectors_runtime()
+        .expect("connectors runtime handle should be available")
+        .collect_logs();
+    assert!(
+        !stdout.contains("rejected message,") && !stderr.contains("rejected message,"),
+        "no message is wider than a frame"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_a_frame_cap_below_max_flush_bytes_and_a_rejected_record_when_written_should_lose_only_that_record(
+    harness: &TestHarness,
+    fixture: QuestDbSinkSplitFixture,
+) {
+    // The rejected record holds no row, so the window that the client refuses
+    // holds fewer rows than messages. It must still be built again in halves,
+    // and only the rejected record may be lost.
+    let fixture = &fixture.0;
+    let blob = "x".repeat(OVERSIZED_FRAME_CAP as usize / 4);
+    let messages = (1..=12u32)
+        .map(|seq| {
+            let payload = if seq == 6 {
+                json!({"seq": seq, "bad?name": 1})
+            } else {
+                json!({"seq": seq, "blob": blob})
+            };
+            message(u128::from(seq), payload)
+        })
+        .collect();
+    send(&harness.root_client().await.unwrap(), messages).await;
+
+    let logs = wait_for_runtime_log(harness, "rejected message,").await;
+    let rejection = logs
+        .lines()
+        .find(|line| line.contains("rejected message,"))
+        .expect("no rejection was logged");
+    assert!(
+        rejection.contains("offset: 5"),
+        "the rejection must name the record with the bad column: {rejection}"
+    );
+    fixture
+        .wait_for_rows(11)
+        .await
+        .expect("the rows around the rejected record are missing");
+    let seqs = fixture.column_values("seq").await.expect("no values");
+    let mut seqs: Vec<f64> = seqs.iter().filter_map(serde_json::Value::as_f64).collect();
+    seqs.sort_by(f64::total_cmp);
+    assert_eq!(
+        seqs,
+        (1..=12)
+            .filter(|seq| *seq != 6)
+            .map(f64::from)
+            .collect::<Vec<_>>(),
+        "only the rejected record may be lost"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_at_least_once_when_a_record_is_rejected_should_write_the_rows_before_it_and_stop(
+    harness: &TestHarness,
+    fixture: QuestDbSinkAtLeastOnceRejectionFixture,
+) {
+    // The runtime stops the delivery at a permanent error and stores no
+    // offset for the batch. The rows in front of the record must still land,
+    // so that skipping the record by its offset loses nothing else.
+    let fixture = &fixture.0;
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![
+            message(
+                1,
+                json!({"seq": 1, "trade_id": "123e4567-e89b-12d3-a456-426614174000"}),
+            ),
+            message(
+                2,
+                json!({"seq": 2, "trade_id": "00000000-0000-0000-0000-000000000002"}),
+            ),
+            message(3, json!({"seq": 3, "trade_id": "definitely-not-a-uuid"})),
+            message(
+                4,
+                json!({"seq": 4, "trade_id": "00000000-0000-0000-0000-000000000004"}),
+            ),
+        ],
+    )
+    .await;
+
+    let logs = wait_for_runtime_log(
+        harness,
+        "the sink rejected a record, and the runtime stops the delivery at this batch",
+    )
+    .await;
+    let rejection = logs
+        .lines()
+        .find(|line| line.contains("rejected message"))
+        .expect("no rejection was logged");
+    assert!(
+        rejection.contains("offset: 2"),
+        "the rejection must name the offset to skip: {rejection}"
+    );
+    // The runtime's stop reason carries the error, which names the record
+    // rather than the first message of the batch.
+    wait_for_runtime_log(harness, "rejected message at offset 2").await;
+    fixture
+        .wait_for_rows(2)
+        .await
+        .expect("the rows in front of the rejected record are missing");
+    // Give a wrongly continued delivery the time to write the last record.
+    sleep(Duration::from_secs(3)).await;
+    let seqs = fixture.column_values("seq").await.expect("no values");
+    let mut seqs: Vec<f64> = seqs.iter().filter_map(serde_json::Value::as_f64).collect();
+    seqs.sort_by(f64::total_cmp);
+    assert_eq!(
+        seqs,
+        vec![1.0, 2.0],
+        "the delivery must stop at the rejected record"
+    );
 }

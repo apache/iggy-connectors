@@ -42,6 +42,10 @@ inputs:
     description: "Single platform to build (e.g., linux/amd64). If set, builds only this platform without QEMU. Leave empty for multi-arch build."
     required: false
     default: ""
+  load:
+    description: "Load a dry-run build into the local Docker daemon so later steps can run it. Needs a single platform."
+    required: false
+    default: "false"
   gha-cache:
     description: "Whether to use GitHub Actions cache for Docker layers (disable to save cache space)"
     required: false
@@ -325,6 +329,7 @@ runs:
         build-args: |
           ${{ steps.bargs.outputs.all }}
         push: false
+        load: ${{ inputs.load == 'true' }}
 
     - name: Consolidate build output
       id: build

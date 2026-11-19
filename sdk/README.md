@@ -95,6 +95,16 @@ as `-1`, which reads as permanent. It lacks the `iggy_sink_enable_at_least_once`
 SDK 0.5.1-edge.3 adds `Sink::enable_at_least_once()` and `Sink::flush()` with default
 implementations, so an existing sink needs no code change when rebuilt.
 
+## User header names
+
+The `headers` module gives a sink one stable, unique name per user-header key, so that `1` and `"1"` and raw keys never collide:
+
+- `HeaderName` writes the name of a key. A string key keeps its own name, and any other key becomes `~<kind>:<value>`, for example `~int32:1`.
+- `JsonHeaders` writes a header map as a JSON object of `{"data", "data_encoding"}` values.
+- `HeaderData` and `JsonHeaderValue::data_encoding` give the value text and its encoding to a sink with its own value shape.
+
+The module documentation in `sdk/src/headers.rs` has the full naming table.
+
 ## Retry helpers
 
 `retry_async` runs an operation that fails with `Err` and retries it while `should_retry` accepts the error. It owns attempt counting, backoff and the per-retry log, and returns `RetryFailure { error, attempts, exhausted }` so the caller logs the terminal failure. `retry_backoff` computes a single delay for a loop that cannot use `retry_async`, such as `HttpRetryMiddleware`, which retries on an `Ok` response rather than an `Err`. Its `retry` argument is 1-based.

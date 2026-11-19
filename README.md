@@ -192,12 +192,14 @@ A `Sink` implementation uses the `sink_connector!` macro, which exposes the FFI 
 | [InfluxDB](sinks/influxdb_sink/README.md)           | InfluxDB V2 and V3, as line-protocol points                             |
 | [Meilisearch](sinks/meilisearch_sink/README.md)     | a Meilisearch index                                                     |
 | [MongoDB](sinks/mongodb_sink/README.md)             | a MongoDB collection                                                    |
+| [OTLP](sinks/otlp_sink/README.md)                   | OpenTelemetry backends, as OTLP log records over HTTP                   |
 | [PostgreSQL](sinks/postgres_sink/README.md)         | PostgreSQL tables                                                       |
 | [QuestDB](sinks/questdb_sink/README.md)             | QuestDB tables, through QWP over WebSocket, with store-and-forward      |
 | [Quickwit](sinks/quickwit_sink/README.md)           | a Quickwit index                                                        |
 | [RabbitMQ](sinks/rabbitmq_sink/README.md)           | RabbitMQ exchanges, through AMQP 0.9.1                                  |
 | [Amazon Redshift](sinks/redshift_sink/README.md)    | Redshift tables, with Parquet files in S3 as the staging area           |
 | [Amazon S3](sinks/s3_sink/README.md)                | Amazon S3 and S3-compatible stores (MinIO, R2, B2, DigitalOcean Spaces) |
+| [ScopeDB](sinks/scopedb_sink/README.md)             | ScopeDB tables, with mapped columns or raw payloads                     |
 | [Stdout](sinks/stdout_sink/README.md)               | the standard output, for debugging and development                      |
 | [SurrealDB](sinks/surrealdb_sink/README.md)         | SurrealDB, with deterministic record IDs for an idempotent replay       |
 
@@ -211,6 +213,7 @@ A source produces messages to an Iggy stream and topic. Configure one `[[streams
 | [HTTP](sources/http_source/README.md)                   | `POST` bodies on the paths of an embedded webhook server, with bearer or HMAC authentication |
 | [InfluxDB](sources/influxdb_source/README.md)           | InfluxDB V2 (Flux) and V3 (SQL), by polling                                                  |
 | [MQTT](sources/mqtt_source/README.md)                   | the topics of an MQTT 3.1.1 or MQTT 5 broker, with QoS 0, 1 or 2                             |
+| [OpenSearch](sources/opensearch_source/README.md)       | documents of OpenSearch indices and index patterns, by polling with a timestamp watermark    |
 | [PostgreSQL](sources/postgres_source/README.md)         | PostgreSQL tables, by table polling or Change Data Capture                                   |
 | [Random](sources/random_source/README.md)               | random test messages, for testing and development                                            |
 

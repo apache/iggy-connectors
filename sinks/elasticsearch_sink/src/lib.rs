@@ -22,14 +22,17 @@ use elasticsearch::{
     auth::Credentials,
     http::{Url, request::JsonBody, transport::TransportBuilder},
 };
-use iggy_common::IggyTimestamp;
+use iggy_common::{HeaderKey, HeaderValue, IggyTimestamp};
 use iggy_connector_sdk::retry::{RetryPolicy, parse_duration};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Schema, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, JsonHeaders, MessagesMetadata, Payload, Schema, Sink, TopicMetadata,
+    sink_connector,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use simd_json::owned::Object;
 use simd_json::{OwnedValue, prelude::*};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -40,6 +43,14 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
+const DEFAULT_INCLUDE_HEADERS: bool = false;
+const HEADERS_FIELD: &str = "_iggy_headers";
+const HEADER_DATA_PATH_MATCH: &str = "_iggy_headers.*.data";
+/// Name and `match_mapping_type` of each keyword template for header `data`.
+const HEADER_DATA_TEMPLATES: [(&str, &str); 2] = [
+    ("iggy_header_data", "string"),
+    ("iggy_header_data_date", "date"),
+];
 
 #[derive(Deserialize)]
 struct BulkResponse {
@@ -85,6 +96,10 @@ pub struct ElasticsearchSinkConfig {
     pub retry_max_delay: Option<String>,
     pub create_index_if_not_exists: Option<bool>,
     pub index_mapping: Option<serde_json::Value>,
+    /// Writes user headers to `_iggy_headers` and maps their `data` as keyword
+    /// on index creation. Defaults to `false`, so that an upgrade leaves the
+    /// documents of an existing index unchanged.
+    pub include_headers: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -93,6 +108,7 @@ pub struct ElasticsearchSink {
     config: ElasticsearchSinkConfig,
     client: Option<Elasticsearch>,
     retry_policy: RetryPolicy,
+    include_headers: bool,
     state: Mutex<State>,
 }
 
@@ -103,11 +119,13 @@ impl ElasticsearchSink {
             base_delay: parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY),
             max_delay: parse_duration(config.retry_max_delay.as_deref(), DEFAULT_RETRY_MAX_DELAY),
         };
+        let include_headers = config.include_headers.unwrap_or(DEFAULT_INCLUDE_HEADERS);
         ElasticsearchSink {
             id,
             config,
             client: None,
             retry_policy,
+            include_headers,
             state: Mutex::new(State {
                 invocations_count: 0,
                 documents_indexed: 0,
@@ -165,26 +183,15 @@ impl ElasticsearchSink {
             return Ok(());
         }
 
-        let response = if let Some(mapping) = &self.config.index_mapping {
-            client
-                .indices()
-                .create(elasticsearch::indices::IndicesCreateParts::Index(
-                    &self.config.index,
-                ))
-                .body(mapping.clone())
-                .send()
-                .await
-                .map_err(|e| Error::Connection(format!("Failed to create index: {}", e)))?
-        } else {
-            client
-                .indices()
-                .create(elasticsearch::indices::IndicesCreateParts::Index(
-                    &self.config.index,
-                ))
-                .send()
-                .await
-                .map_err(|e| Error::Connection(format!("Failed to create index: {}", e)))?
-        };
+        let indices = client.indices();
+        let request = indices.create(elasticsearch::indices::IndicesCreateParts::Index(
+            &self.config.index,
+        ));
+        let response = match self.index_create_body() {
+            Some(body) => request.body(body).send().await,
+            None => request.send().await,
+        }
+        .map_err(|e| Error::Connection(format!("Failed to create index: {}", e)))?;
 
         if response.status_code().is_success() {
             info!("Successfully created index '{}'", self.config.index);
@@ -200,6 +207,23 @@ impl ElasticsearchSink {
         }
 
         Ok(())
+    }
+
+    /// The body of the index-create request. `None` creates the index with no
+    /// body.
+    fn index_create_body(&self) -> Option<serde_json::Value> {
+        let mapping = self.config.index_mapping.clone();
+        if !self.include_headers {
+            return mapping;
+        }
+        let mut body = mapping.unwrap_or_else(|| serde_json::json!({}));
+        if !prepend_header_data_template(&mut body) {
+            warn!(
+                "Elasticsearch sink with ID: {} cannot add the header template to index_mapping, because it is not an object with object `mappings` and array `dynamic_templates`. Header data uses dynamic mapping.",
+                self.id
+            );
+        }
+        Some(body)
     }
 
     async fn bulk_index_documents(
@@ -312,6 +336,86 @@ impl ElasticsearchSink {
     }
 }
 
+/// Prepends the keyword templates for header `data` to
+/// `body.mappings.dynamic_templates`, except those whose name is there.
+/// Returns `false` when `body` has a shape that cannot hold them.
+///
+/// Dynamic mapping pins a field type on first write, so a date-like header
+/// value would make every later non-date value of that header fail to index.
+/// Elasticsearch applies the first matching template, so these go first.
+///
+/// Each template names its `match_mapping_type`. Without one, a header key
+/// such as `x.data` expands to an object at `_iggy_headers.x.data`, the
+/// template maps that object as keyword, and Elasticsearch rejects the
+/// document. Date detection reports a date-like string as `date`, not
+/// `string`, so a `string` template alone misses those values.
+fn prepend_header_data_template(body: &mut serde_json::Value) -> bool {
+    let Some(root) = body.as_object_mut() else {
+        return false;
+    };
+    let Some(mappings) = root
+        .entry("mappings")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+    let Some(templates) = mappings
+        .entry("dynamic_templates")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+    else {
+        return false;
+    };
+    let missing: Vec<serde_json::Value> = HEADER_DATA_TEMPLATES
+        .iter()
+        .filter(|(name, _)| {
+            !templates
+                .iter()
+                .any(|template| template.get(*name).is_some())
+        })
+        .map(|(name, mapping_type)| header_data_template(name, mapping_type))
+        .collect();
+    templates.splice(0..0, missing);
+    true
+}
+
+fn header_data_template(name: &str, mapping_type: &str) -> serde_json::Value {
+    let mut template = serde_json::Map::new();
+    template.insert(
+        name.to_owned(),
+        serde_json::json!({
+            "path_match": HEADER_DATA_PATH_MATCH,
+            "match_mapping_type": mapping_type,
+            "mapping": {"type": "keyword"}
+        }),
+    );
+    serde_json::Value::Object(template)
+}
+
+/// Writes `headers` to `_iggy_headers`. A message without headers loses any
+/// `_iggy_headers` field from its payload, so that a payload value cannot pin
+/// the field type that later headers need.
+fn insert_headers(
+    document: &mut Object,
+    headers: Option<&BTreeMap<HeaderKey, HeaderValue>>,
+) -> Result<(), simd_json::Error> {
+    let Some(headers) = headers.filter(|headers| !headers.is_empty()) else {
+        document.remove(HEADERS_FIELD);
+        return Ok(());
+    };
+    match simd_json::serde::to_owned_value(JsonHeaders(headers)) {
+        Ok(value) => {
+            document.insert(HEADERS_FIELD.to_owned(), value);
+            Ok(())
+        }
+        Err(error) => {
+            document.remove(HEADERS_FIELD);
+            Err(error)
+        }
+    }
+}
+
 /// The document a payload indexes as. `None` skips the message.
 fn document_from_payload(payload: Payload, schema: Schema) -> Option<OwnedValue> {
     let payload = payload.into_json_document();
@@ -418,15 +522,13 @@ impl Sink for ElasticsearchSink {
                     OwnedValue::from(IggyTimestamp::now().as_millis() as i64),
                 );
 
-                if let Some(headers) = &message.headers {
-                    // Convert headers to simd_json value
-                    let headers_json = serde_json::to_string(headers).unwrap_or_default();
-                    let mut headers_bytes = headers_json.into_bytes();
-                    if let Ok(headers_value) =
-                        simd_json::from_slice::<OwnedValue>(&mut headers_bytes)
-                    {
-                        obj.insert("_iggy_headers".to_string(), headers_value);
-                    }
+                if self.include_headers
+                    && let Err(error) = insert_headers(obj, message.headers.as_ref())
+                {
+                    warn!(
+                        "Elasticsearch sink with ID: {} indexes the message at offset: {} without user headers, error: {error}",
+                        self.id, message.offset
+                    );
                 }
             }
 
@@ -463,6 +565,7 @@ impl Sink for ElasticsearchSink {
 
 #[cfg(test)]
 mod tests {
+    use iggy_connector_testing::headers::{header_case_map, header_cases};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -482,6 +585,7 @@ mod tests {
             retry_max_delay: None,
             create_index_if_not_exists: Some(false),
             index_mapping: None,
+            include_headers: Some(true),
         }
     }
 
@@ -497,6 +601,20 @@ mod tests {
         assert_eq!(sink.retry_policy.max_attempts, 3);
         assert_eq!(sink.retry_policy.base_delay, Duration::from_secs(1));
         assert_eq!(sink.retry_policy.max_delay, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn given_omitted_include_headers_when_loading_should_write_no_headers_or_template() {
+        let config = serde_json::from_value(json!({
+            "url": "http://localhost:9200",
+            "index": "test"
+        }))
+        .expect("Existing configurations should remain valid");
+
+        let sink = ElasticsearchSink::new(1, config);
+
+        assert!(!sink.include_headers);
+        assert_eq!(sink.index_create_body(), None);
     }
 
     #[test]
@@ -827,6 +945,323 @@ mod tests {
                     .expect("requests should be recorded")
                     .is_empty()
             );
+        });
+    }
+
+    fn header_templates() -> Vec<serde_json::Value> {
+        vec![
+            json!({"iggy_header_data": {
+                "path_match": HEADER_DATA_PATH_MATCH,
+                "match_mapping_type": "string",
+                "mapping": {"type": "keyword"}
+            }}),
+            json!({"iggy_header_data_date": {
+                "path_match": HEADER_DATA_PATH_MATCH,
+                "match_mapping_type": "date",
+                "mapping": {"type": "keyword"}
+            }}),
+        ]
+    }
+
+    fn document_with_headers(
+        mut document: OwnedValue,
+        headers: Option<&BTreeMap<HeaderKey, HeaderValue>>,
+    ) -> serde_json::Value {
+        let object = document
+            .as_object_mut()
+            .expect("test document is an object");
+        insert_headers(object, headers).expect("headers should encode");
+        iggy_connector_sdk::owned_value_to_serde_json(&document)
+    }
+
+    fn json_message(
+        document: serde_json::Value,
+        headers: Option<BTreeMap<HeaderKey, HeaderValue>>,
+    ) -> ConsumedMessage {
+        let mut bytes = serde_json::to_vec(&document).expect("serialize test document");
+        ConsumedMessage {
+            id: 1,
+            offset: 7,
+            checksum: 0,
+            timestamp: 0,
+            origin_timestamp: 0,
+            headers,
+            payload: Payload::Json(
+                simd_json::to_owned_value(&mut bytes).expect("test document is JSON"),
+            ),
+        }
+    }
+
+    /// Consumes one message against a mock `_bulk` endpoint and returns the
+    /// document that the sink sent.
+    async fn consume_and_capture(
+        config: ElasticsearchSinkConfig,
+        message: ConsumedMessage,
+    ) -> serde_json::Value {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"items": [{"index": {"status": 201}}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut sink = ElasticsearchSink::new(
+            1,
+            ElasticsearchSinkConfig {
+                url: server.uri(),
+                ..config
+            },
+        );
+        sink.client = Some(
+            sink.create_client()
+                .await
+                .expect("client should initialize"),
+        );
+
+        sink.consume(
+            &TopicMetadata {
+                stream: "stream".to_owned(),
+                topic: "topic".to_owned(),
+            },
+            MessagesMetadata {
+                partition_id: 0,
+                current_offset: 7,
+                schema: Schema::Json,
+            },
+            vec![message],
+        )
+        .await
+        .expect("consume should succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("requests should be recorded");
+        let body = String::from_utf8(requests[0].body.clone()).expect("bulk body is UTF-8");
+        let document_line = body.lines().nth(1).expect("bulk body has a document line");
+        serde_json::from_str(document_line).expect("document line is JSON")
+    }
+
+    #[test]
+    fn given_shared_header_cases_when_inserting_headers_should_write_expected_names() {
+        let cases = header_cases();
+
+        let document = document_with_headers(simd_json::json!({}), Some(&header_case_map()));
+
+        let headers = document[HEADERS_FIELD]
+            .as_object()
+            .expect("headers are an object");
+        assert_eq!(headers.len(), cases.len());
+        for case in &cases {
+            assert_eq!(
+                headers.get(&case.expected_name),
+                Some(&json!({"data": case.label, "data_encoding": "utf8"})),
+                "case {}",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn given_payload_headers_field_when_message_has_no_headers_should_remove_it() {
+        let payload = simd_json::json!({"id": 1, "_iggy_headers": "2024-01-01"});
+        let empty = BTreeMap::new();
+
+        for headers in [None, Some(&empty)] {
+            let document = document_with_headers(payload.clone(), headers);
+
+            assert_eq!(document, json!({"id": 1}), "{headers:?}");
+        }
+    }
+
+    #[test]
+    fn given_no_index_mapping_when_building_create_body_should_carry_header_templates() {
+        let sink = ElasticsearchSink::new(1, test_config());
+
+        assert_eq!(
+            sink.index_create_body(),
+            Some(json!({"mappings": {"dynamic_templates": header_templates()}}))
+        );
+    }
+
+    #[test]
+    fn given_index_mapping_when_building_create_body_should_prepend_header_templates() {
+        let user_template =
+            json!({"strings": {"match_mapping_type": "string", "mapping": {"type": "text"}}});
+        let sink = ElasticsearchSink::new(
+            1,
+            ElasticsearchSinkConfig {
+                index_mapping: Some(json!({
+                    "settings": {"number_of_shards": 1},
+                    "mappings": {
+                        "dynamic_templates": [user_template.clone()],
+                        "properties": {"name": {"type": "keyword"}}
+                    }
+                })),
+                ..test_config()
+            },
+        );
+
+        let mut body = sink.index_create_body().expect("body is present");
+
+        assert_eq!(
+            body,
+            json!({
+                "settings": {"number_of_shards": 1},
+                "mappings": {
+                    "dynamic_templates": ([header_templates(), vec![user_template]].concat()),
+                    "properties": {"name": {"type": "keyword"}}
+                }
+            })
+        );
+        let before = body.clone();
+        assert!(prepend_header_data_template(&mut body));
+        assert_eq!(
+            body, before,
+            "a second prepend must not duplicate the template"
+        );
+    }
+
+    #[test]
+    fn given_headers_disabled_when_building_create_body_should_keep_index_mapping() {
+        let mapping = json!({"mappings": {"properties": {"name": {"type": "keyword"}}}});
+        for index_mapping in [None, Some(mapping)] {
+            let sink = ElasticsearchSink::new(
+                1,
+                ElasticsearchSinkConfig {
+                    include_headers: Some(false),
+                    index_mapping: index_mapping.clone(),
+                    ..test_config()
+                },
+            );
+
+            assert_eq!(sink.index_create_body(), index_mapping);
+        }
+    }
+
+    #[test]
+    fn given_index_mapping_of_unexpected_shape_when_building_create_body_should_send_it_unchanged()
+    {
+        for mapping in [
+            json!([]),
+            json!({"mappings": "not an object"}),
+            json!({"mappings": {"dynamic_templates": {}}}),
+        ] {
+            let sink = ElasticsearchSink::new(
+                1,
+                ElasticsearchSinkConfig {
+                    index_mapping: Some(mapping.clone()),
+                    ..test_config()
+                },
+            );
+
+            assert_eq!(sink.index_create_body(), Some(mapping));
+        }
+    }
+
+    #[test]
+    fn given_missing_index_when_creating_it_should_send_the_header_templates() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path("/test"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/test"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"acknowledged": true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let sink = ElasticsearchSink::new(
+                1,
+                ElasticsearchSinkConfig {
+                    url: server.uri(),
+                    create_index_if_not_exists: Some(true),
+                    ..test_config()
+                },
+            );
+            let client = sink
+                .create_client()
+                .await
+                .expect("client should initialize");
+
+            sink.ensure_index_exists(&client)
+                .await
+                .expect("index creation should succeed");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("requests should be recorded");
+            let create = requests
+                .iter()
+                .find(|request| request.method.as_str() == "PUT")
+                .expect("a create request was sent");
+            let body: serde_json::Value =
+                serde_json::from_slice(&create.body).expect("create body is JSON");
+            assert_eq!(
+                body,
+                json!({"mappings": {"dynamic_templates": header_templates()}})
+            );
+        });
+    }
+
+    #[test]
+    fn given_headers_enabled_when_consuming_should_write_header_names() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime.block_on(async {
+            let mut headers = BTreeMap::new();
+            headers.insert(
+                HeaderKey::try_from("a").expect("valid key"),
+                HeaderValue::try_from("b").expect("valid value"),
+            );
+            headers.insert(HeaderKey::from(1i32), HeaderValue::from(2i32));
+
+            let document =
+                consume_and_capture(test_config(), json_message(json!({"id": 1}), Some(headers)))
+                    .await;
+
+            assert_eq!(
+                document[HEADERS_FIELD],
+                json!({
+                    "a": {"data": "b", "data_encoding": "utf8"},
+                    "~int32:1": {"data": "2", "data_encoding": "utf8"}
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn given_headers_disabled_when_consuming_should_leave_payload_untouched() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime should start");
+        runtime.block_on(async {
+            let mut headers = BTreeMap::new();
+            headers.insert(
+                HeaderKey::try_from("a").expect("valid key"),
+                HeaderValue::try_from("b").expect("valid value"),
+            );
+
+            let document = consume_and_capture(
+                ElasticsearchSinkConfig {
+                    include_headers: Some(false),
+                    ..test_config()
+                },
+                json_message(
+                    json!({"id": 1, "_iggy_headers": "from payload"}),
+                    Some(headers),
+                ),
+            )
+            .await;
+
+            assert_eq!(document[HEADERS_FIELD], json!("from payload"));
         });
     }
 }

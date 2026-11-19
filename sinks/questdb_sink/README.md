@@ -26,7 +26,7 @@ enabled through the connect string.
 
 Requires QuestDB 10.0 or QuestDB Enterprise 4.0, or newer.
 `ack_level = "local_durable"` requires QuestDB 10.2.0 or QuestDB Enterprise
-4.2.0. The tests run against QuestDB 10.2.0 with `cairo.commit.mode=adaptive`.
+4.2.1. The tests run against QuestDB 10.2.0 with `cairo.commit.mode=adaptive`.
 
 ## Configuration
 
@@ -41,8 +41,8 @@ uuid_columns = []
 integer_columns = []
 include_stream_column = true
 include_topic_column = true
-include_partition_column = false
-include_offset_column = false
+include_partition_column = true
+include_offset_column = true
 include_headers = false
 # Leave ack_level unset to follow request_durable_ack in the connect string.
 # ack_level = "ok"
@@ -58,18 +58,18 @@ verbose_logging = false
 | ----- | ------- | ----------- |
 | `connection_string` | required | QuestDB connect string, `ws::` or `wss::`. Treated as a secret. |
 | `table` | required | Target table. |
-| `timestamp_source` | `message` | `message`, `origin`, `payload`, or `server`. |
-| `timestamp_field` | none | Payload field holding the timestamp. Required when `timestamp_source = "payload"`, and rejected with any other source. |
-| `timestamp_unit` | `auto` | Unit of the payload timestamp: `auto`, `seconds` (`s`), `millis` (`ms`), `micros` (`us`), `nanos` (`ns`). `auto` infers the unit from the magnitude. Used only when `timestamp_source = "payload"`. A value other than `auto` is rejected with another source, and an invalid value is rejected with any source. |
-| `symbol_columns` | `[]` | Payload fields stored as `SYMBOL`. A record with an object or array in one of these fields, or with a value longer than 1 MiB, is rejected. |
+| `timestamp_source` | `message` | `message`, `origin`, `payload`, or `server`. An auto-created table names this column `timestamp`, so a payload field named `timestamp` collides with it. See [Timestamps](#timestamps). |
+| `timestamp_field` | none | Payload field holding the timestamp, as a JSON number since the Unix epoch in the unit of `timestamp_unit`. A string, such as an RFC 3339 date, rejects the record. Required when `timestamp_source = "payload"`, and rejected with any other source. |
+| `timestamp_unit` | `auto` | Unit of the payload timestamp: `auto`, `seconds` (`s`), `millis` (`ms`), `micros` (`us`), `nanos` (`ns`). `auto` infers the unit from the magnitude, see [Timestamps](#timestamps). Used only when `timestamp_source = "payload"`. A value other than `auto` is rejected with another source, and an invalid value is rejected with any source. |
+| `symbol_columns` | `[]` | Payload fields stored as `SYMBOL`. A record with an object or a non-empty array in one of these fields, or with a value longer than 1 MiB, is rejected. An empty array is left out, as a `null` is. |
 | `uuid_columns` | `[]` | Payload fields holding RFC-4122 strings, stored as `UUID`. A record with a non-string value there is rejected. |
 | `integer_columns` | `[]` | Payload fields stored as `LONG`. A fractional, non-numeric or out-of-range value there is rejected. |
 | `include_stream_column` | `true` | Write the stream name as a `SYMBOL` column named `iggy_stream`. |
 | `include_topic_column` | `true` | Write the topic name as a `SYMBOL` column named `iggy_topic`. |
 | `include_partition_column` | `false` | Write the partition as a `LONG` column named `iggy_partition_id`. |
-| `include_offset_column` | `false` | Write the offset as a `LONG` column named `iggy_offset`. |
+| `include_offset_column` | `false` | Write the offset as a `LONG` column named `iggy_offset`. The partition and the offset identify a message, so they can serve as DEDUP keys for a payload that has no key of its own. |
 | `include_headers` | `false` | Write each header as a `VARCHAR` column named `header_<name>`, so `content-type` is written to `header_content_type`. See [Headers](#headers). |
-| `ack_level` | from the connect string | `ok` waits for the server to accept the rows of a chunk. `durable` waits for the Enterprise durable ack. `local_durable` waits until the server flushed the rows to its own disk. If you do not set it, the connect string decides: `request_durable_ack` set to `on`, `replicated` or `local,replicated` gives `durable`, `local` gives `local_durable`, and `off` or no `request_durable_ack` gives `ok`. |
+| `ack_level` | from the connect string | `ok` waits for the server to accept the rows of a chunk. `durable` waits for the Enterprise durable ack. `local_durable` waits until the server flushed the rows to disk. If you do not set it, `request_durable_ack` in the connect string decides: `on`, `replicated` or `local,replicated` gives `durable`, `local` gives `local_durable`, and `off` or no key gives `ok`. `durable` and `local_durable` must match that key, so only `ok` changes the level. |
 | `flush_timeout` | `30s` | How long a chunk waits for its ack without progress. See [Batch sizing](#batch-sizing). `0s` with `ack_level = "ok"` means fire and forget. `0s` is not allowed with `durable` or `local_durable`. |
 | `batch_size` | `1000` | Maximum rows per chunk. |
 | `max_flush_bytes` | `1000000` | Flush when the buffer reaches this size, even before `batch_size` rows. Keep it below the frame cap, see [Batch sizing](#batch-sizing). |
@@ -77,14 +77,28 @@ verbose_logging = false
 | `log_rejected_payload` | `false` | Add a truncated payload to the log line of a rejected record. |
 | `verbose_logging` | `false` | Log per-batch details at `info` instead of `debug`. |
 
-Field names in the column lists match without regard to case, as in QuestDB.
+Field names in the column lists and in `timestamp_field` match without regard
+to case, as in QuestDB. A record with two fields that match `timestamp_field`
+is rejected.
 
 Credentials, TLS, store-and-forward, reconnect and multi-host failover are set
 in the connect string. See the
 [connect string reference](https://questdb.com/docs/connect/clients/connect-string/).
 
 The delivery guarantee is set in the runtime's `[delivery]` table of the
-connector, not in `plugin_config`. See [Delivery semantics](#delivery-semantics).
+connector, not in `plugin_config`. Set at least once for every table that must
+not lose rows:
+
+```toml
+[delivery]
+guarantee = "at_least_once"
+```
+
+Without this table the runtime delivers at most once, which is best effort: a
+failed write loses the messages of its batch, and the sink only logs their
+offsets. The example configuration sets at least once, and it writes the
+partition and the offset of each message, which can serve as DEDUP keys for
+retried batches. See [Delivery semantics](#delivery-semantics).
 
 ### Batch sizing
 
@@ -106,16 +120,14 @@ The check runs after each row is added. A row that takes the buffer to
 `max_flush_bytes` is taken out again, the rows in front of it are published,
 and the row starts the next frame. So a message larger than the frame cap is
 alone in its frame, and only that flush fails. The sink then rejects the
-message as a [rejected record](#rejected-records). At most once, it loses
-the message, logs its offset, and goes on with the rest of the chunk. At least
-once, it first waits for the acknowledgement of the rows in front of the
-message, and then fails the call at the message with a permanent error.
+message as a [rejected record](#rejected-records).
 
 If the frame cap is below `max_flush_bytes`, the client refuses a frame of
 several rows before the check fires. The sink then builds the rows of that frame
 again in two halves, and halves again until each frame fits or holds one row.
-Every refused frame costs one more build of its rows, so keep `max_flush_bytes`
-below the frame cap.
+It also lowers its flush size to half of the refused frame, for every later
+frame of the connector, and logs a warning each time it does. Set
+`max_flush_bytes` below the frame cap to avoid the refused frames.
 
 ## Store-and-forward
 
@@ -127,13 +139,9 @@ restart.
 connection_string = "ws::addr=localhost:9000;sf_dir=/var/lib/iggy/questdb-sf;sender_id=iggy;"
 ```
 
-Use it in production with the runtime's default at-most-once delivery. The
-runtime then commits the offset of each poll before `consume()` runs and does
-not replay a failed batch, so the queue of the client is the only copy of rows
-that `consume()` reported. With `guarantee = "at_least_once"`, `consume()`
-reports success only after QuestDB acknowledged the rows, and the runtime
-delivers a failed batch again, so `sf_dir` only spares a replay. See
-[Delivery semantics](#delivery-semantics).
+Use it in production with at-most-once delivery, where the queue of the
+client is the only copy of rows that `consume()` reported. At least once,
+`sf_dir` only spares a replay. See [Delivery semantics](#delivery-semantics).
 
 `sf_dir` keeps frames across a process crash or restart, but not across a host
 failure. By default the client does not fsync the frames, so a power loss or a
@@ -237,7 +245,7 @@ connection_string = "ws::addr=localhost:9000;sender_pool_max=16;"
   server.
 - **Durable ack**: set `request_durable_ack=on`, `replicated` or
   `local,replicated` in the connect string. The three ask for the same
-  acknowledgement. `replicated` and `local,replicated` need Enterprise 4.2.0.
+  acknowledgement. `replicated` and `local,replicated` need Enterprise 4.2.1.
   Older servers accept only `on`. `local,replicated` also needs
   `cairo.commit.mode=adaptive`, as `local` does. The
   sink then waits for the durable ack, unless you set `ack_level = "ok"`, which
@@ -268,7 +276,7 @@ An `ok` acknowledgement means that QuestDB committed the rows, but by default
 QuestDB does not flush a commit to disk. A QuestDB process crash keeps the rows.
 An OS crash or a power loss on the QuestDB host can lose them.
 
-QuestDB 10.2.0 and QuestDB Enterprise 4.2.0 add the `adaptive` commit mode,
+QuestDB 10.2.0 and QuestDB Enterprise 4.2.1 add the `adaptive` commit mode,
 which closes this gap for WAL tables. Set `cairo.commit.mode=adaptive` in the
 server configuration. On Enterprise, set it on every node that can become
 primary. Each commit then flushes its write-ahead log files to disk, so a row
@@ -283,10 +291,9 @@ The commit mode is a server setting. To make each chunk of the sink wait until
 the server flushed its rows to disk, add `request_durable_ack=local` to the
 connect string. `ack_level` then defaults to `local_durable`. A row whose
 chunk QuestDB acknowledged then survives a power loss, also within the group
-window. At most once, a chunk whose acknowledgement does not arrive within
-`flush_timeout` is logged and stays queued, and `consume()` still reports
-success. At least once, the call fails, and the runtime retries the batch. See
-[Delivery semantics](#delivery-semantics). A server without the `adaptive` mode
+window. For a chunk whose acknowledgement does not arrive within
+`flush_timeout`, see [Delivery semantics](#delivery-semantics). A server
+without the `adaptive` mode
 refuses the connection with
 `server did not enable durable ACK [requested=local, ...]`, and the connector
 does not start.
@@ -298,7 +305,7 @@ connection_string = "ws::addr=localhost:9000;request_durable_ack=local;"
 ## Types
 
 QuestDB creates the table and its columns from the first rows it receives.
-Create the table yourself if you need partitioning, `TTL`, `DEDUP UPSERT KEYS`,
+Create the table yourself if you need partitioning, `TTL`, `DEDUP` keys,
 symbol capacities or a specific designated timestamp name.
 
 | JSON | QuestDB |
@@ -306,12 +313,16 @@ symbol capacities or a specific designated timestamp name.
 | string | `VARCHAR`, or `SYMBOL` / `UUID` when listed in `symbol_columns` / `uuid_columns` |
 | number | `DOUBLE`, or `LONG` when listed in `integer_columns` |
 | boolean | `BOOLEAN` |
-| array of numbers | `DOUBLE[]`, up to 3 dimensions. An empty array is rejected. |
+| array of numbers | `DOUBLE[]`, up to 3 dimensions, when every row of a dimension has the same length |
+| any other array | not supported, the record is rejected |
 | object | `VARCHAR` holding the JSON text |
-| `null` | column omitted |
+| `null`, empty array, also nested as in `[[]]` | column omitted |
 
 Integer arrays are stored as `DOUBLE[]`, because QuestDB has no other array
-type. `BOOLEAN` has no null, so an omitted boolean reads back as `false`.
+type. An array that holds anything but numbers, for example strings or a
+`null`, one with rows of unequal length, and one nested deeper than 3 levels
+have no QuestDB type, so the record is a [rejected record](#rejected-records).
+`BOOLEAN` has no null, so an omitted boolean reads back as `false`.
 
 A payload that is not a JSON object goes into one `VARCHAR` column named
 `payload`. That covers `Raw`, `Text`, `FlatBuffer` and `Avro` payloads, proto
@@ -363,6 +374,13 @@ gets a `TIMESTAMP` column. `payload` timestamps are converted to nanoseconds and
 give a `TIMESTAMP_NS` column. With `server`, QuestDB stamps each row on arrival.
 Use one source per table.
 
+`timestamp_unit = "auto"` reads the size of the payload value, without its
+sign: below 1e11 it is seconds, below 1e14 milliseconds, below 1e17
+microseconds, and nanoseconds from there. Each bound is 1973-03-03 in the finer
+unit, so `auto` reads a millisecond, microsecond or nanosecond value before
+that date as a coarser unit, and the row gets a wrong time or is rejected. Set
+the unit if the data can hold such values.
+
 ### Headers
 
 With `include_headers = true`, each header is written to a `VARCHAR` column
@@ -412,18 +430,24 @@ each value came from.
 
 Two boundaries decide delivery.
 
-Between Iggy and the sink, the runtime's `[delivery]` table decides. The
-default is at most once: the runtime commits the offset of each poll before
-`consume()` runs and does not replay a batch. For at least once, set:
+Between Iggy and the sink, the runtime's `[delivery]` table decides. Use at
+least once for data that must not be lost:
 
 ```toml
 [delivery]
 guarantee = "at_least_once"
 ```
 
-The runtime then stores an offset only after `consume()` succeeds, and it
-delivers a failed batch again after a backoff. The sink reports success only
-when QuestDB acknowledged every chunk of the batch at `ack_level`:
+Without the table, the runtime delivers at most once: it commits the offset of
+each poll before `consume()` runs and does not replay a batch. At most once is
+best effort. The sink makes one attempt for each message. A chunk that fails
+ends its batch, and the messages that were not written are lost. The sink logs
+their offsets, so that you can rewind to them as
+[Recovery after a host failure](#recovery-after-a-host-failure) describes.
+
+At least once, the runtime stores an offset only after `consume()` succeeds,
+and it delivers a failed batch again after a backoff. The sink reports success
+only when QuestDB acknowledged every chunk of the batch at `ack_level`:
 
 - A chunk whose acknowledgement does not arrive within `flush_timeout` fails
   the call with a transient error, and the runtime retries the batch. The
@@ -433,7 +457,6 @@ when QuestDB acknowledged every chunk of the batch at `ack_level`:
   default. Set it to bound the copies: when it runs out, the runtime stops the
   delivery of the topic, and a restart delivers the batch again. Declare the
   DEDUP keys below to keep one copy of each row.
-- A failed chunk ends the batch, because the runtime delivers all of it again.
 - A record that the sink rejects fails the call with a permanent error. The
   runtime stops the delivery of the whole topic at the record instead of
   skipping it. It first stores the offsets that the other partitions of the
@@ -443,31 +466,47 @@ when QuestDB acknowledged every chunk of the batch at `ack_level`:
   so a connector that sets it does not start with at least once.
 
 A retried batch writes the chunks that QuestDB already took a second time. To
-keep one copy, write the message identity and declare it as the DEDUP keys:
+keep one copy, declare `DEDUP` keys on the table. QuestDB removes duplicates by
+the keys of the table definition, so the keys are yours to choose: the
+designated timestamp, plus the columns that identify a row.
+
+QuestDB has two modes, and they differ in which row stays:
+
+- `DEDUP SKIP KEYS(...)` keeps the first row and discards a later one with the
+  same keys. Use it to remove retried copies: the copy is the same row, so
+  QuestDB has nothing to write. It needs QuestDB 10.2.0 or QuestDB Enterprise
+  4.2.1. An older server treats it as `UPSERT`, without an error.
+- `DEDUP UPSERT KEYS(...)` replaces the stored row with the later one. Use it
+  when a later message with the same keys must overwrite the earlier values.
+
+If the payload has columns that identify a row, for example an order id, use
+them as the keys. If it does not, write the message identity and use it:
 
 1. Set `include_partition_column = true` and `include_offset_column = true`.
 2. Create the table with
-   `DEDUP UPSERT KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset)`,
+   `DEDUP SKIP KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset)`,
    with the name of your designated timestamp in place of `timestamp`.
 
-The offset alone is not enough. Iggy gives every message of one producer batch
-the same timestamp, so keys on the timestamp and the default columns merge
-distinct messages into one row, without an error.
+The timestamp, the stream and the topic are not enough. Iggy gives every
+message of one producer batch the same timestamp, so keys without the partition
+and the offset keep one row for several distinct messages, without an error.
 
 ```sql
 CREATE TABLE iggy_events (
   iggy_stream SYMBOL, iggy_topic SYMBOL, iggy_partition_id LONG,
   iggy_offset LONG, timestamp TIMESTAMP
 ) TIMESTAMP(timestamp) PARTITION BY DAY WAL
-DEDUP UPSERT KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset);
+DEDUP SKIP KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset);
 ```
 
 DEDUP keys must include the designated timestamp, so a retried row is a
 duplicate only if it gets the same timestamp again. With
 `timestamp_source = "server"`, QuestDB stamps each copy on arrival, and the
-connector logs a warning at start. The same holds with `origin` for a message
-without an origin timestamp, because the connector then uses its own clock.
-Use `message` or `payload` for a table that must not have duplicates.
+connector logs a warning at start. The same holds for a message whose
+timestamp is zero, which Iggy uses for "not set": the origin timestamp with
+`origin`, and the message timestamp with `message`. The connector then uses its
+own clock. Use `message` or `payload` for a table that must not have
+duplicates.
 
 Each batch waits for its own acknowledgement. `flush_interval` and
 `flush_max_messages` in `[delivery]` delay only when the runtime stores the
@@ -477,7 +516,7 @@ it.
 
 Between the sink and QuestDB, delivery is at least once. A reconnect, a failover
 or a replay of queued frames can send the same rows again. Declare
-[`DEDUP UPSERT KEYS(...)`](https://questdb.com/docs/concepts/deduplication/) on
+[`DEDUP` keys](https://questdb.com/docs/concepts/deduplication/) on
 tables that must not have duplicates.
 
 The client queues unacknowledged frames in memory, or on disk when `sf_dir` is
@@ -509,8 +548,9 @@ QuestDB acknowledged the rows, and the runtime delivers a failed batch again.
   batch fail until you delete its slot directory. The sink logs the offsets of
   each of those batches. See
   [Frames that QuestDB rejects](#frames-that-questdb-rejects).
-- At most once: rows the sink does not write, such as a rejected record or a
-  failed chunk, are lost, as the rest of this section describes.
+- At most once: rows the sink does not write are lost, as the rest of this
+  section describes. These are a rejected record, the unconfirmed rows of a
+  failed chunk, and the chunks behind a failed chunk.
 
 A batch fails when:
 
@@ -522,9 +562,10 @@ A batch fails when:
   connection. That report fails one later batch, although no rows were lost.
   At least once, these failures are transient, so the runtime retries the
   batch instead of stopping.
-- A chunk fails to write. If the cause is the connection, the connector skips
-  the remaining chunks of the batch. It logs the offsets and message ids of the
-  messages it did not write.
+- A chunk fails to write. The connector does not attempt the remaining chunks
+  of the batch. It logs the offsets and message ids of the messages that
+  QuestDB did not confirm, and of the messages that it did not attempt. At
+  least once, the runtime delivers the whole batch again.
 - 10 batches in a row on one topic each leave a chunk unacknowledged within
   `flush_timeout`. A single late ack is only a warning, because the frames stay
   queued and are delivered later.
@@ -584,24 +625,22 @@ writes some rows and rejects others counts as a success, so
 counts through the current SDK. Alert on the connector's logs instead. At least
 once, the first rejection fails the batch, and the runtime counts it.
 
-A record is rejected when:
+A record is rejected in the cases below. At most once, the first three lose
+only the record, and the rest of the batch is written.
 
 - **The connector rejects it before writing**: a binary payload that is not
-  UTF-8, a malformed UUID, a bad array, a value of the wrong type in a listed
-  column, a symbol value longer than 1 MiB, a missing or out-of-range
-  timestamp field, an invalid or duplicate
-  column name, or a row with no columns. At most once, the rest of the batch
-  is written.
+  UTF-8, a malformed UUID, a value of the wrong type in a listed column, a
+  symbol value longer than 1 MiB, an array that is not a rectangular array of
+  numbers, a missing, non-numeric or out-of-range timestamp field, two fields
+  that match `timestamp_field`, an invalid or duplicate column name, or a row
+  with no columns.
 - **The client rejects it while writing**, usually because a column already has
-  another type in this chunk. At most once, the rest of the batch is written.
-  At least once, the call fails with a permanent error at the record. After a
-  restart, the runtime delivers the batch again from its first message, so the
-  same conflict usually returns. Keep `numbers_as_double = true`, the default, or
-  list the column in `integer_columns`, so that every value of a numeric column
-  has one type.
+  another type in this chunk. At least once, the runtime delivers the batch
+  again from its first message after a restart, so the same conflict usually
+  returns. Keep `numbers_as_double = true`, the default, or list the column in
+  `integer_columns`, so that every value of a numeric column has one type.
 - **The message alone is larger than a frame.** The client refuses the frame
-  that holds only this message, see [Batch sizing](#batch-sizing). At most
-  once, the rest of the batch is written.
+  that holds only this message, see [Batch sizing](#batch-sizing).
 - **The server rejects the frame.** QuestDB rejects whole frames, so the
   connector fails the batch and cannot name the record.
 
@@ -635,15 +674,17 @@ margin, and let the DEDUP keys drop the rows that are written twice.
 
 4. Start the connectors runtime.
 
-The sink writes some rows a second time. To keep one copy of each row, write
-the partition and offset columns and declare the DEDUP keys that
-[Delivery semantics](#delivery-semantics) names. This does not work with
+The sink writes some rows a second time. To keep one copy of each row,
+declare the DEDUP keys that [Delivery semantics](#delivery-semantics) names.
+This does not work with
 `timestamp_source = "server"`, because the second copy gets a new timestamp.
 
 ### Reserved column names
 
 The connector writes these columns itself. A record with a payload field of the
-same name, ignoring case, is rejected.
+same name, ignoring case, is rejected. For the two header columns, this holds
+only for a record that also carries that header. In a record without the
+header, the payload field is written to the column.
 
 | Column | Written when |
 | ------ | ------------ |
@@ -651,8 +692,8 @@ same name, ignoring case, is rejected.
 | `iggy_topic` | `include_topic_column = true`, the default |
 | `iggy_partition_id` | `include_partition_column = true` |
 | `iggy_offset` | `include_offset_column = true` |
-| `header_<name>` | `include_headers = true` |
-| `iggy_header_<name>_encoding` | `include_headers = true`, for a header whose value is base64 |
+| `header_<name>` | `include_headers = true`, for a record that carries the header |
+| `iggy_header_<name>_encoding` | `include_headers = true`, for a record that carries the header with a base64 value |
 
 The `iggy_` prefix keeps these names apart from common payload fields such as
 `stream`, `topic` or `offset`, which are written as ordinary columns. A payload

@@ -39,9 +39,7 @@ use super::container::{
     HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, QuestDbContainer, QuestDbOps,
     SINK_PLUGIN_NAME, create_http_client, ensure_plugin_built,
 };
-
-const POLL_ATTEMPTS: usize = 120;
-const POLL_INTERVAL_MS: u64 = 100;
+use crate::{POLL_ATTEMPTS, POLL_INTERVAL_MS};
 
 /// Every fixture writes to its own `iggy_events_<millis>_<id>` table, because
 /// the tests share one QuestDB server. The creation time in the name is what
@@ -57,7 +55,10 @@ const STALE_TABLE_MAX_AGE_MS: u128 = 30 * 60 * 1000;
 pub const OVERSIZED_FRAME_CAP: u32 = 64 * 1024;
 
 /// Knobs the individual tests vary. Everything not set here falls back to the
-/// connector's own defaults, so a default fixture also exercises those.
+/// connector's own defaults, so a default fixture also exercises those. The
+/// runtime reads the connector's root `config.toml`, which sets at-least-once
+/// delivery and the partition and offset columns, so the fixture always
+/// states those three itself.
 #[derive(Debug, Clone, Default)]
 pub struct QuestDbSinkOptions {
     pub timestamp_source: Option<String>,
@@ -91,13 +92,14 @@ pub struct QuestDbSinkOptions {
     /// Builds DDL from the fixture's table name. It runs once the container is
     /// healthy and before the connectors runtime starts, for tests that need
     /// the table to exist with settings QWP cannot infer, such as
-    /// `DEDUP UPSERT KEYS`.
+    /// `DEDUP` keys.
     pub pre_create_ddl: Option<fn(&str) -> String>,
     /// Run on a QuestDB server of its own instead of the shared one, for a
     /// test that pauses the server.
     pub dedicated_container: bool,
     /// Run the connector with the runtime's at-least-once delivery, and a
     /// short retry backoff so that a retried batch lands within the test.
+    /// Otherwise the connector delivers at most once.
     pub at_least_once: bool,
     /// `RUST_LOG` for the connectors runtime, for a test that asserts a
     /// `debug` line. `None` keeps the runtime's `INFO` default.
@@ -476,18 +478,20 @@ impl TestFixture for QuestDbSinkFixture {
         if let Some(value) = self.options.include_topic_column {
             envs.insert(ENV_SINK_INCLUDE_TOPIC_COLUMN.to_string(), value.to_string());
         }
-        if let Some(value) = self.options.include_partition_column {
-            envs.insert(
-                ENV_SINK_INCLUDE_PARTITION_COLUMN.to_string(),
-                value.to_string(),
-            );
-        }
-        if let Some(value) = self.options.include_offset_column {
-            envs.insert(
-                ENV_SINK_INCLUDE_OFFSET_COLUMN.to_string(),
-                value.to_string(),
-            );
-        }
+        envs.insert(
+            ENV_SINK_INCLUDE_PARTITION_COLUMN.to_string(),
+            self.options
+                .include_partition_column
+                .unwrap_or(false)
+                .to_string(),
+        );
+        envs.insert(
+            ENV_SINK_INCLUDE_OFFSET_COLUMN.to_string(),
+            self.options
+                .include_offset_column
+                .unwrap_or(false)
+                .to_string(),
+        );
         if let Some(value) = self.options.numbers_as_double {
             envs.insert(ENV_SINK_NUMBERS_AS_DOUBLE.to_string(), value.to_string());
         }
@@ -500,11 +504,16 @@ impl TestFixture for QuestDbSinkFixture {
         if let Some(value) = self.options.batch_size {
             envs.insert(ENV_SINK_BATCH_SIZE.to_string(), value.to_string());
         }
+        let guarantee = if self.options.at_least_once {
+            "at_least_once"
+        } else {
+            "at_most_once"
+        };
+        envs.insert(
+            ENV_SINK_DELIVERY_GUARANTEE.to_string(),
+            guarantee.to_string(),
+        );
         if self.options.at_least_once {
-            envs.insert(
-                ENV_SINK_DELIVERY_GUARANTEE.to_string(),
-                "at_least_once".to_string(),
-            );
             envs.insert(
                 ENV_SINK_DELIVERY_RETRY_INITIAL_BACKOFF.to_string(),
                 "200ms".to_string(),
@@ -646,7 +655,7 @@ delegate_fixture!(
                 "create table {table} (iggy_stream SYMBOL, iggy_topic SYMBOL, \
                  iggy_partition_id LONG, iggy_offset LONG, seq DOUBLE, timestamp TIMESTAMP) \
                  timestamp(timestamp) partition by DAY WAL \
-                 DEDUP UPSERT KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset)"
+                 DEDUP SKIP KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset)"
             )
         }),
         ..Default::default()
@@ -762,8 +771,8 @@ delegate_fixture!(
 );
 
 delegate_fixture!(
-    /// Table pre-created with `DEDUP UPSERT KEYS`, which is the recipe the README
-    /// gives operators for the at-least-once delivery model.
+    /// Table pre-created with `DEDUP UPSERT KEYS` on a key of the payload, which
+    /// the README names for a later message that must replace an earlier one.
     QuestDbSinkDedupFixture,
     QuestDbSinkOptions {
         timestamp_source: Some("payload".to_string()),
@@ -802,6 +811,20 @@ delegate_fixture!(
         include_stream_column: Some(false),
         include_topic_column: Some(false),
         flush_timeout: Some("5s".to_string()),
+        pre_create_ddl: Some(server_rejection_ddl),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    /// The same table with two rows per chunk, so that one batch makes
+    /// several chunks and the server refuses the first one.
+    QuestDbSinkServerRejectionSmallBatchFixture,
+    QuestDbSinkOptions {
+        include_stream_column: Some(false),
+        include_topic_column: Some(false),
+        flush_timeout: Some("5s".to_string()),
+        batch_size: Some(2),
         pre_create_ddl: Some(server_rejection_ddl),
         ..Default::default()
     }

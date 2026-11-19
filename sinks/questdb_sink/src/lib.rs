@@ -21,8 +21,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -66,7 +66,7 @@ const REJECTED_PAYLOAD_PREVIEW_BYTES: usize = 512;
 /// the condition visible in the runtime's metrics.
 const PENDING_ACK_BATCHES_BEFORE_ESCALATION: u64 = 10;
 
-/// Installs a process-wide rustls crypto provider exactly once.
+/// Installs a process-wide rustls crypto provider.
 ///
 /// `rustls` picks a provider from crate features only when exactly one of
 /// `ring` and `aws-lc-rs` is linked. This plugin's own dependency graph links
@@ -78,15 +78,12 @@ const PENDING_ACK_BATCHES_BEFORE_ESCALATION: u64 = 10;
 ///
 /// The plugin is a dlopened cdylib with its own copy of `rustls`, so this
 /// install reaches the plugin's slot only and cannot affect the host. Inside
-/// the plugin the slot is still process-wide, which is why the install runs
-/// once and ignores a second attempt. This runs only for a connect string that
-/// needs TLS, so a plain `ws://` sink makes no choice it does not use.
-static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
-
+/// the plugin the slot is still process-wide, and `install_default` refuses a
+/// second install, so the result is ignored. This runs only for a connect
+/// string that needs TLS, so a plain `ws://` sink makes no choice it does not
+/// use.
 fn ensure_crypto_provider() {
-    INSTALL_CRYPTO_PROVIDER.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// Flush once the encoded buffer reaches this many bytes, independently of
@@ -106,7 +103,8 @@ fn ensure_crypto_provider() {
 /// dictionary, which a frame can have to re-ship in full. A frame cap below
 /// this bound, from `max_buf_size` or a server that advertises a smaller batch
 /// size, refuses a window before the bound fires. The chunk then builds the
-/// window again in halves until each frame fits.
+/// window again in halves until each frame fits, and the connector lowers
+/// the bound to half of the refused window for every later window.
 const DEFAULT_MAX_FLUSH_BYTES: usize = 1_000_000;
 
 /// Deserialize only. Nothing re-serializes a plugin config, and leaving
@@ -151,17 +149,20 @@ pub struct QuestDbSinkConfig {
 
 #[derive(Debug)]
 pub struct QuestDbSink {
-    pub id: u32,
+    id: u32,
     connection_string: SecretString,
     mapping: Arc<Mapping>,
     ack_level: AckLevelSetting,
-    /// The ack level that the connect string's `request_durable_ack` asks
-    /// for, read once in `new` and checked against `ack_level` in `open`.
-    /// `None` when the key is unset or holds a value that the client refuses.
-    requested_ack_level: Option<AckLevelSetting>,
     flush_timeout: Duration,
     batch_size: usize,
-    max_flush_bytes: usize,
+    /// `max_flush_bytes`, lowered once a frame cap below it refused a window,
+    /// so that later windows fit instead of failing first.
+    max_flush_bytes: Arc<AtomicUsize>,
+    /// Row vectors that earlier chunks used, so a chunk does not grow them
+    /// again from empty. The client buffer is not kept: `Buffer::clear`
+    /// keeps the column types that earlier rows pinned, so a kept buffer
+    /// would refuse a row because of a chunk that is already gone.
+    spare_scratch: std::sync::Mutex<Vec<RowScratch>>,
     verbose: bool,
     log_rejected_payload: bool,
     /// Set by the runtime's at-least-once handshake. A record that the sink
@@ -186,29 +187,38 @@ pub struct QuestDbSink {
 #[derive(Debug)]
 struct State {
     messages_processed: u64,
-    rows_written: u64,
+    rows_published: u64,
     rejected_rows: u64,
     pending_acks: u64,
     /// Consecutive batches per stream and topic that finished with at least one
-    /// chunk still unacknowledged. An acknowledged batch clears its own entry.
+    /// chunk still unacknowledged. A batch that leaves none clears its own
+    /// entry, also when it failed for another reason.
     consecutive_pending_ack_batches: HashMap<(String, String), u64>,
 }
 
 impl QuestDbSink {
     pub fn new(id: u32, config: QuestDbSinkConfig) -> Self {
-        let mut init_error = None;
+        // Every refused setting is collected, so an operator sees all of them
+        // at the first start instead of one per restart.
+        let mut refused: Vec<String> = Vec::new();
         let mut reject = |error: Error| {
-            if init_error.is_none() {
-                init_error = Some(error);
-            }
+            refused.push(match error {
+                Error::InvalidConfigValue(reason) => reason,
+                other => other.to_string(),
+            });
         };
 
+        // A source that did not parse says nothing about the field and the
+        // unit, so the checks that depend on it wait for a valid one.
+        let mut source_known = true;
         let timestamp_source = match config.timestamp_source.as_deref() {
             None => TimestampSource::default(),
             Some(raw) => raw.parse().unwrap_or_else(|UnknownVariant| {
                 reject(Error::InvalidConfigValue(format!(
-                    "timestamp_source {raw:?} is not one of message, origin, payload, server"
+                    "timestamp_source {raw:?} is not one of {}",
+                    TimestampSource::NAMES
                 )));
+                source_known = false;
                 TimestampSource::default()
             }),
         };
@@ -216,7 +226,8 @@ impl QuestDbSink {
             None => TimestampUnit::default(),
             Some(raw) => raw.parse().unwrap_or_else(|UnknownVariant| {
                 reject(Error::InvalidConfigValue(format!(
-                    "timestamp_unit {raw:?} is not one of auto, seconds (s), millis (ms), micros (us), nanos (ns)"
+                    "timestamp_unit {raw:?} is not one of {}",
+                    TimestampUnit::NAMES
                 )));
                 TimestampUnit::default()
             }),
@@ -225,6 +236,7 @@ impl QuestDbSink {
             timestamp_source == TimestampSource::Payload,
             config.timestamp_field.is_some(),
         ) {
+            _ if !source_known => {}
             (true, false) => reject(Error::InvalidConfigValue(
                 "timestamp_field is required when timestamp_source is \"payload\"".to_owned(),
             )),
@@ -237,7 +249,10 @@ impl QuestDbSink {
         }
         // The same holds for a concrete unit. `auto` is the default, and the
         // example configurations set it with every source, so it stays allowed.
-        if timestamp_source != TimestampSource::Payload && timestamp_unit != TimestampUnit::Auto {
+        if source_known
+            && timestamp_source != TimestampSource::Payload
+            && timestamp_unit != TimestampUnit::Auto
+        {
             reject(Error::InvalidConfigValue(
                 "timestamp_unit other than \"auto\" is used only when timestamp_source is \"payload\""
                     .to_owned(),
@@ -247,7 +262,8 @@ impl QuestDbSink {
         // connect string that asks for durable acks gets them. Otherwise the
         // flag would only cost the extra acknowledgements, while every flush
         // still waits only for the server to accept it.
-        let durable_ack_request = request_durable_ack(config.connection_string.expose_secret());
+        let connection_string = config.connection_string.expose_secret();
+        let durable_ack_request = connect_string_value(connection_string, "request_durable_ack");
         // A value that the client refuses asks for nothing, and the client then
         // refuses the connect string.
         let requested_ack_level = durable_ack_request.as_deref().and_then(ack_level_for);
@@ -255,7 +271,8 @@ impl QuestDbSink {
             None => requested_ack_level.unwrap_or(AckLevelSetting::Ok),
             Some(raw) => raw.parse().unwrap_or_else(|UnknownVariant| {
                 reject(Error::InvalidConfigValue(format!(
-                    "ack_level {raw:?} is not one of ok, durable, local_durable"
+                    "ack_level {raw:?} is not one of {}",
+                    AckLevelSetting::NAMES
                 )));
                 AckLevelSetting::Ok
             }),
@@ -273,7 +290,73 @@ impl QuestDbSink {
                 requested
             );
         }
+        // Durable acks are refused outright unless the connect string asks the
+        // server for them, so a config that sets one without the other fails
+        // every batch while the rows themselves land. Catch it here rather than
+        // letting the operator read that as data loss.
+        // With `local,replicated` the client trims on the replicated
+        // acknowledgement and refuses a local wait, so each level needs its own
+        // values.
+        if ack_level != AckLevelSetting::Ok && requested_ack_level != Some(ack_level) {
+            let found = match (durable_ack_request.as_deref(), requested_ack_level) {
+                (Some(value), Some(level)) => format!(
+                    "sets request_durable_ack={value}, which gives ack_level \"{}\"",
+                    level
+                ),
+                (Some(value), None) => format!(
+                    "sets request_durable_ack={value}, which the QuestDB client does not accept"
+                ),
+                // A key that the sink cannot find, although the string holds
+                // it, is a key that the client cannot parse either, such as one
+                // after a space.
+                (None, _)
+                    if connection_string
+                        .to_ascii_lowercase()
+                        .contains("request_durable_ack") =>
+                {
+                    "does not set request_durable_ack in a form that the QuestDB client \
+                     reads, which is the key in lowercase, right after `::` or a `;`, \
+                     with no space around it"
+                        .to_owned()
+                }
+                (None, _) => "does not set request_durable_ack".to_owned(),
+            };
+            let needed = if ack_level == AckLevelSetting::LocalDurable {
+                "local"
+            } else {
+                "on, replicated or local,replicated"
+            };
+            reject(Error::InvalidConfigValue(format!(
+                "ack_level is \"{}\" but the connection string {found}. The QuestDB client \
+                 needs request_durable_ack set to {needed} for that ack level",
+                ack_level
+            )));
+        }
+        // A connect string that disables verification is a test convenience, and
+        // the client only honours it when this crate was built with the
+        // `insecure-skip-verify` feature. Say which of the two applies rather
+        // than letting a production deployment carry it silently, or letting a
+        // default build fail with the client's generic configuration error. The
+        // client matches the key and the value exactly, so the sink does too.
+        if connect_string_value(connection_string, "tls_verify").as_deref() == Some("unsafe_off") {
+            if cfg!(feature = "insecure-skip-verify") {
+                warn!(
+                    "{CONNECTOR_NAME} ID: {id} has TLS certificate verification disabled through tls_verify=unsafe_off; use this only against a test server"
+                );
+            } else {
+                reject(Error::InvalidConfigValue(
+                    "the connection string sets tls_verify=unsafe_off, which this build of \
+                     the connector does not accept; rebuild it with the \
+                     insecure-skip-verify feature if a test server with a self-signed \
+                     certificate needs it"
+                        .to_owned(),
+                ));
+            }
+        }
 
+        // A value that does not parse is refused, where other sinks warn and
+        // take the default. "500" without a unit would become 30s, and this
+        // timeout decides how long a batch waits before it fails.
         let flush_timeout = match config.flush_timeout.as_deref() {
             None => DEFAULT_FLUSH_TIMEOUT,
             Some(raw) => HumanDuration::from_str(raw)
@@ -347,17 +430,21 @@ impl QuestDbSink {
             rounding_warned: Default::default(),
             header_keys: Default::default(),
         };
-        if let Err(error) = validate_column_overlap(&mapping) {
-            reject(error);
+        for conflict in column_overlaps(&mapping) {
+            reject(Error::InvalidConfigValue(conflict));
         }
         // Zero would make the chunking loop take nothing on every pass and never
         // finish, holding the FFI call open for good, so it is refused as the
         // other settings that cannot work are.
-        let mut size = |field: &str, value: Option<usize>, default: usize| {
-            size_or_default(field, value, default).unwrap_or_else(|error| {
-                reject(error);
+        let mut size = |field: &str, value: Option<usize>, default: usize| match value {
+            Some(0) => {
+                reject(Error::InvalidConfigValue(format!(
+                    "{field} must be greater than zero"
+                )));
                 default
-            })
+            }
+            Some(value) => value,
+            None => default,
         };
         let batch_size = size(
             "batch_size",
@@ -370,15 +457,18 @@ impl QuestDbSink {
             DEFAULT_MAX_FLUSH_BYTES,
         );
 
+        let init_error =
+            (!refused.is_empty()).then(|| Error::InvalidConfigValue(refused.join("; ")));
+
         Self {
             id,
             connection_string: config.connection_string,
             mapping: Arc::new(mapping),
             ack_level,
-            requested_ack_level,
             flush_timeout,
             batch_size,
-            max_flush_bytes,
+            max_flush_bytes: Arc::new(AtomicUsize::new(max_flush_bytes)),
+            spare_scratch: std::sync::Mutex::new(Vec::new()),
             verbose: config.verbose_logging.unwrap_or(false),
             log_rejected_payload: config.log_rejected_payload.unwrap_or(false),
             at_least_once: false,
@@ -388,7 +478,7 @@ impl QuestDbSink {
             db: None,
             state: Mutex::new(State {
                 messages_processed: 0,
-                rows_written: 0,
+                rows_published: 0,
                 rejected_rows: 0,
                 pending_acks: 0,
                 consecutive_pending_ack_batches: HashMap::new(),
@@ -413,18 +503,26 @@ impl QuestDbSink {
         let topic = topic_metadata.topic.clone();
         let ack_level = self.ack_level;
         let flush_timeout = self.flush_timeout;
-        let id = mode.id;
-        let max_flush_bytes = self.max_flush_bytes;
+        let max_flush_bytes = Arc::clone(&self.max_flush_bytes);
         // Taken before the messages move into the task, so a panic in it can
         // still be reported by offset.
         let whole_chunk = MessageRange::of(&messages);
+        // A lock poisoned by a panic in another chunk holds no torn state,
+        // because a spare is pushed or popped whole.
+        let spare = self
+            .spare_scratch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop();
 
         // `questdb-rs` is synchronous: the QWP driver owns its own I/O thread
         // and `flush` / `wait` block. Row building is cheap but is done here
         // too, so the whole batch crosses the boundary exactly once.
-        let handle = tokio::task::spawn_blocking(
-            move || -> Result<BatchOutcome, Box<ChunkFailure>> {
-                let db: &QuestDb = &db;
+        let handle = tokio::task::spawn_blocking(move || {
+            let db: &QuestDb = &db;
+            let mut buffer = db.new_buffer();
+            let mut scratch = spare.unwrap_or_default();
+            let result = (|| -> Result<BatchOutcome, Box<ChunkFailure>> {
                 let context = RowContext {
                     stream: &stream,
                     topic: &topic,
@@ -435,7 +533,13 @@ impl QuestDbSink {
                 // an acknowledgement, so a window counts as confirmed when the
                 // acknowledged watermark covers its frame, and when the chunk
                 // stops everything past the last such window is unconfirmed.
-                let mut windows = ChunkWindows::new(ack_level, flush_timeout, mode, already_logged);
+                let mut windows = ChunkWindows::new(
+                    ack_level,
+                    flush_timeout,
+                    mode,
+                    already_logged,
+                    &max_flush_bytes,
+                );
                 // Index of the first message in the window being buffered, so
                 // a window that leaves unconfirmed can be named by offset.
                 let mut window_start = 0usize;
@@ -450,42 +554,78 @@ impl QuestDbSink {
                         return Err(chunk_stop(failure, outcome, (0, 0), 0, &messages, mode));
                     }
                 };
-                let mut buffer = sender.new_buffer();
-                let mut scratch = RowScratch::default();
                 let rows = ChunkRows {
                     mapping: &mapping,
                     context,
                     messages: &messages,
                 };
+                // Read once here and again after a publish, which is the one
+                // place where this chunk lowers the bound. A load for every row
+                // would read the cache line that every chunk writes.
+                let mut flush_bytes = max_flush_bytes.load(Ordering::Relaxed);
+                // The buffer size after the last written row, and the size of
+                // that row.
+                let mut buffered = buffer.len();
+                let mut last_row = 0usize;
                 for (index, message) in messages.iter().enumerate() {
                     // Publish before the buffer can outgrow the QWP per-frame
                     // cap. `batch_size` bounds rows, not bytes, so a batch of
                     // wide rows would otherwise be rejected whole and lose
-                    // every row in it. A row that takes the buffer to
-                    // `max_flush_bytes` is rolled back to the marker, the rows
-                    // in front of it are published, and the row starts the
-                    // next window. A message wider than a frame then fails in a
-                    // window of its own, which names it by offset and costs no
-                    // other row. The window is only published here: waiting
-                    // for each one would cost a server round trip per window,
-                    // while the final `wait` covers every frame of the lease.
-                    // The size read takes an uncontended lock and sums cheap
-                    // counters over the columns of the table, so its cost
-                    // grows with the column count, not with the rows buffered.
-                    // A marker that is not rewound stays set: the next one
-                    // replaces it and reuses its storage, while clearing it
-                    // would free that storage and cost an allocation per row.
+                    // every row in it. The window is only published here:
+                    // waiting for each one would cost a server round trip per
+                    // window, while the final `wait` covers every frame of the
+                    // lease.
+                    //
+                    // The window is published first when a row as large as the
+                    // last one would take the buffer to `max_flush_bytes`, so
+                    // that rows of a steady size are built once.
+                    if buffer.row_count() > 0 && buffered.saturating_add(last_row) >= flush_bytes {
+                        windows.publish_window(
+                            &mut sender,
+                            &mut buffer,
+                            window_start..index,
+                            &mut outcome,
+                            &rows,
+                            &mut scratch,
+                        )?;
+                        flush_bytes = max_flush_bytes.load(Ordering::Relaxed);
+                        buffered = buffer.len();
+                    }
                     // A window starts at its first written row, so that a
                     // window of one row names that row's message.
                     if buffer.row_count() == 0 {
                         window_start = index;
                     }
+                    // A row that is larger than the last one can still take the
+                    // buffer to the bound. It is rolled back to the marker, the
+                    // rows in front of it are published, and the row is built
+                    // again as the start of the next window. A message wider
+                    // than a frame then fails in a window of its own, which
+                    // names it by offset and costs no other row. The size read
+                    // takes an uncontended lock and sums cheap counters over
+                    // the columns of the table, so its cost grows with the
+                    // column count, not with the rows buffered. A marker that is
+                    // not rewound stays set: the next one replaces it and
+                    // reuses its storage, while clearing it would free that
+                    // storage and cost an allocation per row.
                     let marked = buffer.row_count() > 0 && buffer.set_marker().is_ok();
-                    let mut appended =
-                        mapping.append_row_with(&mut buffer, message, context, &mut scratch);
+                    // The row, and the buffer size after it. A row that was
+                    // not written leaves the size where it was.
+                    let append = |buffer: &mut questdb::ingress::Buffer,
+                                  scratch: &mut RowScratch,
+                                  buffered: usize| {
+                        let appended = mapping.append_row_with(buffer, message, context, scratch);
+                        let size = if appended.is_ok() {
+                            buffer.len()
+                        } else {
+                            buffered
+                        };
+                        (appended, size)
+                    };
+                    let (mut appended, mut size) = append(&mut buffer, &mut scratch, buffered);
                     if marked
                         && appended.is_ok()
-                        && buffer.len() >= max_flush_bytes
+                        && size >= flush_bytes
                         && buffer.rewind_to_marker().is_ok()
                     {
                         windows.publish_window(
@@ -496,14 +636,16 @@ impl QuestDbSink {
                             &rows,
                             &mut scratch,
                         )?;
+                        flush_bytes = max_flush_bytes.load(Ordering::Relaxed);
+                        buffered = buffer.len();
                         window_start = index;
-                        appended =
-                            mapping.append_row_with(&mut buffer, message, context, &mut scratch);
+                        (appended, size) = append(&mut buffer, &mut scratch, buffered);
                     }
 
                     let reason = match appended {
                         Ok(()) => {
-                            outcome.rows_written += 1;
+                            last_row = size.saturating_sub(buffered);
+                            buffered = size;
                             continue;
                         }
                         Err(RowError::Invalid(reason)) => reason,
@@ -520,34 +662,24 @@ impl QuestDbSink {
                         // pinned the column usually shares the chunk again, and
                         // the retries would repeat the conflict until they ran out.
                         Err(RowError::Client(error)) => error.to_string(),
-                        // `Buffer::at` refused the row. For a negative timestamp
-                        // it skips the rollback, so the buffer can hold a partial
-                        // row that only the marker can remove.
-                        // `Mapping::prepare_timestamp` rejects every negative
-                        // value, which is what keeps this unreachable.
+                        // `Buffer::at` refused the row, and for a negative
+                        // timestamp it leaves the row half written.
+                        // `Mapping::prepare_timestamp` rejects every value that
+                        // `at` refuses, so this is unreachable. If it happens
+                        // anyway, the buffer cannot be trusted, so the chunk
+                        // stops and publishes nothing that the buffer holds.
                         Err(RowError::Unrecoverable(error)) => {
-                            // The marker taken before the row removes the
-                            // partial row and keeps the rows in front of it.
-                            // Without one, publishing the buffer would risk
-                            // carrying the partial row along, so the whole
-                            // window goes. The rows already counted as written
-                            // are uncounted again rather than reported as
-                            // delivered.
-                            if !(marked && buffer.rewind_to_marker().is_ok()) {
-                                let discarded = buffer.row_count();
-                                if let window @ Some(_) =
-                                    MessageRange::of(&messages[window_start..index])
-                                {
-                                    error!(
-                                        "{CONNECTOR_NAME} ID: {id} discarded {discarded} unflushed rows after the client refused a designated timestamp, stream: {stream}, topic: {topic}, partition_id: {partition_id}, {}: {error}",
-                                        WindowLabel(window)
-                                    );
-                                }
-                                outcome.rows_written -= discarded;
-                                outcome.rejected_rows += discarded;
-                                buffer = sender.new_buffer();
-                            }
-                            error.to_string()
+                            let failure = FlushError {
+                                phase: FlushPhase::Publishing,
+                                error,
+                            };
+                            return Err(windows.settle_and_stop(
+                                &mut sender,
+                                failure,
+                                outcome,
+                                index,
+                                &messages,
+                            ));
                         }
                     };
 
@@ -593,20 +725,26 @@ impl QuestDbSink {
                     return Err(windows.stop(failure, outcome, messages.len(), &messages));
                 }
                 Ok(outcome)
-            },
-        );
+            })();
+            scratch.forget_header_keys();
+            (result, scratch)
+        });
 
         match handle.await {
-            Ok(result) => result,
-            // The blocking task panicked, so nothing about the chunk is known.
-            // Every message is reported as undelivered and the connection as
-            // suspect, which is the conservative reading of both unknowns.
+            Ok((result, spare)) => {
+                self.spare_scratch
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(spare);
+                result
+            }
+            // The blocking task panicked, so nothing about the chunk is known,
+            // and every message of it is reported as undelivered.
             Err(error) => Err(Box::new(ChunkFailure {
                 error: Error::CannotStoreData(format!(
                     "{CONNECTOR_NAME} ID: {}: blocking flush task failed: {error}",
                     mode.id
                 )),
-                stops_batch: true,
                 server_rejection: false,
                 undelivered: whole_chunk,
                 attempted: 0,
@@ -662,8 +800,8 @@ impl QuestDbSink {
     /// logged: `consume` returns one error for the batch, and the runtime logs
     /// that one.
     /// `what` says which kind: the failed chunk's own messages from its last
-    /// acknowledged window onward, or the chunks behind it that the loop did
-    /// not attempt because the connection was at fault.
+    /// acknowledged window onward, or the chunks behind it, which an
+    /// at-most-once batch does not attempt.
     fn log_undelivered(
         &self,
         topic_metadata: &TopicMetadata,
@@ -698,76 +836,6 @@ impl QuestDbSink {
             .starts_with("wss:");
         if uses_tls {
             ensure_crypto_provider();
-        }
-        // A connect string that disables verification is a test convenience, and
-        // the client only honours it when this crate was built with the
-        // `insecure-skip-verify` feature. Say which of the two applies rather
-        // than letting a production deployment carry it silently, or letting a
-        // default build fail with the client's generic configuration error.
-        if connection_string
-            .to_ascii_lowercase()
-            .contains("tls_verify=unsafe_off")
-        {
-            if cfg!(feature = "insecure-skip-verify") {
-                warn!(
-                    "{CONNECTOR_NAME} ID: {} has TLS certificate verification disabled through tls_verify=unsafe_off; use this only against a test server",
-                    self.id
-                );
-            } else {
-                return Err(Error::InvalidConfigValue(
-                    "the connection string sets tls_verify=unsafe_off, which this build of \
-                     the connector does not accept; rebuild it with the \
-                     insecure-skip-verify feature if a test server with a self-signed \
-                     certificate needs it"
-                        .to_owned(),
-                ));
-            }
-        }
-        // Durable acks are refused outright unless the connect string asks the
-        // server for them, so a config that sets one without the other fails
-        // every batch while the rows themselves land. Catch it here rather than
-        // letting the operator read that as data loss.
-        // With `local,replicated` the client trims on the replicated
-        // acknowledgement and refuses a local wait, so each level needs its own
-        // values.
-        let requested = self.requested_ack_level;
-        if self.ack_level != AckLevelSetting::Ok && requested != Some(self.ack_level) {
-            // Read again only for the message, on this path that fails the
-            // start.
-            let durable_ack_request = request_durable_ack(&connection_string);
-            let found = match (durable_ack_request.as_deref(), requested) {
-                (Some(value), Some(level)) => format!(
-                    "sets request_durable_ack={value}, which gives ack_level \"{}\"",
-                    level
-                ),
-                (Some(value), None) => format!(
-                    "sets request_durable_ack={value}, which the QuestDB client does not accept"
-                ),
-                // A key that the sink cannot find, although the string holds
-                // it, is a key that the client cannot parse either, such as one
-                // after a space.
-                (None, _)
-                    if connection_string
-                        .to_ascii_lowercase()
-                        .contains("request_durable_ack") =>
-                {
-                    "does not set request_durable_ack in a form that the QuestDB client \
-                     reads, which is the key in lowercase, right after `::` or a `;`, \
-                     with no space around it"
-                        .to_owned()
-                }
-                (None, _) => "does not set request_durable_ack".to_owned(),
-            };
-            let needed = if self.ack_level == AckLevelSetting::LocalDurable {
-                "local"
-            } else {
-                "on, replicated or local,replicated"
-            };
-            return Err(Error::InvalidConfigValue(format!(
-                "ack_level is \"{}\" but the connection string {found}. The QuestDB client \
-                 needs request_durable_ack set to {needed} for that ack level",
-                self.ack_level
-            )));
         }
 
         let id = self.id;
@@ -804,8 +872,9 @@ impl QuestDbSink {
         if self.ack_level == AckLevelSetting::Durable {
             // A node without WAL shipping accepts the rows and simply never
             // advances the durable watermark, so the failure shows up as
-            // acknowledgement lag rather than a connect error.
-            warn!(
+            // acknowledgement lag rather than a connect error. A correct
+            // cluster logs this at every start too, so it is not a warning.
+            info!(
                 "{CONNECTOR_NAME} ID: {} requests durable acks; this needs QuestDB Enterprise with \
                  replication configured, otherwise no chunk is ever acknowledged within {:?}",
                 self.id, self.flush_timeout
@@ -865,7 +934,7 @@ impl Sink for QuestDbSink {
         let mut failure: Option<Error> = None;
         // Messages the chunk loop appended or individually rejected, which is
         // what `messages_processed` means. A chunk that stopped early and the
-        // chunks behind a connection failure were never processed.
+        // chunks behind a failed chunk were never processed.
         let mut attempted = 0usize;
         let mut mode = ChunkMode {
             id: self.id,
@@ -908,7 +977,6 @@ impl Sink for QuestDbSink {
                 Err(chunk_failure) => {
                     let ChunkFailure {
                         error,
-                        stops_batch,
                         server_rejection,
                         undelivered,
                         attempted: chunk_attempted,
@@ -952,26 +1020,29 @@ impl Sink for QuestDbSink {
                         undelivered,
                         &error,
                     );
-                    // At least once, the chunks behind this one would only be
-                    // written twice, so the loop ends. At most once, ending it
-                    // would discard every chunk still queued behind this one,
-                    // at offsets the runtime committed before `consume` ran.
-                    // Only a failure that belongs to the connection ends it
-                    // then, because the chunks behind it would fail the same
-                    // way and each would spend its own timeout finding out.
-                    if stops_batch && !self.at_least_once {
+                    // A failed chunk ends the batch. At least once, the runtime
+                    // delivers the whole batch again, so the chunks behind
+                    // this one would only be written twice. At most once, the
+                    // sink makes one attempt and does not try to save the rest
+                    // of the batch. Whether a later chunk can succeed depends
+                    // on the state in which the failure left the connection,
+                    // and the runtime never replays, so a rescue that misjudges
+                    // that state only moves the loss. The two lines name
+                    // every message from the first unconfirmed one to the end
+                    // of the batch, which is where an operator rewinds to. A
+                    // deployment that cannot lose rows sets
+                    // `guarantee = "at_least_once"`.
+                    if !self.at_least_once {
                         self.log_undelivered(
                             topic_metadata,
                             messages_metadata.partition_id,
-                            "abandoned without a write attempt after a connection failure",
+                            "not attempted, because an earlier chunk of this batch failed",
                             MessageRange::of(messages.as_slice()),
                             &error,
                         );
                     }
-                    failure.get_or_insert(error);
-                    if self.at_least_once || stops_batch {
-                        break;
-                    }
+                    failure = Some(error);
+                    break;
                 }
             }
         }
@@ -994,7 +1065,7 @@ impl Sink for QuestDbSink {
 
         let mut state = self.state.lock().await;
         state.messages_processed += attempted as u64;
-        state.rows_written += total.rows_written as u64;
+        state.rows_published += total.rows_published as u64;
         state.rejected_rows += total.rejected_rows as u64;
         state.pending_acks += total.pending_acks as u64;
         // Keyed by stream and topic, because the runtime runs one `consume` per
@@ -1047,7 +1118,7 @@ impl Sink for QuestDbSink {
         // queued and the stall ends when the server acknowledges again. At
         // least once, a pending acknowledgement already fails its own batch,
         // so no run starts.
-        if should_escalate_stall(stalled) {
+        if stalled >= PENDING_ACK_BATCHES_BEFORE_ESCALATION {
             return Err(Error::CannotStoreData(format!(
                 "{CONNECTOR_NAME} ID: {}: the last {stalled} batches left chunks that QuestDB did not acknowledge at ack_level {}; the frames are queued but nothing is being committed",
                 self.id, self.ack_level
@@ -1072,11 +1143,11 @@ impl Sink for QuestDbSink {
         // delivery is still at least once, so this warns instead of refusing.
         match self.mapping.timestamp_source {
             TimestampSource::Server => warn!(
-                "{CONNECTOR_NAME} ID: {} delivers at least once with timestamp_source = \"server\": QuestDB stamps each retried copy anew, so DEDUP UPSERT KEYS cannot remove the duplicates; use the message timestamp to make retries idempotent",
+                "{CONNECTOR_NAME} ID: {} delivers at least once with timestamp_source = \"server\": QuestDB stamps each retried copy anew, so DEDUP keys cannot remove the duplicates; use the message timestamp to make retries idempotent",
                 self.id
             ),
             TimestampSource::Origin => warn!(
-                "{CONNECTOR_NAME} ID: {} delivers at least once with timestamp_source = \"origin\": a message without an origin timestamp takes the connector's clock, so DEDUP UPSERT KEYS cannot remove its retried copies",
+                "{CONNECTOR_NAME} ID: {} delivers at least once with timestamp_source = \"origin\": a message without an origin timestamp takes the connector's clock, so DEDUP keys cannot remove its retried copies",
                 self.id
             ),
             TimestampSource::Message | TimestampSource::Payload => {}
@@ -1114,10 +1185,10 @@ impl Sink for QuestDbSink {
         // failed chunk adds only the rows that QuestDB confirmed, and a lost
         // window adds none.
         info!(
-            "Closed {CONNECTOR_NAME} connector ID: {}, processed: {}, rows buffered: {}, rejected: {}, chunks awaiting ack: {}",
+            "Closed {CONNECTOR_NAME} connector ID: {}, processed: {}, rows buffered: {}, rejected: {}, chunks with a late ack: {}",
             self.id,
             state.messages_processed,
-            state.rows_written,
+            state.rows_published,
             state.rejected_rows,
             state.pending_acks
         );
@@ -1127,7 +1198,7 @@ impl Sink for QuestDbSink {
 
 #[derive(Debug, Default)]
 struct BatchOutcome {
-    rows_written: usize,
+    rows_published: usize,
     rejected_rows: usize,
     /// Chunks whose acknowledgement had not arrived before the timeout. The
     /// rows stay queued and are still being delivered, so this is lag, not
@@ -1141,7 +1212,7 @@ struct BatchOutcome {
 
 impl BatchOutcome {
     fn merge(&mut self, other: BatchOutcome) {
-        self.rows_written += other.rows_written;
+        self.rows_published += other.rows_published;
         self.rejected_rows += other.rejected_rows;
         self.pending_acks += other.pending_acks;
         if other.last_rejection.is_some() {
@@ -1157,75 +1228,24 @@ impl BatchOutcome {
 /// large or binary message cannot blow up the log line.
 fn payload_preview(payload: &Payload) -> String {
     match payload {
-        // Rendered through a writer that keeps only the preview's worth of
-        // bytes, so a large rejected document is never held as one string.
-        Payload::Json(value) => {
-            let mut capped = CappedWriter::default();
-            if simd_json::to_writer(&mut capped, value).is_err() {
-                return "<unrenderable>".to_owned();
-            }
-            capped.into_preview()
-        }
-        Payload::Text(text) | Payload::Proto(text) => truncate_preview(text, text.len()),
+        Payload::Json(value) => match simd_json::to_string(value) {
+            Ok(text) => truncate_preview(&text),
+            Err(_) => "<unrenderable>".to_owned(),
+        },
+        Payload::Text(text) | Payload::Proto(text) => truncate_preview(text),
         Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
             format!("<{} bytes>", bytes.len())
         }
     }
 }
 
-/// Cuts `head` to the preview limit on a char boundary. `total` is the full
-/// rendered length, which `head` may already have been cut short of.
-fn truncate_preview(head: &str, total: usize) -> String {
-    if total <= REJECTED_PAYLOAD_PREVIEW_BYTES {
-        return head.to_owned();
+/// Cuts `text` to the preview limit on a char boundary.
+fn truncate_preview(text: &str) -> String {
+    if text.len() <= REJECTED_PAYLOAD_PREVIEW_BYTES {
+        return text.to_owned();
     }
-    let end = head.floor_char_boundary(REJECTED_PAYLOAD_PREVIEW_BYTES);
-    format!("{}… ({total} bytes total)", &head[..end])
-}
-
-/// Keeps the first preview's worth of what is written to it and counts the
-/// rest.
-#[derive(Default)]
-struct CappedWriter {
-    head: Vec<u8>,
-    total: usize,
-}
-
-impl CappedWriter {
-    fn into_preview(self) -> String {
-        // The cap can split a multi-byte character, so only the valid prefix
-        // is kept.
-        let head = self
-            .head
-            .utf8_chunks()
-            .next()
-            .map_or("", |chunk| chunk.valid());
-        truncate_preview(head, self.total)
-    }
-}
-
-impl std::io::Write for CappedWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let room = REJECTED_PAYLOAD_PREVIEW_BYTES.saturating_sub(self.head.len());
-        self.head.extend_from_slice(&bytes[..room.min(bytes.len())]);
-        self.total += bytes.len();
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// The configured size, or the default when it is unset. Zero is refused.
-fn size_or_default(field: &str, value: Option<usize>, default: usize) -> Result<usize, Error> {
-    match value {
-        None => Ok(default),
-        Some(0) => Err(Error::InvalidConfigValue(format!(
-            "{field} must be greater than zero"
-        ))),
-        Some(value) => Ok(value),
-    }
+    let end = text.floor_char_boundary(REJECTED_PAYLOAD_PREVIEW_BYTES);
+    format!("{}… ({} bytes total)", &text[..end], text.len())
 }
 
 /// The ack level that a `request_durable_ack` value selects, or `None` for a
@@ -1244,16 +1264,17 @@ fn ack_level_for(value: &str) -> Option<AckLevelSetting> {
     }
 }
 
-/// The value of `request_durable_ack`, read with the grammar of the client:
-/// the keys follow `<service>::`, and `;;` in a value is a literal `;`.
-/// `questdb_confstr::parse_conf_str` refuses a repeated key, but the client
-/// accepts a repeated `addr` for failover, so it cannot read the raw string.
-fn request_durable_ack(connection_string: &str) -> Option<String> {
+/// The value of `wanted` in a connect string, read with the grammar of the
+/// client: the keys follow `<service>::`, and `;;` in a value is a literal
+/// `;`. `questdb_confstr::parse_conf_str` refuses a repeated key, but the
+/// client accepts a repeated `addr` for failover, so it cannot read the raw
+/// string.
+fn connect_string_value(connection_string: &str, wanted: &str) -> Option<String> {
     let (_, mut rest) = connection_string.split_once("::")?;
     while !rest.is_empty() {
         let (key, after_key) = rest.split_once('=')?;
         let end = value_end(after_key);
-        if key == "request_durable_ack" {
+        if key == wanted {
             // Every `;` before `end` is half of a `;;` pair.
             return Some(after_key[..end].replace(";;", ";"));
         }
@@ -1287,6 +1308,11 @@ enum AckLevelSetting {
     Ok,
     Durable,
     LocalDurable,
+}
+
+impl AckLevelSetting {
+    /// The accepted names, for the error of a value that is none of them.
+    const NAMES: &'static str = "ok, durable, local_durable";
 }
 
 /// Matched without regard to case, as the timestamp settings are.
@@ -1325,41 +1351,45 @@ impl From<AckLevelSetting> for AckLevel {
 
 /// A column has one type. It cannot be two of `SYMBOL`, `UUID` and `LONG`, and
 /// none of them can double as the designated timestamp. Catching it here beats a
-/// per-row failure later.
-fn validate_column_overlap(mapping: &Mapping) -> Result<(), Error> {
+/// per-row failure later. Every conflict is returned, so that one start names
+/// all of them.
+fn column_overlaps(mapping: &Mapping) -> Vec<String> {
     let lists = [
         ("symbol_columns", &mapping.symbol_columns),
         ("uuid_columns", &mapping.uuid_columns),
         ("integer_columns", &mapping.integer_columns),
     ];
+    let mut conflicts = Vec::new();
     for (index, (name, columns)) in lists.iter().enumerate() {
         for (other_name, other) in &lists[index + 1..] {
-            if let Some(column) = columns.iter().find(|column| other.contains(column)) {
-                return Err(Error::InvalidConfigValue(format!(
+            for column in columns.iter().filter(|column| other.contains(column)) {
+                conflicts.push(format!(
                     "column {column} is listed in both {name} and {other_name}"
-                )));
+                ));
             }
         }
     }
-    if let Some(field) = mapping.timestamp_field.as_deref()
-        && let Some((name, _)) = lists.iter().find(|(_, columns)| columns.contains(field))
-    {
-        return Err(Error::InvalidConfigValue(format!(
-            "timestamp_field {field} cannot also be listed in {name}"
-        )));
-    }
-    // The connector writes the enabled metadata columns itself, and a payload
-    // field of the same name is rejected per record. A configured column of
-    // that name would therefore reject every record that carries it, which is
-    // a configuration mistake rather than a data one.
-    for (reserved, flag) in mapping.reserved_columns_with_flags() {
-        if let Some((name, _)) = lists.iter().find(|(_, columns)| columns.contains(reserved)) {
-            return Err(Error::InvalidConfigValue(format!(
-                "column {reserved} is listed in {name} but the connector writes a metadata column of that name; set {flag} = false or rename the field"
-            )));
+    for (name, columns) in &lists {
+        if let Some(field) = mapping.timestamp_field.as_deref()
+            && columns.contains(field)
+        {
+            conflicts.push(format!(
+                "timestamp_field {field} cannot also be listed in {name}"
+            ));
+        }
+        // The connector writes the enabled metadata columns itself, and a
+        // payload field of the same name is rejected per record. A configured
+        // column of that name would therefore reject every record that
+        // carries it, which is a configuration mistake rather than a data one.
+        for (reserved, flag) in mapping.reserved_columns_with_flags() {
+            if columns.contains(reserved) {
+                conflicts.push(format!(
+                    "column {reserved} is listed in {name} but the connector writes a metadata column of that name; set {flag} = false or rename the field"
+                ));
+            }
         }
     }
-    Ok(())
+    conflicts
 }
 
 /// Which half of the flush failed.
@@ -1471,9 +1501,13 @@ enum StopCause {
     /// lease left queued on the borrowed connection, so the rows of this
     /// chunk are not at fault. See [`ChunkWindows::cause`].
     Inherited(FlushError),
-    /// At least once, the sink refused a record. The call fails at it, so
-    /// that the runtime stops the delivery there instead of losing it.
-    Rejected(String),
+    /// At least once, the sink refused the record at `offset`. The call fails
+    /// at it, so that the runtime stops the delivery there instead of losing
+    /// it.
+    Rejected {
+        offset: u64,
+        reason: String,
+    },
 }
 
 /// Classifies a stopped chunk for `consume`.
@@ -1485,25 +1519,14 @@ enum StopCause {
 /// refused, or never appended. A connection that latched keeps the last
 /// watermark read before the latch, so the windows that it covers stay
 /// confirmed. `attempted` is the index at which the loop stopped appending,
-/// so the messages before it were written or individually rejected and logged.
+/// or the index after a record that stopped it, so the messages before it
+/// were written or individually rejected and logged.
 ///
-/// Three things are decided here and nowhere else. Whether the error is
-/// reported as transient or permanent is [`map_client_error`]. Whether the
-/// batch stops is a different question, and only at most once: at least
-/// once, `consume` ends the loop on every failure, because the runtime
-/// delivers the whole batch again. At most once, a
-/// failure that belongs to the connection, which is every borrow failure and
-/// every transient code, would recur on the next chunk and cost it a timeout,
-/// so the loop ends. A full symbol dictionary is the one transient fault that
-/// does not recur, because returning the sender retires that connection and
-/// the next borrow dials a fresh one, so it does not stop the loop. Under
-/// `sf_dir` the next connection re-seeds the dictionary from the slot until
-/// the slot drains, so each chunk can fail once more. It still does not stop
-/// the loop, because each later chunk can succeed. A failure that belongs to
-/// the frame, such as a server rejection, does not stop the chunks behind it
-/// either. Whether a token has to be retired is the third: the handler counts
-/// a terminal rejection on its own thread, so a chunk that failed on one has
-/// to retire that count.
+/// Two things are decided here and nowhere else. Whether the error is
+/// reported as transient or permanent is [`map_client_error`]. Whether a
+/// token has to be retired is the second: the handler counts a terminal
+/// rejection on its own thread, so a chunk that failed on one has to retire
+/// that count. A stopped chunk always ends its batch, see `consume`.
 fn chunk_stop(
     cause: StopCause,
     mut outcome: BatchOutcome,
@@ -1512,21 +1535,17 @@ fn chunk_stop(
     messages: &[ConsumedMessage],
     mode: ChunkMode,
 ) -> Box<ChunkFailure> {
-    // `rows_written` grew at append time, so the rows of every unconfirmed
+    // `rows_published` grew at each publish, so the rows of every unconfirmed
     // window are in it and come out again here.
-    outcome.rows_written = confirmed_rows;
-    let (error, stops_batch, server_rejection) = match cause {
+    outcome.rows_published = confirmed_rows;
+    let (error, server_rejection) = match cause {
         // The runtime names the first offset of the run in its stop reason,
         // so the error names the record that stopped it.
-        StopCause::Rejected(reason) => (
-            Error::InvalidRecordValue(match messages.get(attempted) {
-                Some(message) => format!(
-                    "{CONNECTOR_NAME} ID: {}: rejected message at offset {}: {reason}",
-                    mode.id, message.offset
-                ),
-                None => format!("{CONNECTOR_NAME} ID: {}: {reason}", mode.id),
-            }),
-            false,
+        StopCause::Rejected { offset, reason } => (
+            Error::InvalidRecordValue(format!(
+                "{CONNECTOR_NAME} ID: {}: rejected message at offset {offset}: {reason}",
+                mode.id
+            )),
             false,
         ),
         // The frame is another chunk's, and that chunk's own retry meets the
@@ -1538,23 +1557,15 @@ fn chunk_stop(
                 "{CONNECTOR_NAME} ID: {}: QuestDB rejected a frame that an earlier chunk left on this connection: {}",
                 mode.id, failure.error
             )),
-            false,
             true,
         ),
         StopCause::Flush(failure) => {
-            let code = failure.error.code();
-            let stops_batch = failure.phase == FlushPhase::Borrowing
-                || (is_transient(&failure.error) && code != ErrorCode::SymbolDictFull);
-            (
-                map_client_error(mode, failure),
-                stops_batch,
-                code == ErrorCode::ServerRejection,
-            )
+            let server_rejection = failure.error.code() == ErrorCode::ServerRejection;
+            (map_client_error(mode, failure), server_rejection)
         }
     };
     Box::new(ChunkFailure {
         error,
-        stops_batch,
         server_rejection,
         undelivered: MessageRange::of(&messages[confirmed_to..]),
         attempted,
@@ -1607,12 +1618,13 @@ fn map_client_error(mode: ChunkMode, failure: FlushError) -> Error {
 /// Whether an at-most-once chunk can go on past a window whose publish
 /// failed.
 ///
-/// A permanent error that is not a server rejection belongs to that frame
-/// alone, for example a frame over the size cap, and the connection can
-/// still publish the rest of the chunk. A server rejection latches the
-/// connection, and a transient error belongs to it, so both stop the chunk.
-/// At least once, the call fails instead, and the runtime delivers the batch
-/// again.
+/// A permanent error that is not a server rejection is taken as the fault of
+/// that frame alone, so the chunk tries the next window. `publish_window`
+/// handles a frame over the size cap before it asks. A server rejection
+/// latches the connection, and a transient error belongs to it, so both stop
+/// the chunk. A connection that latched on another permanent error fails
+/// every later window too, and each one is logged as lost. At least once,
+/// the call fails instead, and the runtime delivers the batch again.
 fn skip_window(failure: &FlushError, mode: ChunkMode) -> bool {
     !mode.at_least_once
         && !is_transient(&failure.error)
@@ -1620,9 +1632,8 @@ fn skip_window(failure: &FlushError, mode: ChunkMode) -> bool {
 }
 
 /// Records a window that an at-most-once chunk lost to its own publish
-/// failure, and logs the messages that it held by offset. The rows of the
-/// window come out of `rows_written`, and the error fails the batch once the
-/// rest of it is written.
+/// failure, and logs the messages that it held by offset. The error fails
+/// the batch once the rest of it is written.
 fn lose_window(
     outcome: &mut BatchOutcome,
     rows: usize,
@@ -1642,16 +1653,12 @@ fn lose_window(
         mode.id,
         WindowLabel(window)
     );
-    outcome.rows_written -= rows;
     outcome.window_failure.get_or_insert(error);
 }
 
 /// A failed chunk, classified for `consume`.
 struct ChunkFailure {
     error: Error,
-    /// The failure belongs to the connection rather than to the frame, so the
-    /// chunks behind this one would fail the same way. Read at most once only.
-    stops_batch: bool,
     /// The failure was a terminal server rejection, which the handler counts
     /// as well, so one token has to be retired for it.
     server_rejection: bool,
@@ -1724,26 +1731,6 @@ fn settle_rejections(
         .then_some(Unclaimed::Rejection)
 }
 
-/// Whether this rejection still fits the batch's `error` budget.
-///
-/// `already_logged` carries the rejections of earlier chunks of the same runtime
-/// batch, so the budget spans the batch rather than restarting for each chunk.
-/// Past it the record is logged at `debug` instead, which bounds the error log
-/// without losing the record's identity.
-fn should_log_rejection(already_logged: usize, rejected_in_chunk: usize) -> bool {
-    already_logged + rejected_in_chunk <= MAX_LOGGED_REJECTIONS_PER_BATCH
-}
-
-/// Whether a run of unacknowledged batches has gone on long enough to report.
-///
-/// One unacknowledged flush is delivery lag. A run of them means the server has
-/// stopped acknowledging, and reporting every one of those batches as a success
-/// would leave the runtime's metrics showing a healthy connector while nothing
-/// is committed.
-fn should_escalate_stall(consecutive_batches: u64) -> bool {
-    consecutive_batches >= PENDING_ACK_BATCHES_BEFORE_ESCALATION
-}
-
 /// The windows a chunk published, and how far QuestDB confirmed them.
 ///
 /// The acknowledged watermark is read after every publish and kept. The
@@ -1753,27 +1740,31 @@ fn should_escalate_stall(consecutive_batches: u64) -> bool {
 /// Reading more often takes a lock that the client's I/O thread also takes,
 /// so once per window is the bound.
 #[derive(Debug)]
-struct ChunkWindows {
+struct ChunkWindows<'a> {
     ack_level: AckLevelSetting,
     flush_timeout: Duration,
     mode: ChunkMode,
-    /// The rejections that earlier chunks of the batch logged, for the
-    /// `error` budget of [`should_log_rejection`].
+    /// The rejections that earlier chunks of the batch logged, so that the
+    /// `error` budget of [`MAX_LOGGED_REJECTIONS_PER_BATCH`] spans the batch
+    /// rather than restarting for each chunk.
     already_logged: usize,
     /// The messages that the chunk rejected at most once, in order. They hold
     /// no row, so a window that is too large for a frame is built again
     /// without them.
     skipped: Vec<usize>,
+    /// The connector's byte bound for a window, which a refused window lowers.
+    max_flush_bytes: &'a AtomicUsize,
     windows: Vec<PublishedWindow>,
     acked: Option<u64>,
 }
 
-impl ChunkWindows {
+impl<'a> ChunkWindows<'a> {
     fn new(
         ack_level: AckLevelSetting,
         flush_timeout: Duration,
         mode: ChunkMode,
         already_logged: usize,
+        max_flush_bytes: &'a AtomicUsize,
     ) -> Self {
         Self {
             ack_level,
@@ -1781,6 +1772,7 @@ impl ChunkWindows {
             mode,
             already_logged,
             skipped: Vec::new(),
+            max_flush_bytes,
             windows: Vec::new(),
             acked: None,
         }
@@ -1811,7 +1803,7 @@ impl ChunkWindows {
             partition_id,
         } = context;
         outcome.rejected_rows += 1;
-        if should_log_rejection(self.already_logged, outcome.rejected_rows) {
+        if self.already_logged + outcome.rejected_rows <= MAX_LOGGED_REJECTIONS_PER_BATCH {
             let payload = if self.mode.log_payload {
                 format!(", payload: {}", payload_preview(&message.payload))
             } else {
@@ -1829,9 +1821,9 @@ impl ChunkWindows {
         }
     }
 
-    /// Publishes the buffer as one window, without waiting for the server.
-    /// `end` is the index after the window's last message, and `rows` the
-    /// chunk's written rows at that point.
+    /// Publishes the buffer as one window, without waiting for the server,
+    /// and counts its rows as written. `end` is the index after the window's
+    /// last message.
     ///
     /// A publish refused by the connection itself, a latch left by an earlier
     /// frame's terminal rejection or a full symbol dictionary, fails the
@@ -1841,25 +1833,36 @@ impl ChunkWindows {
     /// first mid-loop. Failing keeps one sender per chunk, so the caller names
     /// the lost window by offset and retires the rejection token against the
     /// batch that saw it. The sender is retired when the chunk returns it, so
-    /// the next chunk borrows a fresh one.
+    /// the next batch borrows a fresh one.
     fn publish(
         &mut self,
         sender: &mut questdb::BorrowedSender<'_>,
         buffer: &mut questdb::ingress::Buffer,
         end: usize,
-        rows: usize,
+        outcome: &mut BatchOutcome,
     ) -> Result<(), FlushError> {
+        // A successful publish clears the buffer, so its rows are read first.
+        let rows = outcome.rows_published + buffer.row_count();
         let fsn = sender
             .flush_buffer_and_get_fsn(buffer)
             .map_err(|error| FlushError {
                 phase: FlushPhase::Publishing,
                 error,
             })?;
-        // The caller publishes only a buffer that holds rows, so a frame
-        // always has a sequence number.
-        if let Some(fsn) = fsn {
-            self.windows.push(PublishedWindow { fsn, end, rows });
-        }
+        // The caller publishes only a buffer that holds rows, and the client
+        // gives every such frame a sequence number. Without one the final
+        // wait would have nothing to cover, so the publish counts as failed.
+        let Some(fsn) = fsn else {
+            return Err(FlushError {
+                phase: FlushPhase::Publishing,
+                error: questdb::Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "the QuestDB client published rows without a frame sequence number",
+                ),
+            });
+        };
+        outcome.rows_published = rows;
+        self.windows.push(PublishedWindow { fsn, end, rows });
         self.observe(sender);
         Ok(())
     }
@@ -1886,7 +1889,7 @@ impl ChunkWindows {
             context,
             messages,
         } = *rows;
-        let Err(failure) = self.publish(sender, buffer, window.end, outcome.rows_written) else {
+        let Err(failure) = self.publish(sender, buffer, window.end, outcome) else {
             return Ok(());
         };
         // A frame of one row that the client found larger than a frame is
@@ -1900,7 +1903,6 @@ impl ChunkWindows {
                 let outcome = std::mem::take(outcome);
                 return Err(self.reject(sender, outcome, context, messages, window.start, reason));
             }
-            outcome.rows_written -= 1;
             outcome.last_rejection = Some(reason);
             *buffer = sender.new_buffer();
             return Ok(());
@@ -1909,21 +1911,18 @@ impl ChunkWindows {
         // frame cap is below `max_flush_bytes`, for example from `max_buf_size`
         // or from the server's advertised batch size. The client sent none of
         // it, so the halves are built again from their messages, until every
-        // frame fits or one row is left. Each half starts at a written row, so
-        // a half of one row names its message by `window.start`.
-        let written: Vec<usize> =
-            if buffer.row_count() > 1 && failure.error.code() == ErrorCode::BatchTooLarge {
-                self.written(window.clone()).collect()
-            } else {
-                Vec::new()
-            };
-        if written.len() > 1 && written.len() == buffer.row_count() {
+        // frame fits or one row is left. The buffer holds one row for each
+        // message of the window that the chunk did not reject. Each half
+        // starts at a written row, so a half of one row names its message by
+        // `window.start`.
+        let written: Vec<usize> = if failure.error.code() == ErrorCode::BatchTooLarge {
+            self.written(window.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        if written.len() > 1 {
+            self.lower_flush_bytes(buffer.len(), written.len());
             let middle = written[written.len() / 2];
-            // `publish` records the chunk's written rows at the end of each
-            // window, so the rows of the later half are out of the count while
-            // the earlier half is published.
-            let mut later = written.len() - written.len() / 2;
-            outcome.rows_written -= later;
             for half in [window.start..middle, middle..window.end] {
                 *buffer = sender.new_buffer();
                 // A row that the mapping took once takes again, so a rebuild
@@ -1934,11 +1933,12 @@ impl ChunkWindows {
                         .is_ok()
                 });
                 if !rebuilt {
-                    self.settle(sender);
-                    return Err(self.stop(failure, std::mem::take(outcome), window.end, messages));
+                    let outcome = std::mem::take(outcome);
+                    return Err(
+                        self.settle_and_stop(sender, failure, outcome, window.end, messages)
+                    );
                 }
                 self.publish_window(sender, buffer, half, outcome, rows, scratch)?;
-                outcome.rows_written += std::mem::take(&mut later);
             }
             return Ok(());
         }
@@ -1954,8 +1954,26 @@ impl ChunkWindows {
             *buffer = sender.new_buffer();
             return Ok(());
         }
-        self.settle(sender);
-        Err(self.stop(failure, std::mem::take(outcome), window.end, messages))
+        let outcome = std::mem::take(outcome);
+        Err(self.settle_and_stop(sender, failure, outcome, window.end, messages))
+    }
+
+    /// Lowers the connector's byte bound to half of a refused window of
+    /// `bytes`, so that later windows fit the frame cap instead of failing
+    /// first, and says so each time the bound falls.
+    ///
+    /// The bound has no floor above one byte, and it does not rise again. A
+    /// floor above the real frame cap would make the client refuse every
+    /// window before the sink halves it, for the life of the connector.
+    fn lower_flush_bytes(&self, bytes: usize, rows: usize) {
+        let lowered = (bytes / 2).max(1);
+        let previous = self.max_flush_bytes.fetch_min(lowered, Ordering::Relaxed);
+        if lowered < previous {
+            warn!(
+                "{CONNECTOR_NAME} ID: {} the QuestDB client refused a frame of {rows} rows and about {bytes} bytes, so its frame cap is below max_flush_bytes. The sink now flushes at {lowered} bytes. Set max_flush_bytes below the cap that max_buf_size, sf_max_segment_bytes or the server sets",
+                self.mode.id
+            );
+        }
     }
 
     /// The messages of `window` that hold a row.
@@ -1979,11 +1997,24 @@ impl ChunkWindows {
         index: usize,
         reason: String,
     ) -> Box<ChunkFailure> {
+        // The batch summary names the last reason, in both delivery modes.
+        outcome.last_rejection = Some(reason.clone());
         let cause = match self.await_all(sender, &mut outcome, context, messages) {
-            Ok(()) => StopCause::Rejected(reason),
+            Ok(()) => StopCause::Rejected {
+                offset: messages[index].offset,
+                reason,
+            },
             Err(failure) => self.cause(failure),
         };
-        chunk_stop(cause, outcome, self.confirmed(), index, messages, self.mode)
+        // The record was rejected and logged, so it counts as processed.
+        chunk_stop(
+            cause,
+            outcome,
+            self.confirmed(),
+            index + 1,
+            messages,
+            self.mode,
+        )
     }
 
     /// Stops the chunk on a failure of its publish or wait. `attempted` is the
@@ -2003,6 +2034,27 @@ impl ChunkWindows {
             messages,
             self.mode,
         )
+    }
+
+    /// Stops the chunk on a failed publish, after the windows in front of it
+    /// got their wait.
+    ///
+    /// The wait can meet a terminal rejection that the publish error does not
+    /// carry, for example of an earlier frame of this lease. The handler
+    /// counted that rejection, so the chunk has to retire it, or the count
+    /// would fail a later batch that has nothing to do with it.
+    fn settle_and_stop(
+        &mut self,
+        sender: &mut questdb::BorrowedSender<'_>,
+        failure: FlushError,
+        outcome: BatchOutcome,
+        attempted: usize,
+        messages: &[ConsumedMessage],
+    ) -> Box<ChunkFailure> {
+        let met_rejection = self.settle(sender);
+        let mut stopped = self.stop(failure, outcome, attempted, messages);
+        stopped.server_rejection |= met_rejection;
+        stopped
     }
 
     /// `Duration::ZERO` means "no deadline" to the client, not "do not wait",
@@ -2083,17 +2135,25 @@ impl ChunkWindows {
     /// At least once, the runtime delivers the whole batch again whatever the
     /// wait finds, so the wait would only delay that retry by up to
     /// `flush_timeout`.
-    fn settle(&mut self, sender: &mut questdb::BorrowedSender<'_>) {
+    ///
+    /// Returns whether the wait met a terminal server rejection.
+    fn settle(&mut self, sender: &mut questdb::BorrowedSender<'_>) -> bool {
         if self.windows.is_empty()
             || self.fire_and_forget()
             || !self.mode.wait
             || self.mode.at_least_once
         {
-            return;
+            return false;
         }
         match sender.wait(self.ack_level.into(), self.flush_timeout) {
-            Ok(()) => self.confirm_all(),
-            Err(_) => self.observe(sender),
+            Ok(()) => {
+                self.confirm_all();
+                false
+            }
+            Err(error) => {
+                self.observe(sender);
+                error.code() == ErrorCode::ServerRejection
+            }
         }
     }
 
@@ -2167,8 +2227,13 @@ impl ChunkWindows {
             }
             Err(error) if is_pending_ack(&error) && !self.mode.at_least_once => {
                 self.observe(sender);
-                outcome.pending_acks += 1;
                 let (confirmed_to, _) = self.confirmed();
+                // The acknowledgement can land between the timeout and the
+                // read of the watermark, and then nothing is pending.
+                if confirmed_to == last.end {
+                    return Ok(());
+                }
+                outcome.pending_acks += 1;
                 let pending = WindowLabel(MessageRange::of(&messages[confirmed_to..last.end]));
                 warn!(
                     "{CONNECTOR_NAME} ID: {id} flushed rows whose acknowledgement has not arrived yet, stream: {stream}, topic: {topic}, partition_id: {partition_id}, {pending}. The frames are queued and delivery continues in the background, so this is lag rather than a failed write, but it is only durable across a restart when the connect string sets `sf_dir`: {error}"
@@ -2257,9 +2322,10 @@ fn is_pending_ack(error: &questdb::Error) -> bool {
 /// carry it, so re-sending would duplicate rows the server may already hold.
 /// Both must hold for a failure to count as transient.
 ///
-/// The classification decides whether the rest of a batch is abandoned after
-/// a chunk fails, and how the failure is reported. The runtime logs a failed
-/// batch and counts it in `iggy_connector_errors_total`. At most once, it does
+/// The classification decides how a failure is reported, and whether an
+/// at-most-once chunk goes on past a window that failed, see
+/// [`skip_window`]. The runtime logs a failed batch and counts it in
+/// `iggy_connector_errors_total`. At most once, it does
 /// not replay the batch. At least once, [`map_client_error`] ignores
 /// `in_doubt`, because the runtime delivers the batch again anyway, and the
 /// class decides whether it retries or stops.
@@ -2331,6 +2397,7 @@ mod tests {
         assert!(sink.mapping.include_stream_column);
         assert!(sink.mapping.include_topic_column);
         assert!(!sink.mapping.include_partition_column);
+        assert!(!sink.mapping.include_offset_column);
     }
 
     #[test]
@@ -2359,36 +2426,6 @@ mod tests {
         let sink = QuestDbSink::new(1, config);
         assert!(sink.init_error.is_none());
         assert_eq!(sink.flush_timeout, Duration::ZERO);
-    }
-
-    #[test]
-    fn given_rejections_spread_over_chunks_when_deciding_should_cap_across_the_batch() {
-        // The budget spans the runtime batch, so a later chunk inherits what the
-        // earlier ones spent rather than starting over.
-        assert!(should_log_rejection(0, 1));
-        assert!(should_log_rejection(0, MAX_LOGGED_REJECTIONS_PER_BATCH));
-        assert!(!should_log_rejection(
-            0,
-            MAX_LOGGED_REJECTIONS_PER_BATCH + 1
-        ));
-        assert!(should_log_rejection(MAX_LOGGED_REJECTIONS_PER_BATCH - 1, 1));
-        assert!(!should_log_rejection(
-            MAX_LOGGED_REJECTIONS_PER_BATCH - 1,
-            2
-        ));
-        assert!(!should_log_rejection(MAX_LOGGED_REJECTIONS_PER_BATCH, 1));
-    }
-
-    #[test]
-    fn given_a_run_of_unacknowledged_batches_when_deciding_should_escalate_at_the_threshold() {
-        assert!(!should_escalate_stall(0));
-        assert!(!should_escalate_stall(
-            PENDING_ACK_BATCHES_BEFORE_ESCALATION - 1
-        ));
-        assert!(should_escalate_stall(PENDING_ACK_BATCHES_BEFORE_ESCALATION));
-        assert!(should_escalate_stall(
-            PENDING_ACK_BATCHES_BEFORE_ESCALATION + 1
-        ));
     }
 
     #[test]
@@ -2539,7 +2576,7 @@ mod tests {
             ),
             ("ws::addr=a:9000;", AckLevelSetting::Ok),
         ] {
-            let requested = request_durable_ack(connection_string)
+            let requested = connect_string_value(connection_string, "request_durable_ack")
                 .as_deref()
                 .and_then(ack_level_for)
                 .unwrap_or(AckLevelSetting::Ok);
@@ -2800,6 +2837,65 @@ mod tests {
     }
 
     #[test]
+    fn given_several_column_conflicts_when_constructed_should_report_all_of_them() {
+        let mut config = config();
+        config.symbol_columns = Some(vec!["a".to_owned(), "iggy_topic".to_owned()]);
+        config.uuid_columns = Some(vec!["A".to_owned()]);
+        config.integer_columns = Some(vec!["a".to_owned()]);
+        let sink = QuestDbSink::new(1, config);
+        let Some(Error::InvalidConfigValue(reason)) = &sink.init_error else {
+            panic!("the columns must be refused, got {:?}", sink.init_error);
+        };
+        for conflict in [
+            "both symbol_columns and uuid_columns",
+            "both symbol_columns and integer_columns",
+            "both uuid_columns and integer_columns",
+            "iggy_topic is listed in symbol_columns",
+        ] {
+            assert!(
+                reason.contains(conflict),
+                "{conflict} is missing from {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_several_refused_settings_when_constructed_should_report_all_of_them() {
+        // One start names every mistake, so the operator does not need one
+        // restart per setting.
+        let mut config = config();
+        config.timestamp_source = Some("yesterday".to_owned());
+        config.ack_level = Some("maybe".to_owned());
+        config.batch_size = Some(0);
+        let sink = QuestDbSink::new(1, config);
+        let Some(Error::InvalidConfigValue(reason)) = &sink.init_error else {
+            panic!("the settings must be refused, got {:?}", sink.init_error);
+        };
+        for field in ["timestamp_source", "ack_level", "batch_size"] {
+            assert!(reason.contains(field), "{field} is missing from {reason}");
+        }
+    }
+
+    #[test]
+    fn given_unknown_timestamp_source_when_constructed_should_not_blame_field_or_unit() {
+        // The unknown source falls back to `message` only to go on. The field
+        // and the unit are right for the source that the operator meant.
+        let mut config = config();
+        config.timestamp_source = Some("body".to_owned());
+        config.timestamp_field = Some("ts".to_owned());
+        config.timestamp_unit = Some("ms".to_owned());
+        let sink = QuestDbSink::new(1, config);
+        let Some(Error::InvalidConfigValue(reason)) = &sink.init_error else {
+            panic!("the source must be refused, got {:?}", sink.init_error);
+        };
+        assert!(reason.contains("timestamp_source"), "{reason}");
+        assert!(
+            !reason.contains("timestamp_field") && !reason.contains("timestamp_unit"),
+            "{reason}"
+        );
+    }
+
+    #[test]
     fn given_each_ack_level_name_when_parsed_should_round_trip_and_convert() {
         for (name, setting, level) in [
             ("ok", AckLevelSetting::Ok, AckLevel::Ok),
@@ -2907,9 +3003,15 @@ mod tests {
         ];
         // The watermark counts frames of the whole lease, so it can stop
         // between two windows, or before the first one of this chunk.
+        let max_flush_bytes = AtomicUsize::new(DEFAULT_MAX_FLUSH_BYTES);
         let confirmed = |acked: Option<u64>, windows: &[PublishedWindow]| {
-            let mut chunk =
-                ChunkWindows::new(AckLevelSetting::Ok, Duration::from_secs(1), AT_MOST_ONCE, 0);
+            let mut chunk = ChunkWindows::new(
+                AckLevelSetting::Ok,
+                Duration::from_secs(1),
+                AT_MOST_ONCE,
+                0,
+                &max_flush_bytes,
+            );
             chunk.windows = windows.to_vec();
             chunk.acked = acked;
             chunk.confirmed()
@@ -2926,8 +3028,14 @@ mod tests {
         // With `ack_level = "ok"` and a durable `request_durable_ack`, the
         // watermark follows the durable level and can still be behind when the
         // `ok` wait returns. The wait itself covers every window.
-        let mut chunk =
-            ChunkWindows::new(AckLevelSetting::Ok, Duration::from_secs(1), AT_MOST_ONCE, 0);
+        let max_flush_bytes = AtomicUsize::new(DEFAULT_MAX_FLUSH_BYTES);
+        let mut chunk = ChunkWindows::new(
+            AckLevelSetting::Ok,
+            Duration::from_secs(1),
+            AT_MOST_ONCE,
+            0,
+            &max_flush_bytes,
+        );
         chunk.windows = vec![
             PublishedWindow {
                 fsn: 4,
@@ -2999,23 +3107,19 @@ mod tests {
     }
 
     #[test]
-    fn given_a_borrow_failure_when_classified_should_stop_the_batch_by_its_own_code() {
+    fn given_a_borrow_failure_when_classified_should_report_it_by_its_own_code() {
         // Pool exhaustion arrives as InvalidApiCall. It clears itself when
-        // another topic returns its sender, so it is transient, but the next
-        // chunk would wait the acquire timeout again, so the loop stops. A
-        // refused dial is permanent, and must not read as transient just
-        // because it happened while borrowing.
+        // another topic returns its sender, so it is transient. A refused
+        // dial is permanent, and must not read as transient just because it
+        // happened while borrowing.
         let exhausted = stop(FlushPhase::Borrowing, ErrorCode::InvalidApiCall, 0, 0);
-        assert!(exhausted.stops_batch);
         assert!(!exhausted.server_rejection);
         assert!(matches!(exhausted.error, Error::CannotStoreData(_)));
 
         let refused = stop(FlushPhase::Borrowing, ErrorCode::TlsError, 0, 0);
-        assert!(refused.stops_batch);
         assert!(matches!(refused.error, Error::PermanentHttpError(_)));
 
         let dead_host = stop(FlushPhase::Borrowing, ErrorCode::SocketError, 0, 0);
-        assert!(dead_host.stops_batch);
         assert!(matches!(dead_host.error, Error::CannotStoreData(_)));
 
         // Outside the borrow phase the same code is a caller mistake.
@@ -3024,29 +3128,24 @@ mod tests {
     }
 
     #[test]
-    fn given_a_server_rejection_when_classified_should_continue_and_flag_the_token() {
-        // The rejection belongs to the frame, so the chunks behind it are
-        // still worth attempting, and the handler counted the same event.
+    fn given_a_server_rejection_when_classified_should_be_permanent_and_flag_the_token() {
+        // The handler counted the same event, so the chunk retires one token.
         for phase in [FlushPhase::Publishing, FlushPhase::Awaiting] {
             let failure = stop(phase, ErrorCode::ServerRejection, 0, 0);
-            assert!(!failure.stops_batch, "{phase:?}");
             assert!(failure.server_rejection, "{phase:?}");
             assert!(matches!(failure.error, Error::PermanentHttpError(_)));
         }
     }
 
     #[test]
-    fn given_a_transient_failure_when_classified_should_stop_the_batch() {
-        // A connection fault recurs on the next chunk. In the awaiting phase
-        // it is still a connection fault, but never reported as retryable,
-        // because the frame is already published.
+    fn given_a_connection_fault_when_classified_should_be_retryable_only_before_the_publish() {
+        // In the awaiting phase a connection fault is never reported as
+        // retryable at most once, because the frame is already published.
         let publishing = stop(FlushPhase::Publishing, ErrorCode::SocketError, 0, 0);
-        assert!(publishing.stops_batch);
         assert!(!publishing.server_rejection);
         assert!(matches!(publishing.error, Error::CannotStoreData(_)));
 
         let awaiting = stop(FlushPhase::Awaiting, ErrorCode::SocketError, 0, 0);
-        assert!(awaiting.stops_batch);
         assert!(matches!(awaiting.error, Error::PermanentHttpError(_)));
     }
 
@@ -3097,10 +3196,13 @@ mod tests {
             })
             .collect();
         let failure = chunk_stop(
-            StopCause::Rejected("column a is claimed twice".to_owned()),
+            StopCause::Rejected {
+                offset: messages[1].offset,
+                reason: "column a is claimed twice".to_owned(),
+            },
             BatchOutcome::default(),
             (1, 1),
-            1,
+            2,
             &messages,
             AT_LEAST_ONCE,
         );
@@ -3112,6 +3214,7 @@ mod tests {
             failure.error
         );
         assert!(failure.error.is_permanent());
+        assert_eq!(failure.attempted, 2);
     }
 
     #[test]
@@ -3207,12 +3310,10 @@ mod tests {
     }
 
     #[test]
-    fn given_a_full_symbol_dictionary_when_classified_should_not_stop_the_batch() {
-        // The dictionary belongs to the connection, but returning the sender
-        // retires that connection and the next borrow dials a fresh one, so
-        // the chunks behind this one are worth attempting.
+    fn given_a_full_symbol_dictionary_when_classified_should_be_transient() {
+        // The dictionary belongs to the connection. Returning the sender
+        // retires that connection, and the next borrow dials a fresh one.
         let full = stop(FlushPhase::Publishing, ErrorCode::SymbolDictFull, 0, 0);
-        assert!(!full.stops_batch);
         assert!(!full.server_rejection);
         assert!(matches!(full.error, Error::CannotStoreData(_)));
     }
@@ -3327,7 +3428,7 @@ mod tests {
 
     #[test]
     fn given_a_stopped_chunk_when_classified_should_keep_only_the_acknowledged_rows() {
-        // `rows_written` grows at append time, so the rows of an unconfirmed
+        // `rows_published` grows at each publish, so the rows of an unconfirmed
         // window come out again when the chunk stops, and those messages are
         // the ones named as undelivered.
         let messages: Vec<ConsumedMessage> = (0..6u64)
@@ -3342,7 +3443,7 @@ mod tests {
             })
             .collect();
         let outcome = BatchOutcome {
-            rows_written: 7,
+            rows_published: 7,
             rejected_rows: 2,
             ..BatchOutcome::default()
         };
@@ -3357,7 +3458,7 @@ mod tests {
             &messages,
             AT_MOST_ONCE,
         );
-        assert_eq!(stop.outcome.rows_written, 4);
+        assert_eq!(stop.outcome.rows_published, 4);
         assert_eq!(stop.outcome.rejected_rows, 2);
         let range = stop.undelivered.expect("two messages are unconfirmed");
         assert_eq!(
@@ -3408,7 +3509,10 @@ mod tests {
     #[test]
     fn given_no_max_flush_bytes_when_constructed_should_use_the_frame_safe_default() {
         let sink = QuestDbSink::new(1, config());
-        assert_eq!(sink.max_flush_bytes, DEFAULT_MAX_FLUSH_BYTES);
+        assert_eq!(
+            sink.max_flush_bytes.load(Ordering::Relaxed),
+            DEFAULT_MAX_FLUSH_BYTES
+        );
     }
 
     #[test]
@@ -3435,7 +3539,7 @@ mod tests {
         let mut config = config();
         config.max_flush_bytes = Some(4096);
         let sink = QuestDbSink::new(1, config);
-        assert_eq!(sink.max_flush_bytes, 4096);
+        assert_eq!(sink.max_flush_bytes.load(Ordering::Relaxed), 4096);
     }
 
     #[test]

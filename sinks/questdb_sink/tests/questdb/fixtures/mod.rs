@@ -26,8 +26,8 @@ pub use sink::{
     QuestDbSinkFixture, QuestDbSinkHeadersFixture, QuestDbSinkLocalDurableFixture,
     QuestDbSinkOriginTimestampFixture, QuestDbSinkOutageFixture, QuestDbSinkOversizedFixture,
     QuestDbSinkPayloadTimestampFixture, QuestDbSinkRawFixture, QuestDbSinkServerRejectionFixture,
-    QuestDbSinkServerRejectionStoreAndForwardFixture, QuestDbSinkServerTimestampFixture,
-    QuestDbSinkSmallBatchFixture, QuestDbSinkSplitFixture, QuestDbSinkStoreAndForwardFixture,
-    QuestDbSinkTextFixture, QuestDbSinkTypedFixture, QuestDbSinkTypedNumbersFixture,
-    QuestDbSinkWindowedFixture,
+    QuestDbSinkServerRejectionSmallBatchFixture, QuestDbSinkServerRejectionStoreAndForwardFixture,
+    QuestDbSinkServerTimestampFixture, QuestDbSinkSmallBatchFixture, QuestDbSinkSplitFixture,
+    QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture, QuestDbSinkTypedFixture,
+    QuestDbSinkTypedNumbersFixture, QuestDbSinkWindowedFixture,
 };

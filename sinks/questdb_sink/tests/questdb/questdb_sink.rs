@@ -33,10 +33,10 @@ use crate::fixtures::{
     QuestDbSinkHeadersFixture, QuestDbSinkLocalDurableFixture, QuestDbSinkOriginTimestampFixture,
     QuestDbSinkOutageFixture, QuestDbSinkOversizedFixture, QuestDbSinkPayloadTimestampFixture,
     QuestDbSinkRawFixture, QuestDbSinkServerRejectionFixture,
-    QuestDbSinkServerRejectionStoreAndForwardFixture, QuestDbSinkServerTimestampFixture,
-    QuestDbSinkSmallBatchFixture, QuestDbSinkSplitFixture, QuestDbSinkStoreAndForwardFixture,
-    QuestDbSinkTextFixture, QuestDbSinkTypedFixture, QuestDbSinkTypedNumbersFixture,
-    QuestDbSinkWindowedFixture,
+    QuestDbSinkServerRejectionSmallBatchFixture, QuestDbSinkServerRejectionStoreAndForwardFixture,
+    QuestDbSinkServerTimestampFixture, QuestDbSinkSmallBatchFixture, QuestDbSinkSplitFixture,
+    QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture, QuestDbSinkTypedFixture,
+    QuestDbSinkTypedNumbersFixture, QuestDbSinkWindowedFixture,
 };
 
 fn message(id: u128, payload: serde_json::Value) -> IggyMessage {
@@ -107,6 +107,8 @@ async fn given_typed_payload_when_consumed_should_map_questdb_column_types(
                 "embedding": [1.5, 2.5, 3.5],
                 "matrix": [[1.0, 2.0], [3.0, 4.0]],
                 "meta": {"venue": "nyse"},
+                "empty": [],
+                "empty_nested": [[], []],
                 "missing": null,
             }),
         )],
@@ -134,10 +136,12 @@ async fn given_typed_payload_when_consumed_should_map_questdb_column_types(
     );
     // A nested object has no QuestDB type, so it is stored as JSON text.
     assert_eq!(columns.get("meta").map(String::as_str), Some("VARCHAR"));
-    // A null field must not create a column at all.
+    // A null field and an empty array must not create a column at all.
     assert!(
-        !columns.contains_key("missing"),
-        "null field created a column: {columns:?}"
+        ["missing", "empty", "empty_nested"]
+            .iter()
+            .all(|name| !columns.contains_key(*name)),
+        "a null field or an empty array created a column: {columns:?}"
     );
     // The message source carries microseconds, so the designated timestamp
     // is a `TIMESTAMP`, while the payload source test pins `TIMESTAMP_NS`.
@@ -1261,7 +1265,7 @@ async fn given_dedup_table_when_duplicates_delivered_should_collapse_to_one_row(
     fixture: QuestDbSinkDedupFixture,
 ) {
     // Delivery is at-least-once, and the README tells operators to declare
-    // DEDUP UPSERT KEYS. This proves that recipe actually collapses a replay:
+    // DEDUP keys. This proves that `UPSERT` on a payload key collapses a replay:
     // the same logical rows are delivered twice as distinct Apache Iggy
     // messages, and the table must still hold one row per key.
     let fixture = &fixture.0;
@@ -1376,6 +1380,61 @@ async fn given_a_terminal_server_rejection_when_consumed_should_fail_the_batch_a
         vec![json!(7)],
         "only the valid record may reach the table"
     );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_a_failed_chunk_when_consumed_at_most_once_should_end_the_batch_and_name_the_rest(
+    harness: &TestHarness,
+    fixture: QuestDbSinkServerRejectionSmallBatchFixture,
+) {
+    // batch_size is 2, so the six messages make three chunks, and the server
+    // refuses the frame of the first one. At most once, the sink makes one
+    // attempt: it does not write the chunks behind the failed one, and it
+    // names them by offset, so that an operator can rewind to them.
+    let fixture = &fixture.0;
+    let client = harness.root_client().await.unwrap();
+    let mut messages = vec![
+        message(1, json!({"reading": 1.5, "label": "not a number"})),
+        message(2, json!({"reading": 2.5})),
+    ];
+    messages
+        .extend((3..=6u32).map(|id| message(u128::from(id), json!({"reading": 0.5, "label": id}))));
+    send(&client, messages).await;
+
+    let needle = "not attempted, because an earlier chunk of this batch failed";
+    let logs = wait_for_runtime_log(harness, needle).await;
+    let failed = logs
+        .lines()
+        .find(|line| line.contains("QuestDB did not confirm writing"))
+        .expect("the failed chunk was not logged");
+    assert!(
+        failed.contains("2 messages") && failed.contains("offsets: [0, 1]"),
+        "the failed chunk must be named by offset: {failed}"
+    );
+    let skipped = logs
+        .lines()
+        .find(|line| line.contains(needle))
+        .expect("the chunks behind the failed one were not logged");
+    assert!(
+        skipped.contains("4 messages") && skipped.contains("offsets: [2, 5]"),
+        "the chunks behind the failed one must be named by offset: {skipped}"
+    );
+
+    // The next batch lands, and no row of the failed batch does.
+    send(
+        &client,
+        vec![message(7, json!({"reading": 7.5, "label": 7}))],
+    )
+    .await;
+    fixture
+        .wait_for_rows(1)
+        .await
+        .expect("only the batch after the failed one may land");
+    let labels = fixture.column_values("label").await.expect("no values");
+    assert_eq!(labels, vec![json!(7)]);
 }
 
 #[iggy_harness(
@@ -1698,9 +1757,16 @@ async fn given_a_frame_cap_below_max_flush_bytes_when_written_at_least_once_shou
         .connectors_runtime()
         .expect("connectors runtime handle should be available")
         .collect_logs();
+    let logs = format!("{stdout}\n{stderr}");
     assert!(
-        !stdout.contains("rejected message,") && !stderr.contains("rejected message,"),
+        !logs.contains("rejected message,"),
         "no message is wider than a frame"
+    );
+    // The refused window lowers the flush size, so later frames fit, and
+    // the operator learns that max_flush_bytes is above the cap.
+    assert!(
+        logs.contains("frame cap is below max_flush_bytes"),
+        "the sink must say that it lowered its flush size: {logs}"
     );
 }
 

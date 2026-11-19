@@ -41,7 +41,7 @@ use crate::CONNECTOR_NAME;
 
 /// Where the designated timestamp comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TimestampSource {
+pub(crate) enum TimestampSource {
     /// The Apache Iggy message timestamp (microseconds).
     #[default]
     Message,
@@ -55,7 +55,12 @@ pub enum TimestampSource {
 
 /// A configuration value that names none of the enum's variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnknownVariant;
+pub(crate) struct UnknownVariant;
+
+impl TimestampSource {
+    /// The accepted names, for the error of a value that is none of them.
+    pub(crate) const NAMES: &'static str = "message, origin, payload, server";
+}
 
 /// Matched without regard to case, so `Payload` and `PAYLOAD` also work.
 impl FromStr for TimestampSource {
@@ -75,7 +80,7 @@ impl FromStr for TimestampSource {
 /// Unit of a payload-sourced timestamp. `Auto` guesses from magnitude, which
 /// covers the common case of a producer that switched units between releases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TimestampUnit {
+pub(crate) enum TimestampUnit {
     #[default]
     Auto,
     Seconds,
@@ -101,6 +106,10 @@ impl FromStr for TimestampUnit {
 }
 
 impl TimestampUnit {
+    /// The accepted names, for the error of a value that is none of them.
+    pub(crate) const NAMES: &'static str =
+        "auto, seconds (s), millis (ms), micros (us), nanos (ns)";
+
     /// `None` when the value cannot be expressed in nanoseconds, which for
     /// `Auto` also catches a magnitude that was bucketed as a coarser unit than
     /// it really is: multiplying it up overflows rather than quietly saturating
@@ -280,7 +289,7 @@ fn widen_exact(number: i128) -> (f64, bool) {
 /// A message that could not be turned into a row. The batch continues; the
 /// caller counts and logs these.
 #[derive(Debug)]
-pub enum RowError {
+pub(crate) enum RowError {
     /// The payload was not a JSON object, or a required field was missing.
     /// Caught before the first write, so the buffer is untouched and the batch
     /// continues.
@@ -293,8 +302,9 @@ pub enum RowError {
     Client(questdb::Error),
     /// `Buffer::at` refused the row. `at` rolls back most of its failures,
     /// but it refuses a negative timestamp without a rollback, so the buffer
-    /// can hold a partial row and the caller has to drop it. The other
-    /// failures land here too, because the caller cannot tell them apart.
+    /// can hold a partial row, and the caller stops the chunk without
+    /// publishing the buffer. The other failures land here too, because the
+    /// caller cannot tell them apart.
     /// [`Mapping::prepare_timestamp`] rejects every negative value, which is
     /// what keeps this unreachable. `at` also skips the rollback when no
     /// table was set or the timestamp does not convert, and `write_row` always
@@ -319,23 +329,23 @@ impl From<questdb::Error> for RowError {
 /// per configured column, while the lookup runs for every field of every row,
 /// and hashing would need a freshly lowercased copy of each field name.
 #[derive(Debug, Default)]
-pub struct ColumnNames(Vec<String>);
+pub(crate) struct ColumnNames(Vec<String>);
 
 impl ColumnNames {
-    pub fn contains(&self, name: &str) -> bool {
+    pub(crate) fn contains(&self, name: &str) -> bool {
         self.0
             .iter()
             .any(|configured| configured.eq_ignore_ascii_case(name))
     }
 
     #[cfg(test)]
-    pub fn insert(&mut self, name: String) {
+    pub(crate) fn insert(&mut self, name: String) {
         if !self.contains(&name) {
             self.0.push(name);
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &str> {
         self.0.iter().map(String::as_str)
     }
 }
@@ -350,26 +360,26 @@ impl FromIterator<String> for ColumnNames {
 /// behind an `Arc` so it can cross into `spawn_blocking` without cloning
 /// per batch.
 #[derive(Debug)]
-pub struct Mapping {
+pub(crate) struct Mapping {
     /// The connector ID, for the one log line this module writes.
-    pub id: u32,
-    pub table: String,
-    pub symbol_columns: ColumnNames,
-    pub uuid_columns: ColumnNames,
+    pub(crate) id: u32,
+    pub(crate) table: String,
+    pub(crate) symbol_columns: ColumnNames,
+    pub(crate) uuid_columns: ColumnNames,
     /// Columns stored as `LONG`, whatever [`Mapping::numbers_as_double`] says.
     ///
     /// A fractional value in a listed column is rejected in both modes,
     /// because storing it as a `DOUBLE` would break the type the declaration
     /// pinned.
-    pub integer_columns: ColumnNames,
-    pub timestamp_source: TimestampSource,
-    pub timestamp_field: Option<String>,
-    pub timestamp_unit: TimestampUnit,
-    pub include_stream_column: bool,
-    pub include_topic_column: bool,
-    pub include_partition_column: bool,
-    pub include_offset_column: bool,
-    pub include_headers: bool,
+    pub(crate) integer_columns: ColumnNames,
+    pub(crate) timestamp_source: TimestampSource,
+    pub(crate) timestamp_field: Option<String>,
+    pub(crate) timestamp_unit: TimestampUnit,
+    pub(crate) include_stream_column: bool,
+    pub(crate) include_topic_column: bool,
+    pub(crate) include_partition_column: bool,
+    pub(crate) include_offset_column: bool,
+    pub(crate) include_headers: bool,
     /// Write every JSON number as a `DOUBLE`.
     ///
     /// JSON carries one number type and a serializer writes `2.0` as `2`, so a
@@ -385,17 +395,17 @@ pub struct Mapping {
     /// rather than turning this off. Turning it off is only safe when every
     /// numeric field is a genuine integer and the table was pre-created, since
     /// otherwise a whole-valued first window creates the column as a `LONG`.
-    pub numbers_as_double: bool,
+    pub(crate) numbers_as_double: bool,
     pub(crate) rounding_warned: RoundingWarned,
     pub(crate) header_keys: HeaderKeys,
 }
 
 /// Per-batch context that is constant across every row.
 #[derive(Debug, Clone, Copy)]
-pub struct RowContext<'a> {
-    pub stream: &'a str,
-    pub topic: &'a str,
-    pub partition_id: u32,
+pub(crate) struct RowContext<'a> {
+    pub(crate) stream: &'a str,
+    pub(crate) topic: &'a str,
+    pub(crate) partition_id: u32,
 }
 
 impl Mapping {
@@ -474,7 +484,7 @@ impl Mapping {
 
     /// [`Mapping::append_row_with`] with fresh vectors, for a single row.
     #[cfg(test)]
-    pub fn append_row(
+    pub(crate) fn append_row(
         &self,
         buffer: &mut Buffer,
         message: &ConsumedMessage,
@@ -519,127 +529,144 @@ impl Mapping {
         // visit every field anyway.
         let mut timestamp_value = None;
 
-        match fields {
-            Some(fields) => {
-                // The timestamp field is matched without regard to case, like
-                // QuestDB's own column lookup, so two fields can both claim to
-                // be the timestamp. Stamping the row from whichever was read
-                // last would be a silent choice, so the row is rejected.
-                for (name, value) in fields {
-                    if self.is_timestamp_field(name) {
-                        if timestamp_value.replace(value).is_some() {
-                            return Err(RowError::Invalid(format!(
-                                "two fields match timestamp_field {}, so the row has no single timestamp",
-                                self.timestamp_field.as_deref().unwrap_or_default()
-                            )));
-                        }
-                        continue;
-                    }
-                    if self.symbol_columns.contains(name.as_str()) {
-                        // A symbol has to be scalar. Dropping a structured
-                        // value silently would also mean that listing a field
-                        // in `symbol_columns` quietly discards data the default
-                        // path would have kept as JSON text.
-                        let Some(text) = scalar_to_symbol(value, &mut scratch.names) else {
-                            if matches!(value, OwnedValue::Static(StaticNode::Null)) {
-                                continue;
+        // The checks run in a closure and a block, so that a rejected row still
+        // gives its vectors back to `scratch`, which keeps the next row from
+        // allocating them again.
+        let mut checked = (|| -> Result<(), RowError> {
+            match fields {
+                Some(fields) => {
+                    // The timestamp field is matched without regard to case, like
+                    // QuestDB's own column lookup, so two fields can both claim to
+                    // be the timestamp. Stamping the row from whichever was read
+                    // last would be a silent choice, so the row is rejected.
+                    for (name, value) in fields {
+                        if self.is_timestamp_field(name) {
+                            if timestamp_value.replace(value).is_some() {
+                                return Err(RowError::Invalid(format!(
+                                    "two fields match timestamp_field {}, so the row has no single timestamp",
+                                    self.timestamp_field.as_deref().unwrap_or_default()
+                                )));
                             }
-                            return Err(RowError::Invalid(format!(
-                                "column {name} is listed in symbol_columns but its value is not a scalar"
-                            )));
-                        };
-                        // The client accepts a longer symbol into the buffer
-                        // and refuses it only when the frame is encoded, which
-                        // loses the whole window instead of this record.
-                        if text.len() > MAX_SYMBOL_LEN {
-                            return Err(RowError::Invalid(format!(
-                                "column {name} is listed in symbol_columns but its value is {} bytes, more than the {MAX_SYMBOL_LEN} bytes a QuestDB symbol can hold",
-                                text.len()
-                            )));
+                            continue;
+                        }
+                        if self.symbol_columns.contains(name.as_str()) {
+                            // A symbol has to be scalar. Dropping a structured
+                            // value silently would also mean that listing a field
+                            // in `symbol_columns` quietly discards data the default
+                            // path would have kept as JSON text.
+                            let Some(text) = scalar_to_symbol(value, &mut scratch.names) else {
+                                if is_absent(value) {
+                                    continue;
+                                }
+                                return Err(RowError::Invalid(format!(
+                                    "column {name} is listed in symbol_columns but its value is not a scalar"
+                                )));
+                            };
+                            // The client accepts a longer symbol into the buffer
+                            // and refuses it only when the frame is encoded, which
+                            // loses the whole window instead of this record.
+                            if text.len() > MAX_SYMBOL_LEN {
+                                return Err(RowError::Invalid(format!(
+                                    "column {name} is listed in symbol_columns but its value is {} bytes, more than the {MAX_SYMBOL_LEN} bytes a QuestDB symbol can hold",
+                                    text.len()
+                                )));
+                            }
+                            validate_name(name)?;
+                            seen.push(name.as_str());
+                            row.symbols.push((name.as_str(), text));
+                            continue;
+                        }
+                        if is_absent(value) {
+                            // Encoded by omitting the column, so it claims nothing.
+                            continue;
                         }
                         validate_name(name)?;
                         seen.push(name.as_str());
-                        row.symbols.push((name.as_str(), text));
-                        continue;
+                        row.columns.push((
+                            name.as_str(),
+                            self.prepare_value(name.as_str(), value, scratch)?,
+                        ));
                     }
-                    if matches!(value, OwnedValue::Static(StaticNode::Null)) {
-                        // Encoded by omitting the column, so it claims nothing.
-                        continue;
+                }
+                None => {
+                    row.payload = Some(self.payload_text(message, scratch)?);
+                }
+            }
+            Ok(())
+        })();
+        if checked.is_ok() {
+            if self.include_headers
+                && let Some(headers) = message.headers.as_ref()
+            {
+                for (key, value) in headers {
+                    let header = PreparedHeader::new(key, value, &mut scratch.names);
+                    scratch.note_header_key(self.id, &header.column, key, &self.header_keys);
+                    row.headers.push(header);
+                }
+            }
+            checked = 'claimed: {
+                // The prefixed names are owned, so they are claimed from the row
+                // that already holds them rather than being built a second time.
+                // `header_column` already replaced every character that the client
+                // refuses, so only the length can still be wrong.
+                for header in &row.headers {
+                    for column in header.columns() {
+                        // The rewritten name alone does not lead back to a raw or
+                        // non-UTF-8 key, so the error names the key too.
+                        if let Err(RowError::Invalid(reason)) = validate_name_length(column) {
+                            break 'claimed Err(RowError::Invalid(format!(
+                                "{reason}{}",
+                                header_keys_of(message, column)
+                            )));
+                        }
+                        seen.push(column);
                     }
-                    validate_name(name)?;
-                    seen.push(name.as_str());
-                    row.columns.push((
-                        name.as_str(),
-                        self.prepare_value(name.as_str(), value, scratch)?,
+                }
+                if let Some((first, second)) = case_collision(&mut seen) {
+                    let columns = if first == second {
+                        format!("column {first} is claimed twice")
+                    } else {
+                        format!(
+                            "columns {first} and {second} collide, because QuestDB matches column names case-insensitively"
+                        )
+                    };
+                    // A header column starts with `header_` and a metadata column with
+                    // `iggy_`, so at most one of the two explanations applies.
+                    let source = match self
+                        .reserved_columns_with_flags()
+                        .find(|(reserved, _)| reserved.eq_ignore_ascii_case(first))
+                    {
+                        Some((reserved, flag)) => format!(
+                            ". The connector writes a metadata column {reserved}, so set {flag} = false or rename the field"
+                        ),
+                        None => header_keys_of(message, first),
+                    };
+                    break 'claimed Err(RowError::Invalid(format!("{columns}{source}")));
+                }
+
+                // Every QuestDB row needs at least one symbol or column before its
+                // designated timestamp; `at` is refused otherwise. `seen` holds every
+                // claimed name, reserved columns and headers included, and the payload
+                // column is the one write that claims no name.
+                if seen.is_empty() && row.payload.is_none() {
+                    break 'claimed Err(RowError::Invalid(
+                        "row would have no columns, so QuestDB cannot accept it".to_owned(),
                     ));
                 }
-            }
-            None => {
-                row.payload = Some(self.payload_text(message, scratch)?);
-            }
-        }
-
-        if self.include_headers
-            && let Some(headers) = message.headers.as_ref()
-        {
-            for (key, value) in headers {
-                let header = PreparedHeader::new(key, value, &mut scratch.names);
-                scratch.note_header_key(self.id, &header.column, key, &self.header_keys);
-                row.headers.push(header);
-            }
-            // The prefixed names are owned, so they are claimed from the row
-            // that already holds them rather than being built a second time.
-            // `header_column` already replaced every character that the client
-            // refuses, so only the length can still be wrong.
-            for header in &row.headers {
-                for column in header.columns() {
-                    // The rewritten name alone does not lead back to a raw or
-                    // non-UTF-8 key, so the error names the key too.
-                    if let Err(RowError::Invalid(reason)) = validate_name_length(column) {
-                        return Err(RowError::Invalid(format!(
-                            "{reason}{}",
-                            header_keys_of(message, column)
-                        )));
-                    }
-                    seen.push(column);
-                }
-            }
-        }
-        if let Some((first, second)) = case_collision(&mut seen) {
-            let columns = if first == second {
-                format!("column {first} is claimed twice")
-            } else {
-                format!(
-                    "columns {first} and {second} collide, because QuestDB matches column names case-insensitively"
-                )
+                Ok(())
             };
-            // A header column starts with `header_` and a metadata column with
-            // `iggy_`, so at most one of the two explanations applies.
-            let source = match self
-                .reserved_columns_with_flags()
-                .find(|(reserved, _)| reserved.eq_ignore_ascii_case(first))
-            {
-                Some((reserved, flag)) => format!(
-                    ". The connector writes a metadata column {reserved}, so set {flag} = false or rename the field"
-                ),
-                None => header_keys_of(message, first),
-            };
-            return Err(RowError::Invalid(format!("{columns}{source}")));
-        }
-
-        // Every QuestDB row needs at least one symbol or column before its
-        // designated timestamp; `at` is refused otherwise. `seen` holds every
-        // claimed name, reserved columns and headers included, and the payload
-        // column is the one write that claims no name.
-        if seen.is_empty() && row.payload.is_none() {
-            return Err(RowError::Invalid(
-                "row would have no columns, so QuestDB cannot accept it".to_owned(),
-            ));
         }
         scratch.seen = recycle(seen);
-
-        row.timestamp = self.prepare_timestamp(message, timestamp_value)?;
-        Ok(row)
+        match checked.and_then(|()| self.prepare_timestamp(message, timestamp_value)) {
+            Ok(timestamp) => {
+                row.timestamp = timestamp;
+                Ok(row)
+            }
+            Err(error) => {
+                scratch.keep(row);
+                Err(error)
+            }
+        }
     }
 
     /// The enabled reserved columns, each with the configuration flag that
@@ -779,26 +806,26 @@ impl Mapping {
             }
             OwnedValue::Static(StaticNode::F64(number)) => Ok(PreparedValue::F64(*number)),
             OwnedValue::String(text) => Ok(PreparedValue::Str(text.as_str())),
+            // QuestDB arrays hold only `DOUBLE`, so a rectangular array of
+            // numbers becomes a `DOUBLE[]`, and any other array is a type the
+            // sink does not support, which rejects the record.
             OwnedValue::Array(items) => {
-                let (values, rounded) = parse_array(name, items, reuse_array(&mut scratch.arrays))?;
-                if rounded {
-                    self.warn_rounding(name, Rounding::ArrayElement);
+                match parse_array(items, reuse_array(&mut scratch.arrays)) {
+                    Ok((values, rounded)) => {
+                        if rounded {
+                            self.warn_rounding(name, Rounding::ArrayElement);
+                        }
+                        Ok(PreparedValue::Array(values))
+                    }
+                    Err((values, error)) => {
+                        scratch.keep_array(values);
+                        Err(RowError::Invalid(format!("column {name} {error}")))
+                    }
                 }
-                Ok(PreparedValue::Array(values))
             }
             // Nested objects have no QuestDB column type; store the JSON text so
             // the data is preserved rather than dropped.
-            OwnedValue::Object(_) => {
-                let not_serializable =
-                    || RowError::Invalid(format!("column {name} is not serializable"));
-                let mut bytes = reuse_name(&mut scratch.names).into_bytes();
-                simd_json::to_writer(&mut bytes, value).map_err(|_| not_serializable())?;
-                // The writer emits JSON text, which is UTF-8, so the check
-                // never fails. It only turns the bytes back into a `String`.
-                String::from_utf8(bytes)
-                    .map(PreparedValue::Json)
-                    .map_err(|_| not_serializable())
-            }
+            OwnedValue::Object(_) => json_text(name, value, scratch),
             // The caller skips a null before reaching this.
             OwnedValue::Static(StaticNode::Null) => Err(RowError::Invalid(format!(
                 "column {name} holds a null that should have been skipped"
@@ -963,10 +990,10 @@ impl Mapping {
         }
 
         // `at` refuses a negative timestamp without rolling the row back, so
-        // that failure leaves a partial row and the caller has to drop the
-        // buffer. `prepare_timestamp` rejects every negative value, so that
-        // failure does not happen here. The other failures without a rollback,
-        // no table set and a timestamp that does not convert, cannot happen
+        // that failure leaves a partial row and the caller stops the chunk.
+        // `prepare_timestamp` rejects every negative value, so that failure
+        // does not happen here. The other failures without a rollback, no
+        // table set and a timestamp that does not convert, cannot happen
         // either: the table is set above and both timestamp types convert.
         match row.timestamp {
             PreparedTimestamp::Now => buffer.at_now(),
@@ -1027,13 +1054,19 @@ struct PreparedRow<'m> {
     timestamp: PreparedTimestamp,
 }
 
-/// The vectors that rows are built in, kept across the rows of a chunk so
-/// that building a row allocates nothing once they have grown.
+/// The largest buffer, in bytes, that [`RowScratch`] keeps for a later row.
+/// The connector keeps its scratch buffers for as long as it runs, so without
+/// a bound one large payload or nested object would hold its memory for good.
+const MAX_KEPT_CAPACITY: usize = 64 * 1024;
+
+/// The vectors that rows are built in. The sink keeps them across the rows of
+/// a chunk and from one chunk to the next, so that building a row allocates
+/// nothing once they have grown.
 ///
 /// A row borrows from its message and, for proto text, from a document parsed
 /// for that row alone, so the vectors are kept empty, with no borrow in them.
 /// [`recycle`] gives each one to the next row with that row's lifetime. A
-/// rejected row drops its vectors, and the next row grows new ones.
+/// rejected row gives its vectors back too.
 #[derive(Default)]
 pub(crate) struct RowScratch {
     symbols: Vec<(&'static str, Cow<'static, str>)>,
@@ -1057,35 +1090,65 @@ pub(crate) struct RowScratch {
     lowered: String,
 }
 
+/// The vectors hold no row between chunks, so there is nothing to show.
+impl fmt::Debug for RowScratch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("RowScratch").finish_non_exhaustive()
+    }
+}
+
 impl RowScratch {
     /// Keeps the vectors and the owned strings of a written row for the next
     /// one.
     fn keep(&mut self, mut row: PreparedRow<'_>) {
         for header in row.headers.drain(..) {
-            self.names
-                .extend(iter::once(header.column).chain(header.encoding));
+            for name in iter::once(header.column).chain(header.encoding) {
+                self.keep_text(name);
+            }
             if let Cow::Owned(text) = header.text {
-                self.names.push(text);
+                self.keep_text(text);
             }
         }
         for (_, text) in row.symbols.drain(..) {
             if let Cow::Owned(text) = text {
-                self.names.push(text);
+                self.keep_text(text);
             }
         }
         if let Some(Cow::Owned(text)) = row.payload.take() {
-            self.names.push(text);
+            self.keep_text(text);
         }
         for (_, value) in row.columns.drain(..) {
             match value {
-                PreparedValue::Json(text) => self.names.push(text),
-                PreparedValue::Array(array) => self.arrays.push(array.values),
+                PreparedValue::Json(text) => self.keep_text(text),
+                PreparedValue::Array(array) => self.keep_array(array.values),
                 _ => {}
             }
         }
         self.symbols = recycle(row.symbols);
         self.columns = recycle(row.columns);
         self.headers = recycle(row.headers);
+    }
+
+    /// Keeps a string for a later row, unless it grew past
+    /// [`MAX_KEPT_CAPACITY`].
+    fn keep_text(&mut self, text: String) {
+        if text.capacity() <= MAX_KEPT_CAPACITY {
+            self.names.push(text);
+        }
+    }
+
+    /// Keeps an array buffer for a later row, unless it grew past
+    /// [`MAX_KEPT_CAPACITY`].
+    fn keep_array(&mut self, values: Vec<f64>) {
+        if values.capacity() <= MAX_KEPT_CAPACITY / size_of::<f64>() {
+            self.arrays.push(values);
+        }
+    }
+
+    /// Drops the header keys of a chunk that failed before it merged them,
+    /// so that a later chunk does not merge them for it.
+    pub(crate) fn forget_header_keys(&mut self) {
+        self.header_keys.clear();
     }
 
     /// Records that `key` wrote to `column`, and warns once when a second key
@@ -1261,12 +1324,12 @@ enum TimestampNumber {
 /// `names`, so a symbol copies nothing and allocates nothing once the row
 /// scratch has grown, on a path that runs for every symbol of every row.
 fn scalar_to_symbol<'v>(value: &'v OwnedValue, names: &mut Vec<String>) -> Option<Cow<'v, str>> {
-    let rendered = |names: &mut Vec<String>, value: &dyn fmt::Display| {
+    fn rendered<'v>(names: &mut Vec<String>, value: impl fmt::Display) -> Option<Cow<'v, str>> {
         let mut text = reuse_name(names);
         // Writing to a `String` never fails.
         let _ = write!(text, "{value}");
         Some(Cow::Owned(text))
-    };
+    }
     match value {
         OwnedValue::Static(StaticNode::Bool(flag)) => rendered(names, flag),
         OwnedValue::Static(StaticNode::I64(number)) => rendered(names, number),
@@ -1445,35 +1508,74 @@ impl NdArrayView<f64> for ArrayValues {
     }
 }
 
+/// Renders a value that has no QuestDB column type as its JSON text, in a
+/// string taken from `scratch`.
+fn json_text<'v>(
+    name: &str,
+    value: &OwnedValue,
+    scratch: &mut RowScratch,
+) -> Result<PreparedValue<'v>, RowError> {
+    let not_serializable = || RowError::Invalid(format!("column {name} is not serializable"));
+    let mut bytes = reuse_name(&mut scratch.names).into_bytes();
+    simd_json::to_writer(&mut bytes, value).map_err(|_| not_serializable())?;
+    // The writer emits JSON text, which is UTF-8, so the check never fails. It
+    // only turns the bytes back into a `String`.
+    String::from_utf8(bytes)
+        .map(PreparedValue::Json)
+        .map_err(|_| not_serializable())
+}
+
+/// Whether a value is written by leaving its column out. That is a null, and
+/// an array that holds no element at any depth, such as `[]` or `[[], []]`,
+/// which has nothing to store. The client would take the nested form as an
+/// array with a dimension of length zero.
+fn is_absent(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Static(StaticNode::Null) => true,
+        OwnedValue::Array(items) => items
+            .iter()
+            .all(|item| matches!(item, OwnedValue::Array(_)) && is_absent(item)),
+        _ => false,
+    }
+}
+
 /// Why a JSON array cannot be a QuestDB array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArrayShapeError {
+    TooDeep,
     NotNumeric,
     Ragged,
 }
 
-/// Builds the array the write pass will hand to the client.
+impl fmt::Display for ArrayShapeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TooDeep => "exceeds the supported array nesting depth of 3",
+            Self::NotNumeric => {
+                "is not a numeric array, and QuestDB arrays hold only DOUBLE values"
+            }
+            // Every sibling must have the same length, or the client refuses
+            // the whole frame.
+            Self::Ragged => "is not a rectangular array",
+        })
+    }
+}
+
+/// Builds the array the write pass will hand to the client, or hands
+/// `values` back with the reason when the JSON array is not one that QuestDB
+/// can hold.
 ///
 /// Building it is what checks its shape, so the rules cannot be held in two
 /// places that have to agree by hand.
 ///
 /// `values` is an empty buffer that the array is written into.
 fn parse_array(
-    name: &str,
     items: &[OwnedValue],
     mut values: Vec<f64>,
-) -> Result<(ArrayValues, bool), RowError> {
-    // An empty array carries no values and no shape, so there is nothing to
-    // store and nothing to infer a column type from.
-    if items.is_empty() {
-        return Err(RowError::Invalid(format!(
-            "column {name} is an empty array"
-        )));
-    }
+) -> Result<(ArrayValues, bool), (Vec<f64>, ArrayShapeError)> {
     let ndim = array_depth(items);
     if ndim > 3 {
-        return Err(RowError::Invalid(format!(
-            "column {name} exceeds the supported array nesting depth of 3"
-        )));
+        return Err((values, ArrayShapeError::TooDeep));
     }
     values.reserve(items.len());
     let mut array = ArrayValues {
@@ -1485,14 +1587,9 @@ fn parse_array(
     // caller can say so once.
     let mut rounded = false;
     let mut shape = [None; 3];
-    flatten_array(items, 0, &mut shape, &mut array, &mut rounded).map_err(|error| {
-        RowError::Invalid(match error {
-            ArrayShapeError::NotNumeric => format!("column {name} is not a numeric array"),
-            // QuestDB arrays are rectangular: every sibling must have the
-            // same length, or the client refuses the whole frame.
-            ArrayShapeError::Ragged => format!("column {name} is not a rectangular array"),
-        })
-    })?;
+    if let Err(error) = flatten_array(items, 0, &mut shape, &mut array, &mut rounded) {
+        return Err((array.values, error));
+    }
     for (dim, length) in array.shape.iter_mut().zip(shape) {
         *dim = length.unwrap_or(0);
     }
@@ -1508,12 +1605,10 @@ fn flatten_array(
     array: &mut ArrayValues,
     rounded: &mut bool,
 ) -> Result<(), ArrayShapeError> {
-    let leaf = depth + 1 == array.ndim;
-    // A row's elements are read before its length is compared, so a row
-    // that is wrong in both ways is reported as not numeric.
-    if !leaf && *shape[depth].get_or_insert(items.len()) != items.len() {
+    if *shape[depth].get_or_insert(items.len()) != items.len() {
         return Err(ArrayShapeError::Ragged);
     }
+    let leaf = depth + 1 == array.ndim;
     for item in items {
         if leaf {
             let value = array_element(item, rounded).ok_or(ArrayShapeError::NotNumeric)?;
@@ -1522,9 +1617,6 @@ fn flatten_array(
             let nested = item.as_array().ok_or(ArrayShapeError::NotNumeric)?;
             flatten_array(nested, depth + 1, shape, array, rounded)?;
         }
-    }
-    if leaf && *shape[depth].get_or_insert(items.len()) != items.len() {
-        return Err(ArrayShapeError::Ragged);
     }
     Ok(())
 }
@@ -1990,43 +2082,6 @@ mod tests {
         assert_eq!(buffer.row_count(), 1);
     }
 
-    /// Each of these reached the QuestDB client as a write-time failure before
-    /// validation covered it. They are grouped so a regression in any one of
-    /// them is visible as a change of error kind, not only of message.
-    #[test]
-    fn given_inputs_the_client_would_refuse_when_appending_should_reject_the_row() {
-        let long_name = "a".repeat(MAX_NAME_LEN + 1);
-        let cases: &[(&str, Mapping, String)] = &[
-            (
-                "name longer than the column limit",
-                mapping(),
-                format!(r#"{{"{long_name}":1}}"#),
-            ),
-            (
-                "array rows of differing length",
-                mapping(),
-                r#"{"m":[[1,2],[3]]}"#.to_owned(),
-            ),
-            (
-                "array planes of differing length",
-                mapping(),
-                r#"{"m":[[[1,2]],[[3,4],[5,6]]]}"#.to_owned(),
-            ),
-        ];
-
-        for (label, mapping, payload) in cases {
-            let mut buffer = qwp_buffer();
-            let error = mapping
-                .append_row(&mut buffer, &json_message(payload), context())
-                .unwrap_err();
-            assert!(
-                matches!(error, RowError::Invalid(_)),
-                "{label} should be an up-front rejection, got {error:?}"
-            );
-            assert_eq!(buffer.row_count(), 0, "{label} must not write a row");
-        }
-    }
-
     #[test]
     fn given_payload_timestamp_out_of_range_when_appending_should_reject_the_row() {
         let mut mapping = mapping();
@@ -2264,21 +2319,49 @@ mod tests {
     #[test]
     fn given_array_shapes_when_appending_should_accept_rectangular_and_reject_the_rest() {
         let mapping = mapping();
+        let row = |payload: &str| {
+            let mut buffer = qwp_buffer();
+            mapping
+                .append_row(&mut buffer, &json_message(payload), context())
+                .unwrap_or_else(|error| panic!("{payload} was rejected: {error:?}"));
+            buffer.as_bytes().to_vec()
+        };
         let rejected = [
-            (r#"{"m":[]}"#, "empty"),
-            (r#"{"m":[[1,2],[3]]}"#, "ragged rows"),
-            (r#"{"m":[[[1,2]],[[3,4],[5,6]]]}"#, "ragged planes"),
-            (r#"{"m":[[[[1]]]]}"#, "depth four"),
-            (r#"{"m":[1,"two"]}"#, "mixed types"),
-            (r#"{"m":[1,[2]]}"#, "mixed nesting"),
+            (r#"[[1,2],[3]]"#, "not a rectangular", "ragged rows"),
+            (
+                r#"[[[1,2]],[[3,4],[5,6]]]"#,
+                "not a rectangular",
+                "ragged planes",
+            ),
+            (r#"[[[[1]]]]"#, "nesting depth", "depth four"),
+            (r#"[1,"two"]"#, "not a numeric", "mixed types"),
+            (r#"[1,[2]]"#, "not a numeric", "mixed nesting"),
+            (r#"[1,null,3]"#, "not a numeric", "a null element"),
+            (r#"["a","b"]"#, "not a numeric", "strings"),
+            (r#"[{"k":1}]"#, "not a numeric", "objects"),
         ];
-        for (payload, label) in rejected {
+        for (array, reason, label) in rejected {
+            let mut buffer = qwp_buffer();
             let error = mapping
-                .append_row(&mut qwp_buffer(), &json_message(payload), context())
+                .append_row(
+                    &mut buffer,
+                    &json_message(&format!(r#"{{"m":{array}}}"#)),
+                    context(),
+                )
                 .unwrap_err();
             assert!(
-                matches!(error, RowError::Invalid(_)),
-                "{label} should be rejected, got {error:?}"
+                matches!(&error, RowError::Invalid(text) if text.contains(reason)),
+                "{label} should be rejected as {reason}, got {error:?}"
+            );
+            assert_eq!(buffer.row_count(), 0, "{label} must not write a row");
+        }
+        // An array with no element at any depth has nothing to store, so its
+        // column is left out.
+        for empty in ["[]", "[[]]", "[[],[]]", "[[[]]]"] {
+            assert_eq!(
+                row(&format!(r#"{{"k":1,"m":{empty}}}"#)),
+                row(r#"{"k":1}"#),
+                "{empty} should leave its column out"
             );
         }
 
@@ -2309,7 +2392,7 @@ mod tests {
         };
         let flat = |text: &str| {
             let value = simd_json::to_owned_value(&mut text.as_bytes().to_vec()).unwrap();
-            let (array, _) = parse_array("m", value.as_array().unwrap(), Vec::new()).unwrap();
+            let (array, _) = parse_array(value.as_array().unwrap(), Vec::new()).unwrap();
             encode(&|buffer| {
                 buffer.column_arr("m", &array).unwrap();
             })
@@ -2944,6 +3027,17 @@ mod tests {
     }
 
     #[test]
+    fn given_an_oversized_buffer_when_kept_should_be_dropped() {
+        // The scratch lives as long as the connector, so one large payload
+        // must not hold its memory for good.
+        let mut scratch = RowScratch::default();
+        scratch.keep_text(String::with_capacity(MAX_KEPT_CAPACITY));
+        scratch.keep_text(String::with_capacity(MAX_KEPT_CAPACITY + 1));
+        assert_eq!(scratch.names.len(), 1);
+        assert!(scratch.names[0].capacity() <= MAX_KEPT_CAPACITY);
+    }
+
+    #[test]
     fn given_a_marker_when_rewound_after_a_wide_row_should_keep_the_rows_in_front() {
         // The chunk loop rolls a row that fills the window back to the marker
         // and appends it again in the next window. That needs the production
@@ -3160,8 +3254,8 @@ mod tests {
         for message in [&first, &second] {
             mapping.append_row(&mut fresh, message, context()).unwrap();
         }
-        // A rejected row in the middle drops its vectors, and the rows around
-        // it still come out the same.
+        // A rejected row in the middle gives its vectors back, and the rows
+        // around it still come out the same.
         let mut reused = buffer();
         let mut scratch = RowScratch::default();
         for message in [&first, &rejected, &second] {

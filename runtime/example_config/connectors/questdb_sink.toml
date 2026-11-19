@@ -31,6 +31,14 @@ schema = "json"
 batch_length = 1000
 consumer_group = "questdb_sink"
 
+[delivery]
+# Store offsets only after QuestDB acknowledged the batch, and deliver a
+# failed batch again. Without this table the runtime delivers at most once,
+# and a failed write loses the messages of its batch. A retried batch can
+# write rows twice. To keep one copy, create the table with the DEDUP keys
+# that the README names under "Delivery semantics".
+guarantee = "at_least_once"
+
 [plugin_config]
 # QuestDB connect string. Use `wss::` for TLS. See
 # https://questdb.com/docs/connect/clients/connect-string/
@@ -43,6 +51,10 @@ connection_string = "ws::addr=localhost:9000;"
 table = "iggy_events"
 
 # message | origin | payload | server
+# An auto-created table names its designated timestamp `timestamp`. A payload
+# field with that name collides with it, and QuestDB rejects the frame. Create
+# the table with another timestamp column, or remove the field with the
+# `delete_fields` transform.
 timestamp_source = "message"
 # Required when timestamp_source = "payload", and rejected with any other
 # source.
@@ -63,13 +75,16 @@ integer_columns = []
 
 include_stream_column = true
 include_topic_column = true
-include_partition_column = false
-include_offset_column = false
+# The partition and the offset identify a message, so they can serve as the
+# DEDUP keys that remove the copies of a retried batch when the payload has no
+# key of its own. Both default to false.
+include_partition_column = true
+include_offset_column = true
 include_headers = false
 
 # ok | durable | local_durable. `durable` needs QuestDB Enterprise with
 # replication, and request_durable_ack=on, replicated or local,replicated in the
-# connect string. `local_durable` needs QuestDB 10.2.0 or Enterprise 4.2.0 with
+# connect string. `local_durable` needs QuestDB 10.2.0 or Enterprise 4.2.1 with
 # cairo.commit.mode=adaptive, and request_durable_ack=local. Leave it unset to
 # follow the connect string.
 # ack_level = "ok"

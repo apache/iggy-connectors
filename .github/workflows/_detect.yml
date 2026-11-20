@@ -31,6 +31,9 @@ on:
       docker:
         description: "Whether the apache/iggy-connect image gets a test build"
         value: ${{ jobs.detect.outputs.docker }}
+      docs:
+        description: "Whether the docs pages get a test build"
+        value: ${{ jobs.detect.outputs.docs }}
 
 permissions:
   contents: read
@@ -44,6 +47,7 @@ jobs:
       rust_plan: ${{ steps.mk.outputs.rust_plan }}
       rust_tests: ${{ steps.mk.outputs.rust_tests }}
       docker: ${{ steps.mk.outputs.docker }}
+      docs: ${{ steps.mk.outputs.docs }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -225,7 +229,7 @@ jobs:
               console.log(`Total files changed: ${files.length}`);
             }
 
-            const groups = { rust: [], docker: [] };
+            const groups = { rust: [], docker: [], docs: [] };
 
             // Process affected components and generate tasks
             console.log('');
@@ -248,6 +252,7 @@ jobs:
 
               if (name === 'rust' || name.startsWith('rust-')) groups.rust.push(...entries);
               else if (name.startsWith('docker-')) groups.docker.push(...entries);
+              else if (name === 'docs') groups.docs.push(...entries);
               else core.setFailed(`Component ${name} has tasks but no task group`);
             }
 
@@ -282,6 +287,7 @@ jobs:
             const jobSummary = [
               { name: 'Rust', tasks: groups.rust },
               { name: 'Docker', tasks: groups.docker },
+              { name: 'Docs', tasks: groups.docs },
             ];
 
             jobSummary.forEach(({ name, tasks }) => {
@@ -308,3 +314,4 @@ jobs:
             setOutput('rust_plan', rustChecks.length ? JSON.stringify({checks: rustChecks}) : '');
             setOutput('rust_tests', String(groups.rust.some(({task}) => task === 'test')));
             setOutput('docker', String(groups.docker.length > 0));
+            setOutput('docs', String(groups.docs.length > 0));

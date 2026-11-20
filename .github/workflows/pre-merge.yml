@@ -117,13 +117,22 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
         run: ./scripts/ci/runtime-image-smoke.sh "apache/iggy-connect:test-${PLATFORM##*/}"
 
+  # Docs pages, built with apache/iggy-website
+  test-docs:
+    name: Docs
+    needs: detect
+    if: needs.detect.outputs.docs == 'true'
+    uses: ./.github/workflows/_test_docs.yml
+    permissions:
+      contents: read
+
   # Final status check
   finalize_pr:
     runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions:
       actions: read # job durations for the summary
-    needs: [common, detect, test-server, rust-test-build, test-rust, test-rust-runtime, docker]
+    needs: [common, detect, test-server, rust-test-build, test-rust, test-rust-runtime, docker, test-docs]
     if: ${{ !cancelled() }}
     steps:
       # The durations only fill the summary table. A GitHub API error here
@@ -146,7 +155,7 @@ jobs:
               return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
             };
             const groups = {
-              rust: 'Rust', rust_tests: 'Rust tests', docker: 'Docker',
+              rust: 'Rust', rust_tests: 'Rust tests', docker: 'Docker', docs: 'Docs',
               common: 'Common checks', detect: 'Detect changes', test_server: 'Test server',
               rust_test_build: 'Rust test artifacts',
             };
@@ -228,6 +237,7 @@ jobs:
           rust_status=$(format_status "${{ needs.test-rust.result }}")
           rust_tests_status=$(format_status "${{ needs.test-rust-runtime.result }}")
           docker_status=$(format_status "${{ needs.docker.result }}")
+          docs_status=$(format_status "${{ needs.test-docs.result }}")
 
           echo "| 🔍 Detection | $detect_status | ${{ steps.times.outputs.detect_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 📋 Common Checks | $common_status | ${{ steps.times.outputs.common_time }} |" >> "$GITHUB_STEP_SUMMARY"
@@ -236,6 +246,7 @@ jobs:
           echo "| 🦀 Rust | $rust_status | ${{ steps.times.outputs.rust_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🦀 Rust tests | $rust_tests_status | ${{ steps.times.outputs.rust_tests_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🐳 Docker | $docker_status | ${{ steps.times.outputs.docker_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 📖 Docs | $docs_status | ${{ steps.times.outputs.docs_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Total workflow time:** ${{ steps.times.outputs.total_time }}" >> "$GITHUB_STEP_SUMMARY"
 

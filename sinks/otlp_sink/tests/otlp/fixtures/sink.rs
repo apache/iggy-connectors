@@ -25,8 +25,8 @@ use tokio::time::sleep;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-// Everything else, including the auth header, comes from
-// `tests/otlp/sink_config/otlp.toml`.
+// Everything else, including the auth header, comes from the `otlp.toml` of the config
+// directory that a test names.
 const ENV_ENDPOINT: &str = "IGGY_CONNECTORS_SINK_OTLP_PLUGIN_CONFIG_ENDPOINT";
 const ENV_COMPRESSION: &str = "IGGY_CONNECTORS_SINK_OTLP_PLUGIN_CONFIG_COMPRESSION";
 const ENV_MAX_REQUEST_BYTES: &str = "IGGY_CONNECTORS_SINK_OTLP_PLUGIN_CONFIG_MAX_REQUEST_BYTES";

@@ -257,6 +257,6 @@ pub fn json_message(offset: u64, value: Value) -> ConsumedMessage {
     let mut bytes = serde_json::to_vec(&value).expect("encode JSON");
     message(
         offset,
-        Payload::Json(simd_json::to_owned_value(&mut bytes).expect("valid JSON")),
+        Payload::Json(iggy_connector_sdk::json::to_owned_value(&mut bytes).expect("valid JSON")),
     )
 }

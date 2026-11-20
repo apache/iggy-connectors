@@ -41,6 +41,7 @@ pub mod convert;
 pub mod decoders;
 pub mod encoders;
 pub mod headers;
+pub mod json;
 pub mod log;
 pub mod retry;
 pub mod sink;
@@ -242,7 +243,7 @@ impl Payload {
     pub fn try_from_schema(schema: Schema, mut value: Vec<u8>) -> Result<Self, Error> {
         match schema {
             Schema::Json => Ok(Payload::Json(
-                simd_json::to_owned_value(&mut value).map_err(|_| Error::InvalidJsonPayload)?,
+                crate::json::to_owned_value(&mut value).map_err(|_| Error::InvalidJsonPayload)?,
             )),
             Schema::Raw => Ok(Payload::Raw(value)),
             Schema::Text => Ok(Payload::Text(
@@ -272,7 +273,7 @@ impl Payload {
             Payload::Json(value) => Some(Cow::Borrowed(value)),
             Payload::Proto(text) => {
                 let mut bytes = text.as_bytes().to_vec();
-                simd_json::to_owned_value(&mut bytes).ok().map(Cow::Owned)
+                crate::json::to_owned_value(&mut bytes).ok().map(Cow::Owned)
             }
             _ => None,
         }
@@ -386,7 +387,7 @@ impl Schema {
     pub fn try_into_payload(self, mut value: Vec<u8>) -> Result<Payload, Error> {
         match self {
             Schema::Json => Ok(Payload::Json(
-                simd_json::to_owned_value(&mut value).map_err(|_| Error::InvalidJsonPayload)?,
+                crate::json::to_owned_value(&mut value).map_err(|_| Error::InvalidJsonPayload)?,
             )),
             Schema::Raw => Ok(Payload::Raw(value)),
             Schema::Text => Ok(Payload::Text(

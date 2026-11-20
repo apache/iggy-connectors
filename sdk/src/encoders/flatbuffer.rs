@@ -128,7 +128,7 @@ impl FlatBufferStreamEncoder {
         let mut builder = FlatBufferBuilder::with_capacity(self.config.table_size_hint);
 
         let mut json_bytes = text.clone().into_bytes();
-        if let Ok(json_value) = simd_json::to_owned_value(&mut json_bytes) {
+        if let Ok(json_value) = crate::json::to_owned_value(&mut json_bytes) {
             return self.encode_json_to_flatbuffer(json_value);
         }
 
@@ -178,7 +178,7 @@ impl FlatBufferStreamEncoder {
 
             (Payload::Text(text), Schema::Json) => {
                 let mut text_bytes = text.into_bytes();
-                let json_value = simd_json::to_owned_value(&mut text_bytes)
+                let json_value = crate::json::to_owned_value(&mut text_bytes)
                     .map_err(|_| Error::InvalidJsonPayload)?;
                 Ok(Payload::Json(json_value))
             }
@@ -189,8 +189,8 @@ impl FlatBufferStreamEncoder {
                 Ok(Payload::Text(text))
             }
             (Payload::Raw(mut data), Schema::Json) => {
-                let json_value =
-                    simd_json::to_owned_value(&mut data).map_err(|_| Error::InvalidJsonPayload)?;
+                let json_value = crate::json::to_owned_value(&mut data)
+                    .map_err(|_| Error::InvalidJsonPayload)?;
                 Ok(Payload::Json(json_value))
             }
 

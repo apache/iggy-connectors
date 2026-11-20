@@ -75,11 +75,10 @@ integer_columns = []
 
 include_stream_column = true
 include_topic_column = true
-# The partition and the offset identify a message, so they can serve as the
-# DEDUP keys that remove the copies of a retried batch when the payload has no
-# key of its own. Both default to false.
-include_partition_column = true
-include_offset_column = true
+# The partition and the offset identify a message. Turn them on only as DEDUP
+# keys for a payload that has no key of its own.
+include_partition_column = false
+include_offset_column = false
 include_headers = false
 
 # ok | durable | local_durable. `durable` needs QuestDB Enterprise with

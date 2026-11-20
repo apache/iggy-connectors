@@ -41,8 +41,8 @@ uuid_columns = []
 integer_columns = []
 include_stream_column = true
 include_topic_column = true
-include_partition_column = true
-include_offset_column = true
+include_partition_column = false
+include_offset_column = false
 include_headers = false
 # Leave ack_level unset to follow request_durable_ack in the connect string.
 # ack_level = "ok"
@@ -96,9 +96,8 @@ guarantee = "at_least_once"
 
 Without this table the runtime delivers at most once, which is best effort: a
 failed write loses the messages of its batch, and the sink only logs their
-offsets. The example configuration sets at least once, and it writes the
-partition and the offset of each message, which can serve as DEDUP keys for
-retried batches. See [Delivery semantics](#delivery-semantics).
+offsets. The example configuration sets at least once. See
+[Delivery semantics](#delivery-semantics).
 
 ### Batch sizing
 
@@ -465,10 +464,17 @@ only when QuestDB acknowledged every chunk of the batch at `ack_level`:
 - Fire and forget, `flush_timeout = "0s"`, never waits for an acknowledgement,
   so a connector that sets it does not start with at least once.
 
-A retried batch writes the chunks that QuestDB already took a second time. To
-keep one copy, declare `DEDUP` keys on the table. QuestDB removes duplicates by
-the keys of the table definition, so the keys are yours to choose: the
-designated timestamp, plus the columns that identify a row.
+At least once is also how the official QuestDB clients work. On a disconnect or
+a failover they send again the rows that the server did not acknowledge yet,
+and the server removes the duplicates.
+
+A retried batch writes the chunks that QuestDB already took a second time. You
+can use the sink without `DEDUP`, and the table then holds those rows twice,
+which may or may not be a problem for your data. If duplicates do not matter
+to you, leave `DEDUP` out: ingestion is faster and lighter for the server
+without it. To keep one copy, declare `DEDUP` keys on the table. QuestDB
+removes duplicates by the keys of the table definition, so the keys are yours
+to choose: the designated timestamp, plus the columns that identify a row.
 
 QuestDB has two modes, and they differ in which row stays:
 
@@ -479,25 +485,27 @@ QuestDB has two modes, and they differ in which row stays:
 - `DEDUP UPSERT KEYS(...)` replaces the stored row with the later one. Use it
   when a later message with the same keys must overwrite the earlier values.
 
-If the payload has columns that identify a row, for example an order id, use
-them as the keys. If it does not, write the message identity and use it:
+Use the columns of your payload that identify a row, for example an order id:
+
+```sql
+CREATE TABLE orders (
+  order_id SYMBOL, amount DOUBLE, timestamp TIMESTAMP
+) TIMESTAMP(timestamp) PARTITION BY DAY WAL
+DEDUP SKIP KEYS(timestamp, order_id);
+```
+
+Only if the payload has no such columns, fall back to the message identity:
 
 1. Set `include_partition_column = true` and `include_offset_column = true`.
+   Both are off by default.
 2. Create the table with
    `DEDUP SKIP KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset)`,
    with the name of your designated timestamp in place of `timestamp`.
 
-The timestamp, the stream and the topic are not enough. Iggy gives every
-message of one producer batch the same timestamp, so keys without the partition
-and the offset keep one row for several distinct messages, without an error.
-
-```sql
-CREATE TABLE iggy_events (
-  iggy_stream SYMBOL, iggy_topic SYMBOL, iggy_partition_id LONG,
-  iggy_offset LONG, timestamp TIMESTAMP
-) TIMESTAMP(timestamp) PARTITION BY DAY WAL
-DEDUP SKIP KEYS(timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_offset);
-```
+For this fallback, the timestamp, the stream and the topic are not enough. Iggy
+gives every message of one producer batch the same timestamp, so keys without
+the partition and the offset keep one row for several distinct messages,
+without an error.
 
 DEDUP keys must include the designated timestamp, so a retried row is a
 duplicate only if it gets the same timestamp again. With

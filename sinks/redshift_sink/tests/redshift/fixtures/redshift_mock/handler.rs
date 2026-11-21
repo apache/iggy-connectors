@@ -44,6 +44,7 @@ use super::{
 pub struct RedshiftHandlerFactory {
     pub pg_dsn: String,
     pub s3_client: Arc<S3Client>,
+    pub case_sensitive: bool,
 }
 
 impl PgWireServerHandlers for RedshiftHandlerFactory {
@@ -51,6 +52,7 @@ impl PgWireServerHandlers for RedshiftHandlerFactory {
         Arc::new(RedshiftHandler::new(
             self.pg_dsn.clone(),
             self.s3_client.clone(),
+            self.case_sensitive,
         ))
     }
 
@@ -58,6 +60,7 @@ impl PgWireServerHandlers for RedshiftHandlerFactory {
         Arc::new(RedshiftHandler::new(
             self.pg_dsn.clone(),
             self.s3_client.clone(),
+            self.case_sensitive,
         ))
     }
 }
@@ -70,12 +73,12 @@ struct RedshiftHandler {
 }
 
 impl RedshiftHandler {
-    pub fn new(pg_dsn: String, s3_client: Arc<S3Client>) -> Self {
+    pub fn new(pg_dsn: String, s3_client: Arc<S3Client>, case_sensitive: bool) -> Self {
         Self {
             pg_dsn,
             pg: tokio::sync::OnceCell::new(),
             s3_client,
-            query_parser: Arc::new(RedshiftQueryParser),
+            query_parser: Arc::new(RedshiftQueryParser { case_sensitive }),
         }
     }
 

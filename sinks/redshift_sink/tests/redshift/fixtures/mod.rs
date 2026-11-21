@@ -21,6 +21,7 @@ mod sink;
 
 pub use container::{PostgresContainer, RedshiftContainer};
 pub use sink::{
-    RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
-    RedshiftSinkVarbyteFixture,
+    RedshiftSinkCaseSensitiveFixture, RedshiftSinkDefaultSchemaFixture, RedshiftSinkFixture,
+    RedshiftSinkFoldedFixture, RedshiftSinkIdentifierFixture, RedshiftSinkJsonFixture,
+    RedshiftSinkNoArchiveFixture, RedshiftSinkVarbyteFixture,
 };

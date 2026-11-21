@@ -37,12 +37,13 @@ pub async fn fetch_table_columns(
     pg: &PgClient,
     table: &str,
 ) -> Result<Option<Vec<ColumnDef>>, String> {
-    let query = format!(
-        "SELECT column_name, udt_name FROM information_schema.columns WHERE table_name = '{}' ORDER BY ordinal_position",
-        table.replace('"', "")
-    );
+    // Resolve the quoted relation exactly as COPY does, including its schema.
+    let query = "SELECT attname, typname FROM pg_attribute
+         JOIN pg_type ON atttypid = pg_type.oid
+         WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped
+         ORDER BY attnum";
 
-    let rows = pg.query(&query, &[]).await.map_err(|e| {
+    let rows = pg.query(query, &[&table]).await.map_err(|e| {
         tracing::error!("{:?}", e);
         e.to_string()
     })?;

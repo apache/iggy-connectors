@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::container::{
+use async_trait::async_trait;
+use iggy_connector_sdk::Schema;
+use iggy_connector_testing::rabbitmq::{
     DEFAULT_CONSUMER_GROUP, DEFAULT_EXCHANGE, DEFAULT_EXCHANGE_TYPE, DEFAULT_ROUTING_KEY,
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_AMQP_URL, ENV_SINK_EXCHANGE,
     ENV_SINK_EXCHANGE_TYPE, ENV_SINK_INCLUDE_METADATA, ENV_SINK_PATH, ENV_SINK_ROUTING_KEY,
     ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
     ENV_SINK_STREAMS_0_TOPICS, RabbitMqContainer, RabbitMqOps,
 };
-use async_trait::async_trait;
-use iggy_connector_sdk::Schema;
 use integration::harness::{TestBinaryError, TestFixture};
 use std::collections::HashMap;
 

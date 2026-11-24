@@ -99,12 +99,13 @@ Omitting the setting or using `none` preserves uncompressed output and its exist
 
 Rotation thresholds still count uncompressed formatted record bytes or messages.
 Compression uses the libraries' default levels, runs once per file, and reuses the same compressed bytes on retries.
+zstd frames include a content checksum and the decompressed size.
 Small or incompressible files can grow. Readers must support the selected codec.
 HTTP clients that automatically decode `Content-Encoding` can return decompressed bytes.
 Loss markers remain uncompressed text without `Content-Encoding`, even though their keys follow the data object's suffix,
 for example `.jsonl.gz.lost`.
 
-Compression uses CPU time on the plugin's runtime worker and temporarily holds both the finalized and encoded bytes.
+Compression runs inside the `consume` or `close` call that flushes the file and temporarily holds both the finalized and encoded bytes.
 Choose file sizes that fit your CPU and memory budget and leave room for format and compression overhead within
 the single-upload limit. Changing compression changes object keys; replaying the same offsets after a change
 can create additional objects.

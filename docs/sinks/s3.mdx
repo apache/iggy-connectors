@@ -81,9 +81,9 @@ Set `compression = "gzip"` or `compression = "zstd"` to compress each finalized 
 | `gzip` | `.jsonl.gz`, `.json.gz`, `.bin.gz` | `gzip` |
 | `zstd` | `.jsonl.zst`, `.json.zst`, `.bin.zst` | `zstd` |
 
-File rotation still uses the uncompressed record size or message count. The sink compresses once per file using the libraries' default levels and reuses the same bytes for upload retries. Small or incompressible files can grow. Choose a codec supported by your downstream reader. Some HTTP clients automatically decompress responses according to `Content-Encoding`; disable that behavior when downloading encoded bytes for manual decompression. Loss markers remain uncompressed text without `Content-Encoding`, for example an object named `.jsonl.gz.lost`.
+File rotation still uses the uncompressed record size or message count. The sink compresses once per file using the libraries' default levels and reuses the same bytes for upload retries. zstd frames include a content checksum and the decompressed size. Small or incompressible files can grow. Choose a codec supported by your downstream reader. Some HTTP clients automatically decompress responses according to `Content-Encoding`; disable that behavior when downloading encoded bytes for manual decompression. Loss markers remain uncompressed text without `Content-Encoding`, for example an object named `.jsonl.gz.lost`.
 
-Compression uses the plugin worker's CPU and temporarily holds both finalized and encoded bytes. Choose file sizes that fit your CPU and memory budget, with room for format and compression overhead within the single-upload limit. A change of codec changes object keys, so replayed offsets can produce additional objects.
+Compression runs inside the `consume` or `close` call that flushes the file and temporarily holds both finalized and encoded bytes. Choose file sizes that fit your CPU and memory budget, with room for format and compression overhead within the single-upload limit. A change of codec changes object keys, so replayed offsets can produce additional objects.
 
 ## Credentials
 

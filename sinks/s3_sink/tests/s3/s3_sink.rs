@@ -22,6 +22,7 @@ use flate2::read::GzDecoder;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
+use iggy_connector_s3_sink::Compression;
 use iggy_connector_sdk::api::{ConnectorStatus, SinkInfoResponse};
 use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
@@ -241,7 +242,7 @@ async fn s3_sink_rotates_on_message_count(harness: &TestHarness, fixture: S3Sink
     seed = seeds::connector_stream
 )]
 async fn s3_sink_writes_gzip_jsonl(harness: &TestHarness, fixture: S3SinkGzipFixture) {
-    assert_compressed_jsonl(harness, &fixture, "gzip", ".jsonl.gz").await;
+    assert_compressed_jsonl(harness, &fixture, Compression::Gzip).await;
 }
 
 #[iggy_harness(
@@ -249,15 +250,19 @@ async fn s3_sink_writes_gzip_jsonl(harness: &TestHarness, fixture: S3SinkGzipFix
     seed = seeds::connector_stream
 )]
 async fn s3_sink_writes_zstd_jsonl(harness: &TestHarness, fixture: S3SinkZstdFixture) {
-    assert_compressed_jsonl(harness, &fixture, "zstd", ".jsonl.zst").await;
+    assert_compressed_jsonl(harness, &fixture, Compression::Zstd).await;
 }
 
 async fn assert_compressed_jsonl(
     harness: &TestHarness,
     fixture: &impl S3SinkOps,
-    encoding: &str,
-    suffix: &str,
+    compression: Compression,
 ) {
+    let (encoding, suffix) = match compression {
+        Compression::None => (None, ".jsonl"),
+        Compression::Gzip => (Some("gzip"), ".jsonl.gz"),
+        Compression::Zstd => (Some("zstd"), ".jsonl.zst"),
+    };
     let client = harness.root_client().await.unwrap();
     let expected = create_test_messages(10);
     let mut messages: Vec<IggyMessage> = expected
@@ -315,25 +320,13 @@ async fn assert_compressed_jsonl(
             .await
             .expect("Download compressed object");
         assert_eq!(response.status(), 200);
-        assert_eq!(response.headers()["content-encoding"], encoding);
+        let content_encoding = response
+            .headers()
+            .get("content-encoding")
+            .map(|value| value.to_str().unwrap().to_owned());
+        assert_eq!(content_encoding.as_deref(), encoding);
         let data = response.bytes().await.unwrap();
-        let magic: &[u8] = if encoding == "gzip" {
-            &[0x1f, 0x8b]
-        } else {
-            &[0x28, 0xb5, 0x2f, 0xfd]
-        };
-        assert!(data.starts_with(magic), "Stored bytes must use {encoding}");
-        let decoded = match encoding {
-            "gzip" => {
-                let mut decoded = Vec::new();
-                GzDecoder::new(data.as_ref())
-                    .read_to_end(&mut decoded)
-                    .unwrap();
-                decoded
-            }
-            "zstd" => zstd::stream::decode_all(data.as_ref()).unwrap(),
-            _ => unreachable!("Only compressed test cases use this helper"),
-        };
+        let decoded = decode(compression, &data);
         let content = std::str::from_utf8(&decoded).unwrap();
         let lines: Vec<_> = content.lines().collect();
         assert_eq!(
@@ -353,5 +346,17 @@ async fn assert_compressed_jsonl(
         assert_eq!(record["stream"], seeds::names::STREAM);
         assert_eq!(record["topic"], seeds::names::TOPIC);
         assert_eq!(record["payload"], serde_json::to_value(payload).unwrap());
+    }
+}
+
+fn decode(compression: Compression, data: &[u8]) -> Vec<u8> {
+    match compression {
+        Compression::None => data.to_vec(),
+        Compression::Gzip => {
+            let mut decoded = Vec::new();
+            GzDecoder::new(data).read_to_end(&mut decoded).unwrap();
+            decoded
+        }
+        Compression::Zstd => zstd::stream::decode_all(data).unwrap(),
     }
 }

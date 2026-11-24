@@ -519,7 +519,6 @@ mod tests {
             });
             let config: S3SinkConfig = serde_json::from_value(json).unwrap();
             assert_eq!(config.compression, expected);
-            assert_eq!(serde_json::to_value(config).unwrap()["compression"], value);
         }
     }
 

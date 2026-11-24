@@ -332,7 +332,7 @@ impl S3Sink {
     }
 
     async fn do_upload(&self, bucket: &s3::Bucket, payload: FlushPayload) -> Result<(), Error> {
-        // Compress outside the buffer lock and reuse the finalized bytes on every retry.
+        // Compress once, outside the buffer lock, so every retry sends the same encoded bytes.
         let result = async {
             let data = self.config.compression.encode(payload.data)?;
             self.upload_with_retry(bucket, &payload.s3_key, &data, self.config.compression)
@@ -414,9 +414,7 @@ impl S3Sink {
         let base_delay = resolved.retry_delay;
         let mut attempt = 0u32;
         let headers = compression.content_encoding().map(|encoding| {
-            let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
-            headers
+            HeaderMap::from_iter([(CONTENT_ENCODING, HeaderValue::from_static(encoding))])
         });
 
         loop {
@@ -472,9 +470,6 @@ fn is_retriable_status(status: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-
-    use flate2::read::GzDecoder;
     use iggy_connector_sdk::{Payload, Schema};
     use wiremock::matchers::{any, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -533,18 +528,6 @@ mod tests {
         }
     }
 
-    fn decode_object(compression: Compression, data: &[u8]) -> Vec<u8> {
-        match compression {
-            Compression::None => data.to_vec(),
-            Compression::Gzip => {
-                let mut decoded = Vec::new();
-                GzDecoder::new(data).read_to_end(&mut decoded).unwrap();
-                decoded
-            }
-            Compression::Zstd => zstd::stream::decode_all(data).unwrap(),
-        }
-    }
-
     fn raw_message(offset: u64) -> ConsumedMessage {
         ConsumedMessage {
             id: u128::from(offset) + 1,
@@ -575,25 +558,35 @@ mod tests {
                 (Compression::Zstd, ".zst", Some("zstd")),
             ] {
                 for (format, extension, expected) in [
-                    ("json_lines", "jsonl", [
-                        "{\"payload\":{\"value\":0}}\n{\"payload\":{\"value\":1}}\n",
-                        "{\"payload\":{\"value\":2}}\n",
-                    ]),
-                    ("json_array", "json", [
-                        "[{\"payload\":{\"value\":0}},{\"payload\":{\"value\":1}}]",
-                        "[{\"payload\":{\"value\":2}}]",
-                    ]),
-                    ("raw", "bin", [
-                        "{\"value\":0}{\"value\":1}",
-                        "{\"value\":2}",
-                    ]),
+                    (
+                        "json_lines",
+                        "jsonl",
+                        [
+                            "{\"payload\":{\"value\":0}}\n{\"payload\":{\"value\":1}}\n",
+                            "{\"payload\":{\"value\":2}}\n",
+                        ],
+                    ),
+                    (
+                        "json_array",
+                        "json",
+                        [
+                            "[{\"payload\":{\"value\":0}},{\"payload\":{\"value\":1}}]",
+                            "[{\"payload\":{\"value\":2}}]",
+                        ],
+                    ),
+                    (
+                        "raw",
+                        "bin",
+                        ["{\"value\":0}{\"value\":1}", "{\"value\":2}"],
+                    ),
                 ] {
                     let server = MockServer::start().await;
                     mock_write_probe(&server, "data/.iggy-sink-probe").await;
                     Mock::given(method("PUT"))
                         .respond_with(ResponseTemplate::new(200))
                         .expect(2)
-                        .mount(&server).await;
+                        .mount(&server)
+                        .await;
                     let config = S3SinkConfig {
                         endpoint: Some(server.uri()),
                         access_key_id: Some("test-access-key".into()),
@@ -609,29 +602,55 @@ mod tests {
                     let mut sink = S3Sink::new(1, config);
                     sink.open().await.unwrap();
                     sink.consume(
-                        &TopicMetadata { stream: "events".to_string(), topic: "messages".to_string() },
+                        &TopicMetadata {
+                            stream: "events".to_string(),
+                            topic: "messages".to_string(),
+                        },
                         raw_metadata(),
                         (0..3).map(raw_message).collect(),
-                    ).await.unwrap();
+                    )
+                    .await
+                    .unwrap();
                     let requests = server.received_requests().await.unwrap();
-                    assert_eq!(requests.iter().filter(|request| request.method == "PUT").count(), 1,
-                        "Only the full buffer should be uploaded before close");
+                    let puts = requests.iter().filter(|request| request.method == "PUT");
+                    assert_eq!(
+                        puts.count(),
+                        1,
+                        "Only the full buffer should be uploaded before close"
+                    );
                     sink.close().await.unwrap();
                     let requests = server.received_requests().await.unwrap();
-                    for request in requests.iter().filter(|request| request.method != "PUT") {
+                    let (uploads, others): (Vec<_>, Vec<_>) =
+                        requests.iter().partition(|request| request.method == "PUT");
+                    for request in others {
                         assert!(!request.headers.contains_key(CONTENT_ENCODING));
                     }
-                    let uploads: Vec<_> = requests.iter().filter(|request| request.method == "PUT").collect();
                     assert_eq!(uploads.len(), 2);
                     for (index, request) in uploads.iter().enumerate() {
                         let (start, end) = if index == 0 { (0, 1) } else { (2, 2) };
-                        assert_eq!(request.url.path(), format!(
-                            "/test-bucket/data/events/messages/00000-{start:020}-{end:020}.{extension}{suffix}"
-                        ));
-                        assert_eq!(request.headers.get(CONTENT_ENCODING).map(|value| value.to_str().unwrap()), encoding);
+                        let object = format!("00000-{start:020}-{end:020}.{extension}{suffix}");
+                        let content_length: usize = request.headers["content-length"]
+                            .to_str()
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        assert_eq!(
+                            request.url.path(),
+                            format!("/test-bucket/data/events/messages/{object}")
+                        );
+                        assert_eq!(
+                            request
+                                .headers
+                                .get(CONTENT_ENCODING)
+                                .map(|value| value.to_str().unwrap()),
+                            encoding
+                        );
                         assert_eq!(request.headers["content-type"], "application/octet-stream");
-                        assert_eq!(request.headers["content-length"].to_str().unwrap().parse::<usize>().unwrap(), request.body.len());
-                        assert_eq!(decode_object(compression, &request.body), expected[index].as_bytes());
+                        assert_eq!(content_length, request.body.len());
+                        assert_eq!(
+                            compression.decode(&request.body),
+                            expected[index].as_bytes()
+                        );
                     }
                     let state = sink.state.lock().await;
                     assert_eq!(state.messages_uploaded, 3);
@@ -696,7 +715,7 @@ mod tests {
                         request.headers[CONTENT_ENCODING],
                         compression.content_encoding().unwrap()
                     );
-                    assert_eq!(decode_object(compression, &request.body), b"{\"value\":0}");
+                    assert_eq!(compression.decode(&request.body), b"{\"value\":0}");
                 }
                 let state = sink.state.lock().await;
                 assert_eq!(state.messages_uploaded, 1);

@@ -36,12 +36,7 @@ use crate::{OpenState, ScopeDBSink, encode};
 #[async_trait]
 impl Sink for ScopeDBSink {
     async fn open(&mut self) -> Result<(), Error> {
-        self.try_open().await.inspect_err(|error| {
-            error!(
-                "Failed to open ScopeDB sink connector ID: {}: {error}",
-                self.id
-            );
-        })
+        self.try_open().await
     }
 
     async fn consume(

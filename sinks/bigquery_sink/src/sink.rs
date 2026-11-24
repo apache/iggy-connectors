@@ -37,14 +37,7 @@ impl Sink for BigQuerySink {
             "Opening BigQuery sink connector ID: {} for table {} (mode: {:?})",
             self.id, self.target, self.settings.mode
         );
-        // The SDK turns a failed open into a bare status code, so this is the
-        // only place the reason reaches the runtime log.
-        self.try_open().await.inspect_err(|e| {
-            error!(
-                "Failed to open BigQuery sink connector ID: {} for table {}: {e}",
-                self.id, self.target
-            );
-        })
+        self.try_open().await
     }
 
     async fn consume(

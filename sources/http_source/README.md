@@ -387,7 +387,7 @@ Truncating the state file is the same act as deleting it, not a gentler one. The
 
 **Keep the admin listener private.** It defaults to loopback. The management API is token-guarded, but health and metrics are not, and they expose instance names and traffic volumes.
 
-**Read the connector's log for why an `open()` failed, not `last_error`.** Every startup refusal names its cause: the invalid configuration field, the field a joining instance disagrees on, the route it conflicts over, or the state file it cannot decode. None of it survives the plugin boundary, which carries only success or failure, so the runtime records `Plugin initialization failed` on the control API instead. The connector logs the real reason itself just before it gives up.
+**Read the connector's log for why an `open()` failed, not `last_error`.** Every startup refusal names its cause: the invalid configuration field, the field a joining instance disagrees on, the route it conflicts over, or the state file it cannot decode. None of it survives the plugin boundary, which carries only success or failure, so the runtime records `Plugin initialization failed` on the control API instead. The SDK logs the cause: `Failed to open source connector with ID: <id>. <error>`.
 
 ## Limitations
 

@@ -869,8 +869,6 @@ impl HttpSource {
         }
     }
 
-    /// Everything `open` does, split out so its one caller can log whatever
-    /// failed without a line at each of the three failure points.
     async fn open_inner(&mut self) -> Result<(), Error> {
         if let Some(error) = self.restore_error.take() {
             return Err(error);
@@ -2644,10 +2642,9 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_refused_registry_when_opened_should_name_the_reason_once() {
-        // What `open` logs is the only account of this failure an operator
-        // gets: the SDK's shim drops the payload and the runtime reports
-        // "Plugin initialization failed" as `last_error`. So the text matters
-        // in a way it did not while nothing read it, and it used to carry
+        // The SDK's `open` shim logs this text, and it is the only account of
+        // the failure an operator gets: the runtime reports "Plugin
+        // initialization failed" as `last_error`. It used to carry
         // `InitError`'s prefix twice from being wrapped on the way out of
         // `new`.
         let mut source = HttpSource::new(

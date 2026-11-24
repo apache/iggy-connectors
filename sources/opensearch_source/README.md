@@ -234,7 +234,7 @@ count.
 
 | Symptom | Check |
 | --- | --- |
-| Runtime log says `Plugin initialization failed` | The connector logs the cause just before it, as `Failed to open OpenSearch source connector ID: <id>: <error>`. |
+| Runtime log says `Plugin initialization failed` | The SDK logs the cause just before it, as `Failed to open source connector with ID: <id>. <error>`. |
 | `open()` fails on a missing index | Index name, URL and credentials. |
 | `open()` fails with `state restore failed` | Repair or delete the saved state. A state saved for another `index`, `timestamp_field` or `query` also fails this way. |
 | Nothing new after a restart | The `timestamp_field` mapping must match the indexed documents. |

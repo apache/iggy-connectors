@@ -5,11 +5,11 @@ description: "Write messages from Iggy streams to Amazon S3 and S3-compatible ob
 
 The S3 sink connector writes messages from Iggy streams to Amazon S3 and S3-compatible object stores (MinIO, Cloudflare R2, DigitalOcean Spaces, Backblaze B2). Messages are buffered in memory and uploaded as files, rotated by size or message count, under configurable path templates with offset ranges in the object names.
 
-This page is a curated subset of the documentation. The canonical reference is the upstream [s3_sink README](https://github.com/apache/iggy/tree/server-0.10.0/core/connectors/sinks/s3_sink) in the `apache/iggy` repository.
+This page is a curated subset of the documentation. The canonical reference is the [s3_sink README](https://github.com/apache/iggy-connectors/tree/master/sinks/s3_sink) in the `apache/iggy-connectors` repository.
 
 ## Configuration
 
-Use the broker credentials and runtime setup from the [sink guide](/docs/connectors/sinks/sink#configuration). From the matching 0.10.0 Iggy checkout root, build the plugin:
+Use the broker credentials and runtime setup from the [sink guide](/docs/connectors/sinks/sink#configuration). From the matching connectors checkout root, build the plugin:
 
 ```bash
 cargo build --release -p iggy_connector_s3_sink
@@ -43,6 +43,7 @@ path_template = "{stream}/{topic}/{date}/{hour}"
 file_rotation = "size"
 max_file_size = "8MiB"
 output_format = "json_lines"
+compression = "none" # none | gzip | zstd
 ```
 
 ### Common Options
@@ -58,16 +59,31 @@ output_format = "json_lines"
 | `max_file_size` | string | `8MiB` | Size rotation threshold. Must be positive and at most `5GiB`, even in message-count mode |
 | `max_messages_per_file` | u64 | none | Positive count required in `messages` mode. Ignored by size rotation |
 | `output_format` | string | `json_lines` | `json_lines`, `json_array`, or `raw` |
+| `compression` | string | `none` | File compression: `none`, `gzip`, or `zstd` |
 | `include_metadata` | bool | `true` | Include stream/topic/partition/offset/timestamp in JSON output |
 | `include_headers` | bool | `false` | Include available headers in JSON output, independently of metadata |
 
-Further options cover credentials (`access_key_id` / `secret_access_key`), retries (`max_attempts` defaults to `3`, `retry_delay` to `1s`), and `path_style` addressing (auto-enabled when `endpoint` is set, overridable with `false`). `max_retries` is an alias for `max_attempts`. `0` and `1` both make one outer upload attempt. Invalid retry durations prevent startup. `0s` is allowed. Output format names are case-insensitive, with `jsonl` and `jsonlines` aliases for `json_lines`. See the upstream [s3_sink README](https://github.com/apache/iggy/tree/server-0.10.0/core/connectors/sinks/s3_sink) for the full reference.
+Further options cover credentials (`access_key_id` / `secret_access_key`), retries (`max_attempts` defaults to `3`, `retry_delay` to `1s`), and `path_style` addressing (auto-enabled when `endpoint` is set, overridable with `false`). `max_retries` is an alias for `max_attempts`. `0` and `1` both make one outer upload attempt. Invalid retry durations prevent startup. `0s` is allowed. Output format names are case-insensitive, with `jsonl` and `jsonlines` aliases for `json_lines`. See the [s3_sink README](https://github.com/apache/iggy-connectors/tree/master/sinks/s3_sink) for the full reference.
 
 Each stream/topic/partition has its own buffer, retained across polls. Rotation is checked after appending a complete formatted record. Size mode counts record bytes but excludes JSON newlines, commas and array brackets, so an object can exceed `max_file_size`. Message-count mode does not also enforce the size threshold. Uploads use one `PutObject`, with no multipart upload. Choose thresholds and message sizes that fit the [store's single-upload limit](https://docs.aws.amazon.com/AmazonS3/latest/userguide/upload-objects.html). There is no timer flush: a partial buffer waits until its threshold is reached or the connector closes.
 
 Path templates support `{stream}`, `{topic}`, `{partition}`, `{date}`, `{hour}`, and `{timestamp}`. The time-based variables derive from the first message timestamp in each buffer: date/hour use UTC, and `{timestamp}` is epoch milliseconds. File names embed the partition (zero-padded to 5 digits, to prevent cross-partition collisions) and the offset range (zero-padded to 20 digits), e.g. `application_logs/api_requests/2026-03-16/14/00000-00000000000000000000-00000000000000000999.jsonl` before adding the configured prefix.
 
 Stream/topic substitutions preserve ASCII letters, digits, `.`, `_` and `-`, replacing other characters with `_`. Distinct names can therefore produce the same key. Keep stream/topic separation in the template, use names that remain distinct after replacement, and avoid sharing the same output paths across independent producers. A repeated object key overwrites the current object, subject to bucket versioning. The offset range alone does not provide global deduplication. Extensions are `.jsonl`, `.json` and `.bin` for the three formats.
+
+### Compression
+
+Set `compression = "gzip"` or `compression = "zstd"` to compress each finalized file, including a partial file flushed on close. The default `none` preserves the existing bytes and keys. Compression values are lowercase; unsupported values prevent startup.
+
+| Compression | Object extensions | `Content-Encoding` |
+| ----------- | ----------------- | ------------------ |
+| `none` | `.jsonl`, `.json`, `.bin` | Not set |
+| `gzip` | `.jsonl.gz`, `.json.gz`, `.bin.gz` | `gzip` |
+| `zstd` | `.jsonl.zst`, `.json.zst`, `.bin.zst` | `zstd` |
+
+File rotation still uses the uncompressed record size or message count. The sink compresses once per file using the libraries' default levels and reuses the same bytes for upload retries. Small or incompressible files can grow. Choose a codec supported by your downstream reader. Some HTTP clients automatically decompress responses according to `Content-Encoding`; disable that behavior when downloading encoded bytes for manual decompression. Loss markers remain uncompressed text without `Content-Encoding`, for example an object named `.jsonl.gz.lost`.
+
+Compression uses the plugin worker's CPU and temporarily holds both finalized and encoded bytes. Choose file sizes that fit your CPU and memory budget, with room for format and compression overhead within the single-upload limit. A change of codec changes object keys, so replayed offsets can produce additional objects.
 
 ## Credentials
 

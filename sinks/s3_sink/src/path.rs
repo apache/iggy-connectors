@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::OutputFormat;
+use crate::{Compression, OutputFormat};
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::Error;
 
@@ -33,17 +33,19 @@ pub(crate) fn render_s3_key(
     offset_start: u64,
     offset_end: u64,
     format: OutputFormat,
+    compression: Compression,
 ) -> Result<String, Error> {
     let rendered = render_template(template, ctx)?;
 
     // Partition ID is always embedded in the filename to prevent cross-partition
     // key collisions (partitions have independent offset spaces starting at 0).
     let filename = format!(
-        "{:05}-{:020}-{:020}.{}",
+        "{:05}-{:020}-{:020}.{}{}",
         ctx.partition_id,
         offset_start,
         offset_end,
-        format.file_extension()
+        format.file_extension(),
+        compression.file_suffix()
     );
 
     let key = match prefix {
@@ -123,6 +125,7 @@ mod tests {
             0,
             99,
             OutputFormat::JsonLines,
+            Compression::None,
         )
         .unwrap();
         assert_eq!(
@@ -141,6 +144,7 @@ mod tests {
             100,
             199,
             OutputFormat::JsonArray,
+            Compression::None,
         )
         .unwrap();
         assert_eq!(
@@ -152,7 +156,16 @@ mod tests {
     #[test]
     fn render_no_prefix() {
         let ctx = test_ctx();
-        let key = render_s3_key(None, "{stream}/{topic}", &ctx, 0, 9, OutputFormat::Raw).unwrap();
+        let key = render_s3_key(
+            None,
+            "{stream}/{topic}",
+            &ctx,
+            0,
+            9,
+            OutputFormat::Raw,
+            Compression::None,
+        )
+        .unwrap();
         assert_eq!(
             key,
             "app_logs/api_requests/00001-00000000000000000000-00000000000000000009.bin"
@@ -162,7 +175,16 @@ mod tests {
     #[test]
     fn render_empty_prefix() {
         let ctx = test_ctx();
-        let key = render_s3_key(Some(""), "{stream}", &ctx, 0, 0, OutputFormat::JsonLines).unwrap();
+        let key = render_s3_key(
+            Some(""),
+            "{stream}",
+            &ctx,
+            0,
+            0,
+            OutputFormat::JsonLines,
+            Compression::None,
+        )
+        .unwrap();
         assert_eq!(
             key,
             "app_logs/00001-00000000000000000000-00000000000000000000.jsonl"
@@ -179,6 +201,7 @@ mod tests {
             5,
             10,
             OutputFormat::JsonLines,
+            Compression::None,
         )
         .unwrap();
         assert_eq!(
@@ -190,8 +213,26 @@ mod tests {
     #[test]
     fn timestamp_deterministic_from_message() {
         let ctx = test_ctx();
-        let key1 = render_s3_key(None, "{timestamp}", &ctx, 0, 0, OutputFormat::Raw).unwrap();
-        let key2 = render_s3_key(None, "{timestamp}", &ctx, 0, 0, OutputFormat::Raw).unwrap();
+        let key1 = render_s3_key(
+            None,
+            "{timestamp}",
+            &ctx,
+            0,
+            0,
+            OutputFormat::Raw,
+            Compression::None,
+        )
+        .unwrap();
+        let key2 = render_s3_key(
+            None,
+            "{timestamp}",
+            &ctx,
+            0,
+            0,
+            OutputFormat::Raw,
+            Compression::None,
+        )
+        .unwrap();
         assert_eq!(key1, key2);
     }
 
@@ -215,7 +256,16 @@ mod tests {
             partition_id: 0,
             first_timestamp_micros: 1_710_597_600_000_000,
         };
-        let key = render_s3_key(None, "{stream}/{topic}", &ctx, 0, 0, OutputFormat::Raw).unwrap();
+        let key = render_s3_key(
+            None,
+            "{stream}/{topic}",
+            &ctx,
+            0,
+            0,
+            OutputFormat::Raw,
+            Compression::None,
+        )
+        .unwrap();
         assert!(
             !key.contains("//"),
             "Sanitized key must not contain '//' from stream name: {key}"
@@ -229,8 +279,16 @@ mod tests {
     #[test]
     fn lex_sort_correct_with_large_offsets() {
         let ctx = test_ctx();
-        let key_small =
-            render_s3_key(None, "{stream}", &ctx, 999_900, 999_999, OutputFormat::Raw).unwrap();
+        let key_small = render_s3_key(
+            None,
+            "{stream}",
+            &ctx,
+            999_900,
+            999_999,
+            OutputFormat::Raw,
+            Compression::None,
+        )
+        .unwrap();
         let key_large = render_s3_key(
             None,
             "{stream}",
@@ -238,8 +296,42 @@ mod tests {
             1_000_000,
             1_001_000,
             OutputFormat::Raw,
+            Compression::None,
         )
         .unwrap();
         assert!(key_small < key_large, "Lexicographic sort must be correct");
+    }
+
+    #[test]
+    fn given_compression_when_rendering_keys_should_preserve_layout_and_append_suffix() {
+        let ctx = test_ctx();
+        for (format, extension) in [
+            (OutputFormat::JsonLines, "jsonl"),
+            (OutputFormat::JsonArray, "json"),
+            (OutputFormat::Raw, "bin"),
+        ] {
+            for (compression, suffix) in [
+                (Compression::None, ""),
+                (Compression::Gzip, ".gz"),
+                (Compression::Zstd, ".zst"),
+            ] {
+                let key = render_s3_key(
+                    Some("data"),
+                    "{stream}/{topic}/{date}/{hour}",
+                    &ctx,
+                    5,
+                    9,
+                    format,
+                    compression,
+                )
+                .unwrap();
+                assert_eq!(
+                    key,
+                    format!(
+                        "data/app_logs/api_requests/2024-03-16/14/00001-00000000000000000005-00000000000000000009.{extension}{suffix}"
+                    )
+                );
+            }
+        }
     }
 }

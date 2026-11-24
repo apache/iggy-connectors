@@ -42,6 +42,7 @@ file_rotation = "size"
 max_file_size = "8MiB"
 # max_messages_per_file = 10000            # used when file_rotation = "messages"
 output_format = "json_lines"
+compression = "none" # none | gzip | zstd
 include_metadata = true
 include_headers = true
 max_attempts = 3

@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::io::Read;
+
 use bytes::Bytes;
+use flate2::read::GzDecoder;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
 use iggy_connector_sdk::api::{ConnectorStatus, SinkInfoResponse};
-use integration::harness::seeds;
+use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
 use reqwest::Client;
 use s3::{
@@ -28,7 +31,9 @@ use s3::{
     request::{Request, tokio_backend::ReqwestRequest},
 };
 
-use crate::fixtures::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
+use crate::fixtures::{
+    S3SinkFixture, S3SinkGzipFixture, S3SinkOps, S3SinkRotationFixture, S3SinkZstdFixture,
+};
 use iggy_connector_testing::create_test_messages;
 
 const API_KEY: &str = "test-api-key";
@@ -228,5 +233,125 @@ async fn s3_sink_rotates_on_message_count(harness: &TestHarness, fixture: S3Sink
             key.contains("/00000-"),
             "All keys must contain partition_id"
         );
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/s3/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn s3_sink_writes_gzip_jsonl(harness: &TestHarness, fixture: S3SinkGzipFixture) {
+    assert_compressed_jsonl(harness, &fixture, "gzip", ".jsonl.gz").await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/s3/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn s3_sink_writes_zstd_jsonl(harness: &TestHarness, fixture: S3SinkZstdFixture) {
+    assert_compressed_jsonl(harness, &fixture, "zstd", ".jsonl.zst").await;
+}
+
+async fn assert_compressed_jsonl(
+    harness: &TestHarness,
+    fixture: &impl S3SinkOps,
+    encoding: &str,
+    suffix: &str,
+) {
+    let client = harness.root_client().await.unwrap();
+    let expected = create_test_messages(10);
+    let mut messages: Vec<IggyMessage> = expected
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            IggyMessage::builder()
+                .id((index + 1) as u128)
+                .payload(Bytes::from(serde_json::to_vec(payload).unwrap()))
+                .build()
+                .unwrap()
+        })
+        .collect();
+    client
+        .send_messages(
+            &seeds::names::STREAM.try_into().unwrap(),
+            &seeds::names::TOPIC.try_into().unwrap(),
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Send messages");
+
+    let prefix = format!("{}/", seeds::names::STREAM);
+    let mut keys = fixture
+        .wait_for_objects(&prefix, 2)
+        .await
+        .expect("Wait for compressed objects");
+    keys.sort();
+    assert_eq!(
+        keys.len(),
+        2,
+        "Message-count rotation should produce two files"
+    );
+
+    // Read encoded bytes even if another dependency enables automatic HTTP decompression.
+    let http_client = Client::builder()
+        .no_gzip()
+        .no_zstd()
+        .no_brotli()
+        .no_deflate()
+        .build()
+        .unwrap();
+    let mut records = Vec::new();
+    for key in keys {
+        assert!(key.ends_with(suffix), "Unexpected object extension: {key}");
+        let url = fixture
+            .bucket()
+            .presign_get(&key, 60, None)
+            .await
+            .expect("Sign object download");
+        let response = http_client
+            .get(url)
+            .send()
+            .await
+            .expect("Download compressed object");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-encoding"], encoding);
+        let data = response.bytes().await.unwrap();
+        let magic: &[u8] = if encoding == "gzip" {
+            &[0x1f, 0x8b]
+        } else {
+            &[0x28, 0xb5, 0x2f, 0xfd]
+        };
+        assert!(data.starts_with(magic), "Stored bytes must use {encoding}");
+        let decoded = match encoding {
+            "gzip" => {
+                let mut decoded = Vec::new();
+                GzDecoder::new(data.as_ref())
+                    .read_to_end(&mut decoded)
+                    .unwrap();
+                decoded
+            }
+            "zstd" => zstd::stream::decode_all(data.as_ref()).unwrap(),
+            _ => unreachable!("Only compressed test cases use this helper"),
+        };
+        let content = std::str::from_utf8(&decoded).unwrap();
+        let lines: Vec<_> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            5,
+            "Each file must contain the complete rotated batch"
+        );
+        for line in lines {
+            records.push(serde_json::from_str::<serde_json::Value>(line).unwrap());
+        }
+    }
+    records.sort_by_key(|record| record["offset"].as_u64().unwrap());
+    assert_eq!(records.len(), expected.len());
+    for (offset, (record, payload)) in records.iter().zip(expected).enumerate() {
+        assert_eq!(record["offset"], offset as u64);
+        assert_eq!(record["partition_id"], 0);
+        assert_eq!(record["stream"], seeds::names::STREAM);
+        assert_eq!(record["topic"], seeds::names::TOPIC);
+        assert_eq!(record["payload"], serde_json::to_value(payload).unwrap());
     }
 }

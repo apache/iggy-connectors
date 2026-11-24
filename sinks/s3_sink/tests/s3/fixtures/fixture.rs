@@ -43,6 +43,7 @@ const ENV_SINK_PLUGIN_SECRET_KEY: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_
 const ENV_SINK_PLUGIN_FILE_ROTATION: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_FILE_ROTATION";
 const ENV_SINK_PLUGIN_MAX_MESSAGES: &str =
     "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_MAX_MESSAGES_PER_FILE";
+const ENV_SINK_PLUGIN_COMPRESSION: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_COMPRESSION";
 
 const DEFAULT_MAX_MESSAGES_PER_FILE: usize = 5;
 const POLL_ATTEMPTS: usize = 30;
@@ -219,6 +220,64 @@ impl TestFixture for S3SinkRotationFixture {
             "messages".to_string(),
         );
         envs.insert(ENV_SINK_PLUGIN_MAX_MESSAGES.to_string(), "10".to_string());
+        envs
+    }
+}
+
+pub struct S3SinkGzipFixture {
+    inner: S3SinkFixture,
+}
+
+impl S3SinkOps for S3SinkGzipFixture {
+    fn bucket(&self) -> &Bucket {
+        self.inner.bucket()
+    }
+
+    fn endpoint(&self) -> &str {
+        self.inner.endpoint()
+    }
+}
+
+#[async_trait]
+impl TestFixture for S3SinkGzipFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: S3SinkFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SINK_PLUGIN_COMPRESSION.to_string(), "gzip".to_string());
+        envs
+    }
+}
+
+pub struct S3SinkZstdFixture {
+    inner: S3SinkFixture,
+}
+
+impl S3SinkOps for S3SinkZstdFixture {
+    fn bucket(&self) -> &Bucket {
+        self.inner.bucket()
+    }
+
+    fn endpoint(&self) -> &str {
+        self.inner.endpoint()
+    }
+}
+
+#[async_trait]
+impl TestFixture for S3SinkZstdFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self {
+            inner: S3SinkFixture::setup().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SINK_PLUGIN_COMPRESSION.to_string(), "zstd".to_string());
         envs
     }
 }

@@ -24,6 +24,7 @@ members = [
     "sinks/delta_sink",
     "sinks/doris_sink",
     "sinks/elasticsearch_sink",
+    "sinks/fluss_sink",
     "sinks/http_sink",
     "sinks/iceberg_sink",
     "sinks/influxdb_sink",
@@ -91,6 +92,7 @@ figment = { version = "0.10.19", features = ["toml", "env"] }
 flatbuffers = "25.12.19"
 flate2 = "1.1.10"
 flume = "0.12.0"
+fluss-rs = { version = "1.0.0" }
 futures = "0.3.34"
 gcloud-bigquery = { version = "1.8.0", default-features = false, features = [
     "auth",

@@ -187,6 +187,7 @@ A `Sink` implementation uses the `sink_connector!` macro, which exposes the FFI 
 | [Delta Lake](sinks/delta_sink/README.md)            | Delta Lake tables                                                       |
 | [Apache Doris](sinks/doris_sink/README.md)          | Apache Doris tables, through the Stream Load HTTP API                   |
 | [Elasticsearch](sinks/elasticsearch_sink/README.md) | Elasticsearch indices                                                   |
+| [Apache Fluss](sinks/fluss_sink/README.md)          | Apache Fluss log and primary-key tables, fixed or routed per message    |
 | [HTTP](sinks/http_sink/README.md)                   | any HTTP endpoint, for example a webhook or a REST API                  |
 | [Apache Iceberg](sinks/iceberg_sink/README.md)      | Apache Iceberg tables, through a REST catalog                           |
 | [InfluxDB](sinks/influxdb_sink/README.md)           | InfluxDB V2 and V3, as line-protocol points                             |

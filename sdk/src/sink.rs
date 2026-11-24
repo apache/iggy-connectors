@@ -248,6 +248,9 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
             let mut sink = factory(id, config);
             let runtime = get_runtime();
             let result = runtime.block_on(sink.open());
+            if let Err(error) = &result {
+                error!("Failed to open sink connector with ID: {id}. {error}");
+            }
             self.id = id;
             self.sink = Some(sink);
             if result.is_ok() { 0 } else { 1 }

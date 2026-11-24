@@ -419,13 +419,7 @@ impl OtlpSink {
 #[async_trait]
 impl Sink for OtlpSink {
     async fn open(&mut self) -> Result<(), Error> {
-        // The SDK does not log the error `open` returns, so the reason would be lost.
-        let opened = Opened::new(self.id, &self.config).inspect_err(|error| {
-            error!(
-                "Failed to open OTLP sink connector ID: {}: {error}",
-                self.id
-            )
-        })?;
+        let opened = Opened::new(self.id, &self.config)?;
         info!(
             "Opened OTLP sink connector ID: {}, endpoint: {}",
             self.id,

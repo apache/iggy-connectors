@@ -455,10 +455,6 @@ impl Sink for QuickwitSink {
         .await;
         if let Err(error) = result {
             self.client = None;
-            error!(
-                "Failed to open Quickwit sink connector ID: {}: {error}",
-                self.id
-            );
             return Err(error);
         }
 

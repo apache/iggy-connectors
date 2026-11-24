@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::{Admission, admit_endpoint};
 use crate::server::{INSTANCE_HEADER, RECEIVED_AT_HEADER, REMOTE_ADDR_HEADER};
@@ -869,8 +869,6 @@ impl HttpSource {
         }
     }
 
-    /// Everything `open` does, split out so its one caller can log whatever
-    /// failed without a line at each of the three failure points.
     async fn open_inner(&mut self) -> Result<(), Error> {
         if let Some(error) = self.restore_error.take() {
             return Err(error);
@@ -991,20 +989,7 @@ impl HttpSource {
 #[async_trait]
 impl Source for HttpSource {
     async fn open(&mut self) -> Result<(), Error> {
-        let id = self.shared.id;
-        let opened = self.open_inner().await;
-        // The only place this reason exists. The SDK's `open` shim returns
-        // `0`/`1` and drops the `Err` payload, and the runtime substitutes
-        // "Plugin initialization failed" for `last_error`, so every message
-        // below this call was unreachable text: all of `validate`'s, the
-        // field `join` names on a mismatch, a route conflict, and the refusal
-        // to serve an undecodable registry. The log callback is installed
-        // before the plugin is built, so an `error!` here does reach the
-        // runtime's log even though the return value does not.
-        if let Err(error) = &opened {
-            error!("Failed to open {CONNECTOR_NAME} connector ID: {id}: {error}");
-        }
-        opened
+        self.open_inner().await
     }
 
     fn batch_policy(&self) -> source::BatchPolicy {
@@ -2657,10 +2642,9 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_refused_registry_when_opened_should_name_the_reason_once() {
-        // What `open` logs is the only account of this failure an operator
-        // gets: the SDK's shim drops the payload and the runtime reports
-        // "Plugin initialization failed" as `last_error`. So the text matters
-        // in a way it did not while nothing read it, and it used to carry
+        // The SDK's `open` shim logs this text, and it is the only account of
+        // the failure an operator gets: the runtime reports "Plugin
+        // initialization failed" as `last_error`. It used to carry
         // `InitError`'s prefix twice from being wrapped on the way out of
         // `new`.
         let mut source = HttpSource::new(

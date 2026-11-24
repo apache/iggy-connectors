@@ -1035,17 +1035,7 @@ impl OpenSearchSource {
 #[async_trait]
 impl Source for OpenSearchSource {
     async fn open(&mut self) -> Result<(), Error> {
-        let opened = self.open_checked().await;
-        // The SDK's `open` shim returns 0 or 1 and drops the `Err` payload, and the runtime
-        // reports only "Plugin initialization failed", so this line is the only place an
-        // operator can read why the connector did not start.
-        if let Err(error) = &opened {
-            error!(
-                "Failed to open {CONNECTOR_NAME} connector ID: {}: {error}",
-                self.id
-            );
-        }
-        opened
+        self.open_checked().await
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {

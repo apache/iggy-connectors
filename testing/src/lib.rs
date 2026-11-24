@@ -23,6 +23,7 @@ pub mod headers;
 pub mod influxdb;
 pub mod influxdb_v3;
 pub mod postgres;
+pub mod rabbitmq;
 pub mod random_source_liveness;
 
 use iggy_common::IggyTimestamp;

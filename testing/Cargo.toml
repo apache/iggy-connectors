@@ -26,8 +26,10 @@ publish = false
 ignored = ["rust-s3"]
 
 [dependencies]
+futures = { workspace = true }
 iggy_common = { workspace = true }
 integration = { workspace = true }
+lapin = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }

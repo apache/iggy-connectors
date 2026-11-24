@@ -47,6 +47,13 @@ updates:
       - dependency-name: "iggy_common"
       - dependency-name: "integration"
       - dependency-name: "system_stats"
+      # iceberg 0.11 needs arrow and parquet 58, and the iceberg sink
+      # passes arrow types to it. When an iceberg release moves to
+      # arrow 59, remove these two entries.
+      - dependency-name: "arrow*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "parquet"
+        update-types: ["version-update:semver-major"]
     groups:
       rust:
         patterns:

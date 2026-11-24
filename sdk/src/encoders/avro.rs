@@ -187,7 +187,7 @@ impl AvroStreamEncoder {
                 let schemas = union_schema.variants();
                 for (idx, variant_schema) in schemas.iter().enumerate() {
                     match Self::serde_json_to_avro_value(value.clone(), variant_schema) {
-                        Ok(avro_val) if avro_val.validate(variant_schema) => {
+                        Ok(avro_val) if avro_val.validate(variant_schema).is_ok() => {
                             return Ok(AvroValue::Union(idx as u32, Box::new(avro_val)));
                         }
                         _ => continue,
@@ -250,7 +250,7 @@ impl AvroStreamEncoder {
                 let avro_val = AvroValue::try_from(value).map_err(|e| {
                     Error::Serialization(format!("JSON value cannot be converted to Avro: {e}"))
                 })?;
-                if avro_val.validate(schema) {
+                if avro_val.validate(schema).is_ok() {
                     Ok(avro_val)
                 } else {
                     Err(Error::Serialization(format!(

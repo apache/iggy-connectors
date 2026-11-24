@@ -31,6 +31,8 @@ use reqwest_retry::{
 use reqwest_tracing::TracingMiddleware;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
+use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -348,7 +350,9 @@ impl HttpSink {
             .tcp_keepalive(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS))
             .danger_accept_invalid_certs(self.tls_danger_accept_invalid_certs)
             .build()
-            .map_err(|e| Error::InitError(format!("Failed to build HTTP client: {}", e)))?;
+            .map_err(|e| {
+                Error::InitError(format!("Failed to build HTTP client: {}", ErrorChain(&e)))
+            })?;
 
         let retry_policy = ExponentialBackoff::builder()
             .retry_bounds(self.retry_delay, self.max_retry_delay)
@@ -1071,6 +1075,21 @@ fn sanitize_url_for_log(url: &str) -> String {
     }
 }
 
+/// Display an error followed by each of its sources, separated by `: `.
+struct ErrorChain<'a>(&'a dyn StdError);
+
+impl fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(cause) = source {
+            write!(f, ": {cause}")?;
+            source = cause.source();
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Sink for HttpSink {
     async fn open(&mut self) -> Result<(), Error> {
@@ -1186,7 +1205,8 @@ impl Sink for HttpSink {
             let response = health_request.send().await.map_err(|e| {
                 Error::Connection(format!(
                     "Health check failed for URL '{}': {}",
-                    self.log_url, e
+                    self.log_url,
+                    ErrorChain(&e)
                 ))
             })?;
 
@@ -2266,5 +2286,57 @@ mod tests {
             headers: None,
             payload: Payload::Json(simd_json_from_str(r#"{"key":"value"}"#)),
         }
+    }
+
+    #[derive(Debug)]
+    struct ChainedError {
+        message: &'static str,
+        source: Option<Box<ChainedError>>,
+    }
+
+    impl fmt::Display for ChainedError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl StdError for ChainedError {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            self.source.as_deref().map(|source| source as &dyn StdError)
+        }
+    }
+
+    fn chained_error(messages: &[&'static str]) -> ChainedError {
+        messages
+            .iter()
+            .rev()
+            .fold(None, |source, message| {
+                Some(ChainedError {
+                    message,
+                    source: source.map(Box::new),
+                })
+            })
+            .expect("at least one message")
+    }
+
+    #[test]
+    fn given_error_without_source_should_display_only_its_message() {
+        let error = chained_error(&["builder error"]);
+
+        assert_eq!(ErrorChain(&error).to_string(), "builder error");
+    }
+
+    #[test]
+    fn given_error_with_source_chain_should_display_every_source_in_order() {
+        let error = chained_error(&[
+            "builder error",
+            "unexpected error",
+            "No CA certificates were loaded from the system",
+        ]);
+
+        assert_eq!(
+            ErrorChain(&error).to_string(),
+            "builder error: unexpected error: No CA certificates were loaded from the system"
+        );
     }
 }

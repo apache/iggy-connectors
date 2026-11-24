@@ -278,6 +278,9 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
             let mut source = factory(id, config, state);
             let runtime = get_runtime();
             let result = runtime.block_on(source.open());
+            if let Err(error) = &result {
+                error!("Failed to open source connector with ID: {id}. {error}");
+            }
             self.batch_policy = source.batch_policy();
             self.id = id;
             self.source = Some(Arc::new(source));

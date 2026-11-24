@@ -19,10 +19,15 @@
 
 use async_trait::async_trait;
 use iggy_connector_sdk::sink::SinkContainer;
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
+use iggy_connector_sdk::source::SourceContainer;
+use iggy_connector_sdk::{
+    ConnectorState, ConsumedMessage, Error, MessagesMetadata, ProducedMessages, Sink, Source,
+    TopicMetadata,
+};
 use std::sync::Mutex;
 
 const WARN: u8 = 3;
+const ERROR: u8 = 4;
 
 /// Level, target and message of every event the plugin handed to the runtime.
 static FORWARDED: Mutex<Vec<(u8, String, String)>> = Mutex::new(Vec::new());
@@ -96,5 +101,107 @@ fn given_an_open_plugin_when_a_dependency_logs_through_the_log_crate_should_forw
                 && target == "opendal::layers::retry"
                 && message.contains("will retry Write")),
         "the record should reach the runtime with its own target and level: {forwarded:?}"
+    );
+}
+
+#[derive(Debug)]
+struct FailingSink;
+
+#[async_trait]
+impl Sink for FailingSink {
+    async fn open(&mut self) -> Result<(), Error> {
+        Err(Error::InitError(
+            "sink endpoint refused the connection".to_owned(),
+        ))
+    }
+
+    async fn consume(
+        &self,
+        _topic_metadata: &TopicMetadata,
+        _messages_metadata: MessagesMetadata,
+        _messages: Vec<ConsumedMessage>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FailingSource;
+
+#[async_trait]
+impl Source for FailingSource {
+    async fn open(&mut self) -> Result<(), Error> {
+        Err(Error::InitError(
+            "source endpoint refused the connection".to_owned(),
+        ))
+    }
+
+    async fn poll(&self) -> Result<ProducedMessages, Error> {
+        Err(Error::InitError("never polled".to_owned()))
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// A copy, so a failed assert does not poison the recorder while another test logs.
+fn forwarded_events() -> Vec<(u8, String, String)> {
+    FORWARDED.lock().expect("recorder was poisoned").clone()
+}
+
+fn has_error(events: &[(u8, String, String)], reason: &str, id: u32) -> bool {
+    events.iter().any(|(level, _, message)| {
+        *level == ERROR && message.contains(reason) && message.contains(&format!("ID: {id}"))
+    })
+}
+
+#[test]
+fn given_a_sink_whose_open_fails_when_opening_should_forward_the_reason() {
+    let mut container = SinkContainer::<FailingSink>::new(7);
+    let config = b"{}";
+    let status = unsafe {
+        container.open(
+            7,
+            config.as_ptr(),
+            config.len(),
+            record_event,
+            |_, _: serde_json::Value| FailingSink,
+        )
+    };
+
+    assert_ne!(status, 0, "the sink should fail to open");
+    let events = forwarded_events();
+    assert!(
+        has_error(&events, "sink endpoint refused the connection", 7),
+        "the reason should reach the runtime at error level: {events:?}"
+    );
+}
+
+#[test]
+fn given_a_source_whose_open_fails_when_opening_should_forward_the_reason() {
+    let mut container = SourceContainer::<FailingSource>::new(8);
+    let config = b"{}";
+    let status = unsafe {
+        container.open(
+            8,
+            config.as_ptr(),
+            config.len(),
+            std::ptr::null(),
+            0,
+            record_event,
+            |_, _: serde_json::Value, _: Option<ConnectorState>| FailingSource,
+        )
+    };
+
+    assert_ne!(status, 0, "the source should fail to open");
+    let events = forwarded_events();
+    assert!(
+        has_error(&events, "source endpoint refused the connection", 8),
+        "the reason should reach the runtime at error level: {events:?}"
     );
 }

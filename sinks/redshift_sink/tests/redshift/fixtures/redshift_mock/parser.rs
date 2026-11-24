@@ -35,6 +35,7 @@ use sqlparser::{
     },
     dialect::{PostgreSqlDialect, RedshiftSqlDialect},
     parser::Parser as SqlParser,
+    tokenizer::{Token, Tokenizer},
 };
 
 use super::util::user_err;
@@ -63,7 +64,9 @@ pub struct ParsedStatement {
 }
 
 #[derive(Clone)]
-pub struct RedshiftQueryParser;
+pub struct RedshiftQueryParser {
+    pub case_sensitive: bool,
+}
 
 #[async_trait]
 impl QueryParser for RedshiftQueryParser {
@@ -79,9 +82,7 @@ impl QueryParser for RedshiftQueryParser {
         C: ClientInfo + Send + Sync,
     {
         tracing::debug!("Parsing sql");
-        let dialect = RedshiftSqlDialect {};
-
-        let mut asts = SqlParser::parse_sql(&dialect, sql)
+        let mut asts = parse_redshift_sql(sql, self.case_sensitive)
             .map_err(|e| user_err(format!("sql parse error: {e}")))?;
 
         if asts.is_empty() {
@@ -95,7 +96,9 @@ impl QueryParser for RedshiftQueryParser {
             ));
         }
 
-        let _ = asts.visit(&mut RedshiftExprRewriter);
+        let _ = asts.visit(&mut RedshiftExprRewriter {
+            case_sensitive: self.case_sensitive,
+        });
 
         tracing::debug!("Query rewritten");
 
@@ -135,6 +138,26 @@ impl QueryParser for RedshiftQueryParser {
     ) -> PgWireResult<Vec<FieldInfo>> {
         Ok(stmt.result_columns.clone())
     }
+}
+
+fn parse_redshift_sql(sql: &str, case_sensitive: bool) -> Result<Vec<SqlStatement>, String> {
+    let dialect = RedshiftSqlDialect {};
+    let mut tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|error| error.to_string())?;
+    // Fold identifiers before parsing so every statement follows Redshift's rules,
+    // including COPY and nested INSERT queries. Never fold string literals or binds.
+    for token in &mut tokens {
+        if let Token::Word(word) = token
+            && (!case_sensitive || word.quote_style.is_none())
+        {
+            word.value.make_ascii_lowercase();
+        }
+    }
+    SqlParser::new(&dialect)
+        .with_tokens(tokens)
+        .parse_statements()
+        .map_err(|error| error.to_string())
 }
 
 fn classify(stmt: &SqlStatement) -> QueryClass {
@@ -372,7 +395,7 @@ pub fn redshift_create_table_to_postgres(create: &mut CreateTable) -> Result<(),
 }
 
 pub fn redshift_select_to_postgres(select: &mut Box<Select>) -> Result<(), String> {
-    rewrite_pg_table_def(select)?;
+    rewrite_svv_columns(select)?;
 
     if select.top.is_some() {
         return Err("TOP must be rewritten as LIMIT on the enclosing Query; \
@@ -446,108 +469,51 @@ pub fn redshift_select_to_postgres(select: &mut Box<Select>) -> Result<(), Strin
     Ok(())
 }
 
-fn rewrite_pg_table_def(select: &mut Select) -> Result<(), String> {
-    // Only support:
-    //
-    // SELECT "column", type
-    // FROM pg_table_def
-    // WHERE tablename = ...
-    //
-    //
+fn rewrite_svv_columns(select: &mut Select) -> Result<(), String> {
     let from_size = select.from.len();
-
     let Some(from) = select.from.first_mut() else {
         return Ok(());
     };
-
     let TableFactor::Table { name, alias, .. } = &mut from.relation else {
         return Ok(());
     };
-
-    // Fast no-op path: every ordinary SELECT returns here unchanged.
-    if !is_unqualified_name(name, "pg_table_def") {
+    if !is_unqualified_name(name, "svv_columns") {
         return Ok(());
     }
-
     if from_size != 1 || !from.joins.is_empty() || alias.is_some() {
-        return Err(format!("Unsupported pg_table_def query shape: {}", select));
+        return Err(format!("Unsupported svv_columns query shape: {select}"));
     }
-
-    if select.projection.len() != 2
-        || !is_identifier_projection(&select.projection[0], "column")
-        || !is_identifier_projection(&select.projection[1], "type")
-    {
-        return Err(
-            "Only `SELECT \"column\", type FROM pg_table_def ...` is supported \
-             by the pg_table_def compatibility rewrite."
-                .into(),
-        );
-    }
-
     *name = ObjectName(vec![
         ObjectNamePart::Identifier(Ident::new("information_schema")),
         ObjectNamePart::Identifier(Ident::new("columns")),
     ]);
-
-    select.projection = vec![
-        SelectItem::ExprWithAlias {
-            expr: Expr::Identifier(Ident::new("column_name")),
-            alias: Ident::with_quote('"', "column"),
-        },
-        SelectItem::ExprWithAlias {
-            expr: Expr::Identifier(Ident::new("udt_name")),
-            alias: Ident::new("type"),
-        },
-    ];
-
-    rename_tablename_predicate(select.selection.as_mut())?;
-
     Ok(())
-}
-
-fn rename_tablename_predicate(expr: Option<&mut Expr>) -> Result<(), String> {
-    let Some(expr) = expr else {
-        return Ok(());
-    };
-
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            rename_tablename_expr(left);
-            rename_tablename_expr(right);
-        }
-        Expr::Nested(expr) => rename_tablename_expr(expr),
-        _ => {}
-    }
-
-    Ok(())
-}
-
-fn rename_tablename_expr(expr: &mut Expr) {
-    if let Expr::Identifier(ident) = expr
-        && ident.value.eq_ignore_ascii_case("tablename")
-    {
-        *ident = Ident::new("table_name");
-    }
-}
-
-fn is_identifier_projection(item: &SelectItem, expected: &str) -> bool {
-    matches!(
-        item,
-        SelectItem::UnnamedExpr(Expr::Identifier(ident))
-            if ident.value.eq_ignore_ascii_case(expected)
-    )
 }
 
 fn is_unqualified_name(name: &ObjectName, expected: &str) -> bool {
     name.0.len() == 1 && name.to_string().eq_ignore_ascii_case(expected)
 }
 
-pub struct RedshiftExprRewriter;
+pub struct RedshiftExprRewriter {
+    pub case_sensitive: bool,
+}
 
 impl VisitorMut for RedshiftExprRewriter {
     type Break = ();
 
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        if let Expr::Function(func) = expr
+            && func
+                .name
+                .to_string()
+                .eq_ignore_ascii_case("current_setting")
+            && func.args.to_string() == "('enable_case_sensitive_identifier')"
+        {
+            *expr = Expr::value(Value::SingleQuotedString(
+                if self.case_sensitive { "on" } else { "off" }.to_string(),
+            ));
+        }
+
         if let Expr::Function(func) = expr
             && func.name.to_string().eq_ignore_ascii_case("GETDATE")
             && func.args.to_string() == "()"
@@ -556,5 +522,73 @@ impl VisitorMut for RedshiftExprRewriter {
         }
 
         ControlFlow::Continue(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn translate(sql: &str, case_sensitive: bool) -> String {
+        let mut statements = parse_redshift_sql(sql, case_sensitive).expect("Failed to parse SQL");
+        let _ = statements.visit(&mut RedshiftExprRewriter { case_sensitive });
+        let ast = statements.remove(0);
+        let mut statement = ParsedStatement {
+            raw_sql: String::new(),
+            class: classify(&ast),
+            ast,
+            parameter_types: vec![],
+            result_columns: vec![],
+        };
+        statement
+            .rewrite_to_postgres()
+            .expect("Failed to translate SQL");
+        statement.raw_sql
+    }
+
+    #[test]
+    fn given_quoted_relations_should_apply_case_rules_to_every_statement() {
+        for sql in [
+            r#"CREATE TABLE "Data"."Events'O""Brien" (payload VARCHAR(32))"#,
+            r#"COPY "Data"."Events'O""Brien" (payload) FROM 's3://Bucket/KeepCase' FORMAT AS PARQUET"#,
+            r#"INSERT INTO "Data"."Events'O""Brien" SELECT * FROM "Data"."Staging_Events'O""Brien""#,
+            r#"TRUNCATE "Data"."Events'O""Brien""#,
+        ] {
+            let folded = translate(sql, false);
+            assert!(folded.contains(r#""data"."events'o""brien""#), "{folded}");
+            let preserved = translate(sql, true);
+            assert!(
+                preserved.contains(r#""Data"."Events'O""Brien""#),
+                "{preserved}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_literals_and_parameters_should_preserve_values() {
+        let sql = r#"SELECT 'KeepCase O''Brien', $1 FROM "Events" WHERE payload = $2"#;
+        let result = translate(sql, false);
+        assert!(result.contains("'KeepCase O''Brien'"), "{result}");
+        assert!(result.contains("$1"), "{result}");
+        assert!(result.contains("$2"), "{result}");
+    }
+
+    #[test]
+    fn given_catalog_query_should_preserve_schema_and_table_parameters() {
+        let result = translate(
+            r#"SELECT column_name AS "column", data_type AS "type" FROM svv_columns WHERE table_schema = $1 AND table_name = $2"#,
+            false,
+        );
+        assert_eq!(
+            result,
+            r#"SELECT column_name AS "column", data_type AS "type" FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2"#
+        );
+    }
+
+    #[test]
+    fn given_case_setting_query_should_report_configured_mode() {
+        let sql = "SELECT current_setting('enable_case_sensitive_identifier') AS case_sensitive";
+        assert_eq!(translate(sql, false), "SELECT 'off' AS case_sensitive");
+        assert_eq!(translate(sql, true), "SELECT 'on' AS case_sensitive");
     }
 }

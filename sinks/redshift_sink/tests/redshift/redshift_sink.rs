@@ -17,8 +17,9 @@
 
 use super::TEST_MESSAGE_COUNT;
 use crate::fixtures::{
-    RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
-    RedshiftSinkVarbyteFixture,
+    RedshiftSinkCaseSensitiveFixture, RedshiftSinkDefaultSchemaFixture, RedshiftSinkFixture,
+    RedshiftSinkFoldedFixture, RedshiftSinkIdentifierFixture, RedshiftSinkJsonFixture,
+    RedshiftSinkNoArchiveFixture, RedshiftSinkVarbyteFixture,
 };
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
@@ -26,7 +27,7 @@ use iggy_common::Identifier;
 use iggy_common::MessageClient;
 use iggy_connector_sdk::api::SinkInfoResponse;
 use iggy_connector_testing::{TestMessage, create_test_messages};
-use integration::harness::seeds;
+use integration::harness::{TestFixture, seeds};
 use integration::iggy_harness;
 
 use reqwest::Client;
@@ -34,6 +35,151 @@ use reqwest::Client;
 const SINK_TABLE: &str = "iggy_messages";
 const API_KEY: &str = "test-api-key";
 const REDSHIFT_SINK_KEY: &str = "redshift";
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/redshift/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_quoted_mixed_case_table_in_default_schema_when_messages_sent_should_store_them(
+    harness: &TestHarness,
+    fixture: RedshiftSinkDefaultSchemaFixture,
+) {
+    assert_identifier_ingestion(harness, &fixture).await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/redshift/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_folded_names_outside_search_path_when_messages_sent_should_store_them(
+    harness: &TestHarness,
+    fixture: RedshiftSinkFoldedFixture,
+) {
+    assert_identifier_ingestion(harness, &fixture).await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/redshift/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_case_sensitive_names_outside_search_path_when_messages_sent_should_store_them(
+    harness: &TestHarness,
+    fixture: RedshiftSinkCaseSensitiveFixture,
+) {
+    assert_identifier_ingestion(harness, &fixture).await;
+}
+
+#[tokio::test]
+async fn given_namesake_in_other_schema_when_mock_catalog_queried_should_return_target_columns() {
+    let fixture = RedshiftSinkFoldedFixture::setup()
+        .await
+        .expect("Failed to set up fixture");
+    let postgres = fixture
+        .target_pool()
+        .await
+        .expect("Failed to connect to PostgreSQL");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE {} (payload TEXT)",
+        fixture.qualified_table(false),
+    )))
+    .execute(&postgres)
+    .await
+    .expect("Failed to create target table");
+    let mock = sqlx::postgres::PgPoolOptions::new()
+        .connect(fixture.redshift_connection_string())
+        .await
+        .expect("Failed to connect to Redshift mock");
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name AS \"column\", data_type AS \"type\" FROM svv_columns
+         WHERE table_schema = $1 AND table_name = $2",
+    )
+    .bind(fixture.schema_name())
+    .bind(fixture.table_name())
+    .fetch_all(&mock)
+    .await
+    .expect("Bound catalog query failed");
+    assert_eq!(columns, vec![("payload".to_string(), "text".to_string())]);
+    let missing: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name AS \"column\", data_type AS \"type\" FROM svv_columns
+         WHERE table_schema = $1 AND table_name = $2",
+    )
+    .bind("missing_schema")
+    .bind(fixture.table_name())
+    .fetch_all(&mock)
+    .await
+    .expect("Missing-schema lookup failed");
+    assert!(missing.is_empty());
+    mock.close().await;
+}
+
+async fn assert_identifier_ingestion<const CASE_SENSITIVE: bool, const EXPLICIT_SCHEMA: bool>(
+    harness: &integration::harness::TestHarness,
+    fixture: &RedshiftSinkIdentifierFixture<CASE_SENSITIVE, EXPLICIT_SCHEMA>,
+) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to create Iggy client");
+    let pool = fixture
+        .target_pool()
+        .await
+        .expect("Failed to connect to PostgreSQL");
+    let stream: Identifier = seeds::names::STREAM.try_into().expect("Invalid stream");
+    let topic: Identifier = seeds::names::TOPIC.try_into().expect("Invalid topic");
+    let payload = serde_json::json!({"message": "Keep Mixed Case and 'quotes' intact"});
+    let mut messages = vec![
+        IggyMessage::builder()
+            .id(1_u128)
+            .payload(Bytes::from(payload.to_string()))
+            .build()
+            .expect("Failed to build message"),
+    ];
+    client
+        .send_messages(
+            &stream,
+            &topic,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send message");
+    let query = format!("SELECT payload FROM {}", fixture.qualified_table(false));
+    let rows: Vec<(String,)> = fixture
+        .fetch_rows_as(&pool, &query, 1)
+        .await
+        .expect("Message did not reach the configured table");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&rows[0].0).expect("Invalid payload"),
+        payload
+    );
+
+    let cleanup_query = format!("SELECT COUNT(*) FROM {}", fixture.qualified_table(true));
+    let mut cleaned = false;
+    for _ in 0..100 {
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(cleanup_query.as_str()))
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to inspect staging table");
+        if count == 0 {
+            cleaned = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(cleaned, "Staging rows were not cleared after ingestion");
+    if EXPLICIT_SCHEMA {
+        let decoy_query = format!(
+            "SELECT COUNT(*) FROM public.\"{}\"",
+            fixture.table_name().replace('"', "\"\"")
+        );
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(decoy_query))
+            .fetch_one(&pool)
+            .await
+            .expect("Decoy table must remain intact");
+        assert_eq!(count, 0);
+    }
+}
 
 type SinkRow = (String, String, String, String, String);
 type SinkRawRow = (String, String, String, String, String);

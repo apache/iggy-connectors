@@ -31,8 +31,8 @@ use crate::fixtures::{
         ENV_SINK_S3_ENDPOINT, ENV_SINK_S3_PREFIX, ENV_SINK_STAGING_ACCESS_KEY,
         ENV_SINK_STAGING_REGION, ENV_SINK_STAGING_SECRET, ENV_SINK_STREAMS_0_CONSUMER_GROUP,
         ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS,
-        ENV_SINK_TARGET_TABLE, STAGING_BUCKET, STAGING_PREFIX, STAGING_REGION, SinkPayloadFormat,
-        SinkSchema,
+        ENV_SINK_TARGET_SCHEMA, ENV_SINK_TARGET_TABLE, STAGING_BUCKET, STAGING_PREFIX,
+        STAGING_REGION, SinkPayloadFormat, SinkSchema,
     },
 };
 use iggy_connector_testing::{
@@ -52,6 +52,10 @@ pub struct RedshiftSinkFixture {
 }
 
 impl RedshiftSinkFixture {
+    pub fn redshift_connection_string(&self) -> &str {
+        &self.redshift.connection_string
+    }
+
     /// Assertions read from here — never from `redshift`.
     pub async fn target_pool(&self) -> Result<sqlx::Pool<sqlx::Postgres>, TestBinaryError> {
         self.postgres.create_pool().await
@@ -97,9 +101,8 @@ impl RedshiftSinkFixture {
     }
 }
 
-#[async_trait]
-impl TestFixture for RedshiftSinkFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
+impl RedshiftSinkFixture {
+    async fn setup_with_case_sensitivity(case_sensitive: bool) -> Result<Self, TestBinaryError> {
         let postgres = PostgresContainer::start().await?;
 
         let floci_name = unique_container_name("floci-redshift");
@@ -108,9 +111,12 @@ impl TestFixture for RedshiftSinkFixture {
 
         floci::create_bucket(&floci.endpoint, STAGING_BUCKET).await?;
 
-        let redshift =
-            RedshiftContainer::start(postgres.connection_string.clone(), floci.endpoint.clone())
-                .await?;
+        let redshift = RedshiftContainer::start_with_case_sensitivity(
+            postgres.connection_string.clone(),
+            floci.endpoint.clone(),
+            case_sensitive,
+        )
+        .await?;
 
         Ok(Self {
             floci_endpoint: floci.endpoint.clone(),
@@ -120,6 +126,13 @@ impl TestFixture for RedshiftSinkFixture {
             payload_format: SinkPayloadFormat::default(),
             schema: SinkSchema::default(),
         })
+    }
+}
+
+#[async_trait]
+impl TestFixture for RedshiftSinkFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Self::setup_with_case_sensitivity(false).await
     }
 
     fn connectors_runtime_envs(&self) -> std::collections::HashMap<String, String> {
@@ -208,28 +221,10 @@ impl std::ops::Deref for RedshiftSinkVarbyteFixture {
 #[async_trait]
 impl TestFixture for RedshiftSinkVarbyteFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        let postgres = PostgresContainer::start().await?;
-
-        let floci_name = unique_container_name("floci-redshift");
-
-        let floci = FlociContainer::start(None, &floci_name).await?;
-
-        floci::create_bucket(&floci.endpoint, STAGING_BUCKET).await?;
-
-        let redshift =
-            RedshiftContainer::start(postgres.connection_string.clone(), floci.endpoint.clone())
-                .await?;
-
-        Ok(Self {
-            inner: RedshiftSinkFixture {
-                floci_endpoint: floci.endpoint.clone(),
-                floci,
-                redshift,
-                postgres,
-                payload_format: SinkPayloadFormat::Varbyte,
-                schema: SinkSchema::Raw,
-            },
-        })
+        let mut inner = RedshiftSinkFixture::setup_with_case_sensitivity(false).await?;
+        inner.payload_format = SinkPayloadFormat::Varbyte;
+        inner.schema = SinkSchema::Raw;
+        Ok(Self { inner })
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -252,28 +247,10 @@ impl std::ops::Deref for RedshiftSinkJsonFixture {
 #[async_trait]
 impl TestFixture for RedshiftSinkJsonFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        let postgres = PostgresContainer::start().await?;
-
-        let floci_name = unique_container_name("floci-redshift");
-
-        let floci = FlociContainer::start(None, &floci_name).await?;
-
-        floci::create_bucket(&floci.endpoint, STAGING_BUCKET).await?;
-
-        let redshift =
-            RedshiftContainer::start(postgres.connection_string.clone(), floci.endpoint.clone())
-                .await?;
-
-        Ok(Self {
-            inner: RedshiftSinkFixture {
-                floci_endpoint: floci.endpoint.clone(),
-                floci,
-                redshift,
-                postgres,
-                payload_format: SinkPayloadFormat::Text,
-                schema: SinkSchema::Json,
-            },
-        })
+        let mut inner = RedshiftSinkFixture::setup_with_case_sensitivity(false).await?;
+        inner.payload_format = SinkPayloadFormat::Text;
+        inner.schema = SinkSchema::Json;
+        Ok(Self { inner })
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
@@ -352,6 +329,103 @@ impl TestFixture for RedshiftSinkNoArchiveFixture {
         envs
     }
 }
+
+pub struct RedshiftSinkIdentifierFixture<const CASE_SENSITIVE: bool, const EXPLICIT_SCHEMA: bool> {
+    inner: RedshiftSinkFixture,
+}
+
+impl<const CASE_SENSITIVE: bool, const EXPLICIT_SCHEMA: bool>
+    RedshiftSinkIdentifierFixture<CASE_SENSITIVE, EXPLICIT_SCHEMA>
+{
+    pub fn schema_name(&self) -> &str {
+        match (EXPLICIT_SCHEMA, CASE_SENSITIVE) {
+            (false, _) => "public",
+            (true, true) => "Connector_Schema",
+            (true, false) => "connector_schema",
+        }
+    }
+
+    pub fn table_name(&self) -> &str {
+        if CASE_SENSITIVE {
+            "Events'O\"Brien"
+        } else {
+            "events'o\"brien"
+        }
+    }
+
+    pub fn qualified_table(&self, staging: bool) -> String {
+        let prefix = if staging { "staging_" } else { "" };
+        format!(
+            "\"{}\".\"{prefix}{}\"",
+            self.schema_name(),
+            self.table_name().replace('"', "\"\"")
+        )
+    }
+}
+
+impl<const CASE_SENSITIVE: bool, const EXPLICIT_SCHEMA: bool> std::ops::Deref
+    for RedshiftSinkIdentifierFixture<CASE_SENSITIVE, EXPLICIT_SCHEMA>
+{
+    type Target = RedshiftSinkFixture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl<const CASE_SENSITIVE: bool, const EXPLICIT_SCHEMA: bool> TestFixture
+    for RedshiftSinkIdentifierFixture<CASE_SENSITIVE, EXPLICIT_SCHEMA>
+{
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let mut inner = RedshiftSinkFixture::setup_with_case_sensitivity(CASE_SENSITIVE).await?;
+        inner.payload_format = SinkPayloadFormat::Text;
+        let fixture = Self { inner };
+        let pool = fixture.target_pool().await?;
+        let schema_sql = format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", fixture.schema_name());
+        sqlx::query(sqlx::AssertSqlSafe(schema_sql))
+            .execute(&pool)
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "RedshiftSinkIdentifierFixture".to_string(),
+                message: error.to_string(),
+            })?;
+        // An incompatible namesake must not supply columns to the sink's lookup.
+        if EXPLICIT_SCHEMA {
+            let decoy_sql = format!(
+                "CREATE TABLE public.\"{}\" (decoy INTEGER)",
+                fixture.table_name().replace('"', "\"\""),
+            );
+            sqlx::query(sqlx::AssertSqlSafe(decoy_sql))
+                .execute(&pool)
+                .await
+                .map_err(|error| TestBinaryError::FixtureSetup {
+                    fixture_type: "RedshiftSinkIdentifierFixture".to_string(),
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(fixture)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(
+            ENV_SINK_TARGET_TABLE.to_string(),
+            "Events'O\"Brien".to_string(),
+        );
+        if EXPLICIT_SCHEMA {
+            envs.insert(
+                ENV_SINK_TARGET_SCHEMA.to_string(),
+                "Connector_Schema".to_string(),
+            );
+        }
+        envs
+    }
+}
+
+pub type RedshiftSinkDefaultSchemaFixture = RedshiftSinkIdentifierFixture<false, false>;
+pub type RedshiftSinkFoldedFixture = RedshiftSinkIdentifierFixture<false, true>;
+pub type RedshiftSinkCaseSensitiveFixture = RedshiftSinkIdentifierFixture<true, true>;
 
 async fn bucket_empty(bucket: &Bucket) -> Result<bool, TestBinaryError> {
     for _ in 0..DEFAULT_POLL_ATTEMPTS {

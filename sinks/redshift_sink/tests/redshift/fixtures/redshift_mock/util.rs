@@ -56,6 +56,7 @@ pub fn tokio_type_to_wire(t: &PgType) -> PgWireType {
         PgType::FLOAT8 => PgWireType::FLOAT8,
         PgType::TEXT => PgWireType::TEXT,
         PgType::VARCHAR => PgWireType::VARCHAR,
+        PgType::NAME => PgWireType::NAME,
         PgType::TIMESTAMP => PgWireType::TIMESTAMP,
         PgType::TIMESTAMPTZ => PgWireType::TIMESTAMPTZ,
         PgType::NUMERIC => PgWireType::NUMERIC,
@@ -91,7 +92,7 @@ pub fn row_to_data_row(row: &Row, fields: &[FieldInfo]) -> PgWireResult<DataRow>
             &PgWireType::FLOAT8 => {
                 encoder.encode_field(&row.try_get::<_, Option<f64>>(i).map_err(backend_err)?)?
             }
-            &PgWireType::TEXT | &PgWireType::VARCHAR => {
+            &PgWireType::TEXT | &PgWireType::VARCHAR | &PgWireType::NAME => {
                 encoder.encode_field(&row.try_get::<_, Option<String>>(i).map_err(backend_err)?)?
             }
             &PgWireType::NUMERIC => {
@@ -145,7 +146,7 @@ pub fn decode_param(
         PgType::INT8 => decode!(i64),
         PgType::FLOAT4 => decode!(f32),
         PgType::FLOAT8 => decode!(f64),
-        PgType::TEXT | PgType::VARCHAR => decode!(String),
+        PgType::TEXT | PgType::VARCHAR | PgType::NAME => decode!(String),
         PgType::BYTEA => decode!(Vec<u8>),
         _ => decode!(String), // last resort: treat as text
     })

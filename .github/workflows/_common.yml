@@ -119,7 +119,8 @@ jobs:
     name: Validate third-party licenses
     if: inputs.validate-third-party-licenses
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    # One cargo-about run per bundled plugin, about 40 s each, so the run time grows with the plugin set.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/utils/validate-third-party-licenses

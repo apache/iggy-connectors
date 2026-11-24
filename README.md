@@ -17,7 +17,7 @@ This repository holds the runtime, the plugin SDK, the sinks and the sources. Th
 - **Observability**: Prometheus metrics with per-stage latency histograms, and an opt-in per-batch timing log.
 - **Logging**: text or JSON logs, selected in the `[logging]` configuration.
 
-The runtime ships as the Docker image [`apache/iggy-connect`](https://hub.docker.com/r/apache/iggy-connect). Run `docker pull apache/iggy-connect:edge` to fetch the image of the latest `master` commit.
+The runtime ships as the Docker image [`apache/iggy-connect`](https://hub.docker.com/r/apache/iggy-connect). Run `docker pull apache/iggy-connect` to fetch it. The image comes in two flavors, described in [Docker image](#docker-image).
 
 ## Quick start
 
@@ -110,6 +110,42 @@ The Quickwit sink writes the records to the `events` index. The Quickwit UI at <
 | `.claude/skills/` |                          | Skills for AI agents, linked from `.agents/skills/`   |
 
 Only `iggy_connector_sdk` goes to crates.io. The runtime ships only as the Docker image, and the sinks and sources ship as source code.
+
+## Docker image
+
+The image is published to Docker Hub as [`apache/iggy-connect`](https://hub.docker.com/r/apache/iggy-connect) in two flavors:
+
+| Tag                         | Contents                                              |
+| --------------------------- | ----------------------------------------------------- |
+| `x.y.z`, `latest`           | Runtime plus every bundled connector plugin (default) |
+| `x.y.z-slim`, `latest-slim` | Runtime binary only                                   |
+
+> [!NOTE]
+> Up to and including the last release before flavors, `latest` and `x.y.z` were the runtime-only image. From the first release that ships flavors, they are the full image, and the runtime-only image is `latest-slim` or `x.y.z-slim`.
+>
+> Both flavors are built only by a manual release. The `edge` tag is no longer refreshed on merge, and there is no `edge-slim`.
+
+The default image places every connector plugin in `/usr/local/lib`, which is on the runtime plugin search path. A connector configuration loads a bundled plugin by its library file name, with no directory and no extension:
+
+```toml
+type = "sink"
+key = "stdout"
+name = "Stdout sink"
+path = "libiggy_connector_stdout_sink"
+```
+
+Run the image with a configuration mounted in:
+
+```bash
+docker run --rm \
+  -v "$PWD/my_config:/config" \
+  -e IGGY_CONNECTORS_CONFIG_PATH=/config/config.toml \
+  apache/iggy-connect
+```
+
+Use a `-slim` tag when you supply your own plugins. Mount the plugin `.so` files into a search path directory such as `/usr/local/lib`.
+
+Sources save their state under `[state].path`, which is `/app/local_state` in the image. Mount a volume there, or the state is lost when the container is replaced.
 
 ## The core pin
 

@@ -46,6 +46,18 @@ inputs:
     description: "Load a dry-run build into the local Docker daemon so later steps can run it. Needs a single platform."
     required: false
     default: "false"
+  target:
+    description: "Dockerfile stage to build. Empty builds the default (last) stage. Used to select an image flavor from a multi-flavor Dockerfile."
+    required: false
+    default: ""
+  flavor:
+    description: "Flavor name (e.g. fat, slim), recorded as the org.apache.iggy.flavor image label. Empty for single-flavor components, which get no label."
+    required: false
+    default: ""
+  flavor_suffix:
+    description: "Image flavor suffix (e.g. -slim). Scopes the layer cache, since two flavors of one component build different graphs concurrently on the same arch. Empty for single-flavor components, which keeps their cache refs unchanged."
+    required: false
+    default: ""
   gha-cache:
     description: "Whether to use GitHub Actions cache for Docker layers (disable to save cache space)"
     required: false
@@ -177,6 +189,8 @@ runs:
         tags: |
           type=raw,value=${{ inputs.version }}${{ steps.suffix.outputs.suffix }},enable=${{ steps.config.outputs.should_push != 'true' }}
           type=sha,enable=${{ steps.config.outputs.should_push != 'true' && inputs.version == 'test' }}
+        labels: |
+          ${{ inputs.flavor != '' && format('org.apache.iggy.flavor={0}', inputs.flavor) || '' }}
 
     - name: Determine platforms
       id: platforms
@@ -211,11 +225,13 @@ runs:
         os="${{ runner.os }}"
         arch="${{ runner.arch }}"
         img="${{ steps.config.outputs.image }}"
+        # Each flavor gets its own cache name suffix because two flavors building at the same time would otherwise overwrite each other's cache, and a later build could load the cache of the wrong flavor.
+        flavor="${{ inputs.flavor_suffix }}"
 
         # Include architecture in cache scope to prevent collisions between
         # native amd64 and arm64 builds (both have runner.os = "Linux")
-        scope_arch="${comp}-${os}-${arch}"
-        scope_os="${comp}-${os}"
+        scope_arch="${comp}${flavor}-${os}-${arch}"
+        scope_os="${comp}${flavor}-${os}"
 
         if [ "${{ inputs.dry_run }}" = "true" ]; then
           # dry-run/forks: avoid Docker Hub completely, use shared GHA scope for deps
@@ -235,16 +251,16 @@ runs:
           # CI on upstream: registry cache of the image + GHA scopes
           CACHE_TO=$(
             printf '%s\n' \
-              "type=registry,ref=${img}:buildcache-${arch},mode=max" \
+              "type=registry,ref=${img}:buildcache${flavor}-${arch},mode=max" \
               "type=inline" \
               "type=gha,scope=buildkit-deps-${os}-${arch},mode=max" \
               "type=gha,scope=buildkit-${scope_arch},mode=max"
           )
           CACHE_FROM=$(
             printf '%s\n' \
-              "type=registry,ref=${img}:buildcache-${arch}" \
-              "type=registry,ref=${img}:buildcache" \
-              "type=registry,ref=${img}:latest" \
+              "type=registry,ref=${img}:buildcache${flavor}-${arch}" \
+              "type=registry,ref=${img}:buildcache${flavor}" \
+              "type=registry,ref=${img}:latest${flavor}" \
               "type=gha,scope=buildkit-deps-${os}-${arch}" \
               "type=gha,scope=buildkit-${scope_arch}" \
               "type=gha,scope=buildkit-${scope_os}"
@@ -306,6 +322,7 @@ runs:
       with:
         context: ${{ steps.ctx.outputs.context }}
         file: ${{ steps.config.outputs.dockerfile }}
+        target: ${{ inputs.target }}
         platforms: ${{ steps.platforms.outputs.platforms }}
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: ${{ env.CACHE_FROM }}
@@ -321,6 +338,7 @@ runs:
       with:
         context: ${{ steps.ctx.outputs.context }}
         file: ${{ steps.config.outputs.dockerfile }}
+        target: ${{ inputs.target }}
         platforms: ${{ steps.platforms.outputs.platforms }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}

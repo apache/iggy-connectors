@@ -43,6 +43,14 @@ runs:
           "cargo-about-0.9.0-${TARGET}/cargo-about"
         rm -f "$tarball"
 
-    - name: Validate iggy-connect bundle
+    - name: Validate iggy-connect bundle (runtime + connector plugins)
       shell: bash
-      run: ./scripts/ci/third-party-licenses.sh --validate --manifest runtime/Cargo.toml
+      run: |
+        # The fat image bundles the runtime plus every connector plugin, so
+        # validate the plugins' dependency closures too. The manifest list is
+        # derived from cargo metadata so a newly added connector is license
+        # validated on the PR that adds it, with no change here.
+        MANIFEST_FLAGS="$(scripts/ci/connector-plugins.sh --manifest-flags)"
+        ./scripts/ci/third-party-licenses.sh --validate \
+          --manifest runtime/Cargo.toml \
+          $MANIFEST_FLAGS

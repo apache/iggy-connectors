@@ -20,6 +20,7 @@
         "about.hbs",
         "runtime/Dockerfile",
         "scripts/extract-version.sh",
+        "scripts/ci/connector-plugins.sh",
         "scripts/ci/third-party-licenses.sh"
       ]
     }

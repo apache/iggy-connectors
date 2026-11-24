@@ -1,0 +1,125 @@
+---
+title: ScopeDB Sink
+description: "Append Iggy messages to an existing ScopeDB table with mapped columns or raw payloads."
+---
+
+The ScopeDB sink appends Iggy messages to an existing ScopeDB table through the ScopeDB Rust SDK (`scopedb-client`). It never creates tables, alters schemas, or submits transformation statements. At startup, the connector reads the target table definition from the ScopeDB catalog and validates that the required writable columns exist with compatible types.
+
+## Configuration
+
+Use the runtime setup from the [sink guide](/docs/connectors/sinks/sink#configuration). Build the plugin from the repository root:
+
+```bash
+cargo build --release -p iggy_connector_scopedb_sink
+```
+
+Save this connector configuration in the [local provider](/docs/connectors/runtime#local-file-provider) directory:
+
+```toml
+type = "sink"
+key = "scopedb"
+enabled = true
+version = 0
+name = "ScopeDB sink"
+path = "target/release/libiggy_connector_scopedb_sink"
+verbose = false
+
+[[streams]]
+stream = "orders"
+topics = ["events"]
+schema = "json"
+batch_length = 1000
+consumer_group = "scopedb_sink_connector"
+
+[plugin_config]
+endpoint = "https://<workspace-endpoint>"
+table = "events"
+mode = "mapped"
+include_metadata = true
+include_headers = false
+```
+
+`endpoint` and `table` are required. Supply the API key with the `IGGY_CONNECTORS_SINK_SCOPEDB_PLUGIN_CONFIG_API_KEY` environment variable rather than storing it in the TOML file. The credentials need permission to read the target table definition and append rows. Endpoints with embedded credentials, query parameters, or fragments are rejected at startup.
+
+| Option                    | Default   | Description                                                                                             |
+| ------------------------- | --------- | ------------------------------------------------------------------------------------------------------- |
+| `endpoint`                | required  | ScopeDB HTTP(S) endpoint without embedded credentials, query parameters, or fragments                   |
+| `table`                   | required  | Existing target table name                                                                              |
+| `api_key`                 | none      | Bearer API key, when required by the endpoint                                                           |
+| `database`                | `scopedb` | Target database                                                                                         |
+| `schema`                  | `public`  | Target schema                                                                                           |
+| `mode`                    | `mapped`  | Write mode: `mapped` or `raw`                                                                           |
+| `payload_column`          | `payload` | Destination column name in `raw` mode                                                                   |
+| `include_metadata`        | `true`    | Populate the six Iggy metadata columns listed below                                                     |
+| `include_headers`         | `false`   | Populate `iggy_headers`, independently of `include_metadata`                                            |
+| `batch_size`              | `100`     | Maximum rows per append request (`1..=200000`)                                                          |
+| `max_request_bytes`       | `8388608` | Maximum uncompressed NDJSON request size in bytes (`1..=8388608`); oversized rows are rejected locally  |
+| `max_concurrent_requests` | `1`       | Concurrent append requests per batch (`>= 1`); values above `1` allow out-of-order request completion   |
+| `max_retries`             | `3`       | Total attempts per request including the first, clamped to `1..=3`                                      |
+| `retry_delay`             | `1s`      | Initial exponential backoff duration (`humantime` string)                                               |
+| `max_retry_delay`         | `30s`     | Maximum backoff duration, including `Retry-After` (`humantime` string)                                  |
+| `retry_ambiguous`         | `false`   | Allow replaying transient ambiguous write outcomes (may produce duplicate rows)                         |
+| `timeout`                 | `30s`     | Overall startup deadline and per-attempt HTTP write timeout (must be greater than zero)                 |
+| `verbose_logging`         | `false`   | Log per-batch summaries at `info` instead of `debug`                                                    |
+
+Invalid duration strings fall back to their documented defaults with a warning, and reversed `retry_delay` / `max_retry_delay` values are swapped. Out-of-range request limits or a zero `timeout` fail startup. Restart the connector after changing the target table definition.
+
+## Write Modes
+
+In `mapped` mode, `Json`, `Text`, and `Proto` payloads must represent JSON objects. Top-level keys are matched by name to writable table columns; unmatched fields and computed columns are ignored. When metadata or headers are enabled, those generated columns override payload fields with the same names.
+
+In `raw` mode, the entire payload is written to `payload_column`, which must be a writable column and must not conflict with enabled metadata or header columns. The target column type determines how payloads are encoded:
+
+- **`binary`**: base64-encoded bytes from any payload type.
+- **`string`**: UTF-8 text (`Text`, `Proto`, serialized `Json`, or UTF-8 `Raw` / `FlatBuffer` / `Avro` bytes).
+- **`object`**: valid JSON object (`Json`, `Text`, `Proto`, or UTF-8 JSON `Raw` bytes).
+- **`any`**: any valid JSON value (`Json`, `Text`, `Proto`, or UTF-8 JSON `Raw` bytes).
+
+Numeric values must fit within signed 64-bit integer or JSON floating-point range; store wider identifiers as strings.
+
+## Metadata and Headers
+
+When `include_metadata = true`, the target table must include these six writable columns:
+
+| Column              | ScopeDB type    | Value                                                         |
+| ------------------- | --------------- | ------------------------------------------------------------- |
+| `iggy_stream`       | `string`        | Source stream name                                            |
+| `iggy_topic`        | `string`        | Source topic name                                             |
+| `iggy_partition_id` | `uint` or `int` | Source partition ID                                           |
+| `iggy_offset`       | `uint` or `int` | Source message offset                                         |
+| `iggy_timestamp`    | `timestamp`     | Message timestamp converted from microseconds to UTC RFC 3339 |
+| `iggy_id`           | `string`        | Full decimal `u128` message ID                                |
+
+When `include_headers = true`, the table also requires a writable `iggy_headers` column of type `object` or `any`. Header keys follow the SDK header naming convention, text and typed values are stored as strings, binary or non-UTF-8 values are encoded as `{"data":"<base64>","iggy_header_encoding":"base64"}`, and absent headers are written as an empty object.
+
+Example of creating the target ScopeDB table for `mapped` mode (with metadata and headers enabled) via the ScopeDB Catalog API:
+
+```bash
+curl -X PUT "$SCOPEDB_ENDPOINT/v1/catalog/databases/scopedb/schemas/public/tables/events" \
+  -H "Authorization: Bearer $SCOPEDB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "events",
+    "columns": [
+      {"name": "id", "data_type": "int"},
+      {"name": "event", "data_type": "string"},
+      {"name": "iggy_stream", "data_type": "string"},
+      {"name": "iggy_topic", "data_type": "string"},
+      {"name": "iggy_partition_id", "data_type": "uint"},
+      {"name": "iggy_offset", "data_type": "uint"},
+      {"name": "iggy_timestamp", "data_type": "timestamp"},
+      {"name": "iggy_id", "data_type": "string"},
+      {"name": "iggy_headers", "data_type": "object"}
+    ]
+  }'
+```
+
+## Delivery and Failure Handling
+
+The ScopeDB sink uses the runtime's default `at_most_once` delivery mode, which commits consumer group offsets on poll before ScopeDB persists the batch. A failed batch is logged and not automatically redelivered, and a crash after offset commit can lose unpersisted messages. Configuring the runtime's `at_least_once` delivery mode fails startup. Preserve the Iggy metadata columns when downstream reconciliation or deduplication is needed.
+
+Each `consume()` call waits for all split requests and retries to settle without buffering rows across calls. By default, only validated HTTP `429` admission refusals are retried with bounded exponential backoff and `Retry-After`. HTTP `5xx` responses, lost responses, and invalid success counts have ambiguous outcomes and are not replayed unless `retry_ambiguous = true`. Client-side write timeouts are never replayed automatically.
+
+A batch split across multiple requests can partially succeed. When an error response supplies complete, atomic structured row errors, the connector drops the invalid rows and resubmits the remaining rows from that request once without replaying successful sibling requests. Every locally rejected, failed, or unconfirmed row is logged with its stream, topic, partition, and offset. There is no dead-letter queue.
+
+For full implementation details, header encoding rules, row-error recovery, and live verification steps, see the [ScopeDB sink README](https://github.com/apache/iggy-connectors/blob/master/sinks/scopedb_sink/README.md).

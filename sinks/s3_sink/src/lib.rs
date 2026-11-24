@@ -25,9 +25,12 @@ use serde::{Deserialize, Serialize};
 
 mod buffer;
 mod client;
+mod compression;
 mod formatter;
 mod path;
 mod sink;
+
+pub use compression::Compression;
 
 sink_connector!(S3Sink);
 
@@ -66,6 +69,8 @@ pub struct S3SinkConfig {
     pub max_messages_per_file: Option<u64>,
     #[serde(default = "default_output_format")]
     pub output_format: String,
+    #[serde(default)]
+    pub compression: Compression,
     #[serde(default = "default_true")]
     pub include_metadata: bool,
     #[serde(default)]
@@ -96,6 +101,7 @@ impl fmt::Debug for S3SinkConfig {
             .field("max_file_size", &self.max_file_size)
             .field("max_messages_per_file", &self.max_messages_per_file)
             .field("output_format", &self.output_format)
+            .field("compression", &self.compression)
             .field("include_metadata", &self.include_metadata)
             .field("include_headers", &self.include_headers)
             .field("max_attempts", &self.max_attempts)
@@ -412,6 +418,7 @@ mod tests {
         assert_eq!(config.path_template, DEFAULT_PATH_TEMPLATE);
         assert_eq!(config.max_file_size, DEFAULT_MAX_FILE_SIZE);
         assert_eq!(config.output_format, DEFAULT_OUTPUT_FORMAT);
+        assert_eq!(config.compression, Compression::None);
         assert!(config.include_metadata);
         assert!(!config.include_headers);
         assert_eq!(config.file_rotation, FileRotation::Size);
@@ -435,6 +442,7 @@ mod tests {
             "max_file_size": "16MiB",
             "max_messages_per_file": 5000,
             "output_format": "json_array",
+            "compression": "gzip",
             "include_metadata": false,
             "include_headers": true,
             "max_attempts": 5,
@@ -447,6 +455,7 @@ mod tests {
         assert_eq!(config.endpoint.as_deref(), Some("http://localhost:9000"));
         assert_eq!(config.file_rotation, FileRotation::Messages);
         assert_eq!(config.max_messages_per_file, Some(5000));
+        assert_eq!(config.compression, Compression::Gzip);
         assert!(!config.include_metadata);
         assert!(config.include_headers);
         assert_eq!(config.max_attempts, Some(5));
@@ -494,5 +503,38 @@ mod tests {
         let json = r#"{"bucket":"b","region":"us-east-1","max_retries":5}"#;
         let config: S3SinkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.max_attempts, Some(5));
+    }
+
+    #[test]
+    fn given_compression_settings_when_deserializing_should_accept_supported_codecs() {
+        for (value, expected) in [
+            ("none", Compression::None),
+            ("gzip", Compression::Gzip),
+            ("zstd", Compression::Zstd),
+        ] {
+            let json = serde_json::json!({
+                "bucket": "test",
+                "region": "us-east-1",
+                "compression": value,
+            });
+            let config: S3SinkConfig = serde_json::from_value(json).unwrap();
+            assert_eq!(config.compression, expected);
+        }
+    }
+
+    #[test]
+    fn given_invalid_compression_when_deserializing_should_reject_config() {
+        for value in [
+            serde_json::json!("snappy"),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            let json = serde_json::json!({
+                "bucket": "test",
+                "region": "us-east-1",
+                "compression": value,
+            });
+            assert!(serde_json::from_value::<S3SinkConfig>(json).is_err());
+        }
     }
 }

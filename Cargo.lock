@@ -6091,6 +6091,8 @@ dependencies = [
  "ctor 1.0.14",
  "dashmap",
  "dtor 1.0.7",
+ "flate2",
+ "http",
  "humantime",
  "iggy",
  "iggy_common",
@@ -6107,6 +6109,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+ "zstd 0.14.4",
 ]
 
 [[package]]

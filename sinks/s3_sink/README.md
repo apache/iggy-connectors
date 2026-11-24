@@ -6,6 +6,7 @@ Writes messages from Iggy streams to Amazon S3 and S3-compatible object stores (
 
 - Buffered uploads with configurable file rotation (by size or message count)
 - Multiple output formats: JSON Lines, JSON Array, Raw
+- Optional gzip or zstd compression for every output format
 - Configurable path templates with variables for stream, topic, date, hour, partition
 - S3 keys include offset ranges for human-readable object naming
 - Optional metadata and header inclusion in output
@@ -50,6 +51,7 @@ path_template = "{stream}/{topic}/{date}/{hour}"
 file_rotation = "size"
 max_file_size = "8MiB"
 output_format = "json_lines"
+compression = "none"                     # none | gzip | zstd
 include_metadata = true
 include_headers = true
 max_attempts = 3
@@ -71,6 +73,7 @@ retry_delay = "1s"
 | `max_file_size` | String | `8MiB` | Size rotation threshold, positive and at most `5GiB`; validated in both modes |
 | `max_messages_per_file` | Integer | `None` | Positive count required in `messages` mode; ignored by size rotation |
 | `output_format` | String | `json_lines` | Output format: `json_lines`, `json_array`, or `raw` |
+| `compression` | String | `none` | File compression: `none`, `gzip`, or `zstd` |
 | `include_metadata` | Boolean | `true` | Include stream/topic/partition/offset/timestamp in JSON output |
 | `include_headers` | Boolean | `false` | Include available headers in JSON output, independently of metadata |
 | `max_attempts` | Integer | `3` | Outer upload attempts; `0` and `1` both allow one (alias: `max_retries`) |
@@ -80,6 +83,32 @@ retry_delay = "1s"
 Each stream/topic/partition has its own buffer across polls. Rotation checks run after appending a record. Size mode counts formatted record bytes without JSON delimiters/brackets, so the threshold is not a hard object-size limit. Message-count mode does not also enforce the size threshold. There is no timer flush: partial buffers wait for the threshold or close. Uploads use one `PutObject`, not multipart upload, and must fit the destination's single-upload limit.
 
 Format names are case-insensitive; `jsonl` and `jsonlines` alias `json_lines`.
+
+### Compression
+
+Set `compression = "gzip"` or `compression = "zstd"` to compress each finalized file before upload.
+The setting applies to JSON Lines, JSON Array, and Raw output, including partial files flushed on close.
+Values are lowercase; unsupported values prevent the connector from opening.
+Omitting the setting or using `none` preserves uncompressed output and its existing object keys.
+
+| Compression | Object extensions | `Content-Encoding` |
+| ----------- | ----------------- | ------------------ |
+| `none` | `.jsonl`, `.json`, `.bin` | Not set |
+| `gzip` | `.jsonl.gz`, `.json.gz`, `.bin.gz` | `gzip` |
+| `zstd` | `.jsonl.zst`, `.json.zst`, `.bin.zst` | `zstd` |
+
+Rotation thresholds still count uncompressed formatted record bytes or messages.
+Compression uses the libraries' default levels, runs once per file, and reuses the same compressed bytes on retries.
+zstd frames include a content checksum and the decompressed size.
+Small or incompressible files can grow. Readers must support the selected codec.
+HTTP clients that automatically decode `Content-Encoding` can return decompressed bytes.
+Loss markers remain uncompressed text without `Content-Encoding`, even though their keys follow the data object's suffix,
+for example `.jsonl.gz.lost`.
+
+Compression runs inside the `consume` or `close` call that flushes the file and temporarily holds both the finalized and encoded bytes.
+Choose file sizes that fit your CPU and memory budget and leave room for format and compression overhead within
+the single-upload limit. Changing compression changes object keys; replaying the same offsets after a change
+can create additional objects.
 
 ### Path Template Variables
 

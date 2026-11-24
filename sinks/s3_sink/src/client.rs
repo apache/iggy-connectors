@@ -98,6 +98,7 @@ mod tests {
             max_file_size: default_max_file_size(),
             max_messages_per_file: None,
             output_format: default_output_format(),
+            compression: crate::Compression::None,
             include_metadata: true,
             include_headers: false,
             max_attempts: None,

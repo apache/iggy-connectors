@@ -18,8 +18,9 @@
 use crate::buffer::FileBuffer;
 use crate::formatter;
 use crate::path::{PathContext, render_s3_key};
-use crate::{BufferKey, S3Sink};
+use crate::{BufferKey, Compression, S3Sink};
 use async_trait::async_trait;
+use http::{HeaderMap, HeaderValue, header::CONTENT_ENCODING};
 use iggy_connector_sdk::retry::{RetryPolicy, retry_async, retry_backoff};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
 use s3::error::S3Error;
@@ -51,9 +52,10 @@ impl Sink for S3Sink {
         self.bucket = Some(bucket);
 
         info!(
-            "S3 sink ID: {} opened. format={}, rotation={}, max_file_size={}, template='{}'",
+            "S3 sink ID: {} opened. format={}, compression={}, rotation={}, max_file_size={}, template='{}'",
             self.id,
             self.config.output_format,
+            self.config.compression,
             self.config.file_rotation,
             self.config.max_file_size,
             self.config.path_template,
@@ -310,6 +312,7 @@ impl S3Sink {
             buffer.first_offset(),
             buffer.last_offset(),
             resolved.output_format,
+            self.config.compression,
         )?;
 
         let msg_count = buffer.message_count();
@@ -329,17 +332,20 @@ impl S3Sink {
     }
 
     async fn do_upload(&self, bucket: &s3::Bucket, payload: FlushPayload) -> Result<(), Error> {
-        match self
-            .upload_with_retry(bucket, &payload.s3_key, &payload.data)
-            .await
-        {
-            Ok(()) => {
+        // Compress once, outside the buffer lock, so every retry sends the same encoded bytes.
+        let result = async {
+            let data = self.config.compression.encode(payload.data)?;
+            self.upload_with_retry(bucket, &payload.s3_key, &data, self.config.compression)
+                .await?;
+            Ok(data.len())
+        }
+        .await;
+
+        match result {
+            Ok(uploaded_bytes) => {
                 debug!(
                     "S3 sink ID: {} uploaded {} ({} messages, {} bytes)",
-                    self.id,
-                    payload.s3_key,
-                    payload.msg_count,
-                    payload.data.len(),
+                    self.id, payload.s3_key, payload.msg_count, uploaded_bytes,
                 );
                 let mut state = self.state.lock().await;
                 state.messages_uploaded += payload.msg_count;
@@ -386,7 +392,7 @@ impl S3Sink {
             "offset_range: {first_offset}-{last_offset}\nmessage_count: {msg_count}\nerror: {error}\n"
         );
         if let Err(e) = self
-            .upload_with_retry(bucket, &marker_key, body.as_bytes())
+            .upload_with_retry(bucket, &marker_key, body.as_bytes(), Compression::None)
             .await
         {
             warn!(
@@ -401,14 +407,21 @@ impl S3Sink {
         bucket: &s3::Bucket,
         s3_key: &str,
         data: &[u8],
+        compression: Compression,
     ) -> Result<(), Error> {
         let resolved = self.resolved();
         let max_attempts = resolved.max_attempts;
         let base_delay = resolved.retry_delay;
         let mut attempt = 0u32;
+        let headers = compression.content_encoding().map(|encoding| {
+            HeaderMap::from_iter([(CONTENT_ENCODING, HeaderValue::from_static(encoding))])
+        });
 
         loop {
-            match bucket.put_object(s3_key, data).await {
+            match bucket
+                .put_object_with_headers(s3_key, data, headers.clone())
+                .await
+            {
                 Ok(response) => {
                     let status = response.status_code();
                     if (200..300).contains(&status) {
@@ -506,12 +519,275 @@ mod tests {
             max_file_size: DEFAULT_MAX_FILE_SIZE.to_string(),
             max_messages_per_file: None,
             output_format: DEFAULT_OUTPUT_FORMAT.to_string(),
+            compression: Compression::None,
             include_metadata: true,
             include_headers: false,
             max_attempts: None,
             retry_delay: None,
             path_style: None,
         }
+    }
+
+    fn raw_message(offset: u64) -> ConsumedMessage {
+        ConsumedMessage {
+            id: u128::from(offset) + 1,
+            offset,
+            checksum: 0,
+            timestamp: 1_000_000,
+            origin_timestamp: 0,
+            headers: None,
+            payload: Payload::Raw(format!(r#"{{"value":{offset}}}"#).into_bytes()),
+        }
+    }
+
+    fn raw_metadata() -> MessagesMetadata {
+        MessagesMetadata {
+            partition_id: 0,
+            current_offset: 0,
+            schema: Schema::Raw,
+        }
+    }
+
+    #[test]
+    fn given_compression_when_rotating_and_closing_should_upload_complete_encoded_files() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for (compression, suffix, encoding) in [
+                (Compression::None, "", None),
+                (Compression::Gzip, ".gz", Some("gzip")),
+                (Compression::Zstd, ".zst", Some("zstd")),
+            ] {
+                for (format, extension, expected) in [
+                    (
+                        "json_lines",
+                        "jsonl",
+                        [
+                            "{\"payload\":{\"value\":0}}\n{\"payload\":{\"value\":1}}\n",
+                            "{\"payload\":{\"value\":2}}\n",
+                        ],
+                    ),
+                    (
+                        "json_array",
+                        "json",
+                        [
+                            "[{\"payload\":{\"value\":0}},{\"payload\":{\"value\":1}}]",
+                            "[{\"payload\":{\"value\":2}}]",
+                        ],
+                    ),
+                    (
+                        "raw",
+                        "bin",
+                        ["{\"value\":0}{\"value\":1}", "{\"value\":2}"],
+                    ),
+                ] {
+                    let server = MockServer::start().await;
+                    mock_write_probe(&server, "data/.iggy-sink-probe").await;
+                    Mock::given(method("PUT"))
+                        .respond_with(ResponseTemplate::new(200))
+                        .expect(2)
+                        .mount(&server)
+                        .await;
+                    let config = S3SinkConfig {
+                        endpoint: Some(server.uri()),
+                        access_key_id: Some("test-access-key".into()),
+                        secret_access_key: Some("test-secret-key".into()),
+                        path_template: "{stream}/{topic}".to_string(),
+                        file_rotation: FileRotation::Messages,
+                        max_messages_per_file: Some(2),
+                        output_format: format.to_string(),
+                        compression,
+                        include_metadata: false,
+                        ..test_config()
+                    };
+                    let mut sink = S3Sink::new(1, config);
+                    sink.open().await.unwrap();
+                    sink.consume(
+                        &TopicMetadata {
+                            stream: "events".to_string(),
+                            topic: "messages".to_string(),
+                        },
+                        raw_metadata(),
+                        (0..3).map(raw_message).collect(),
+                    )
+                    .await
+                    .unwrap();
+                    let requests = server.received_requests().await.unwrap();
+                    let puts = requests.iter().filter(|request| request.method == "PUT");
+                    assert_eq!(
+                        puts.count(),
+                        1,
+                        "Only the full buffer should be uploaded before close"
+                    );
+                    sink.close().await.unwrap();
+                    let requests = server.received_requests().await.unwrap();
+                    let (uploads, others): (Vec<_>, Vec<_>) =
+                        requests.iter().partition(|request| request.method == "PUT");
+                    for request in others {
+                        assert!(!request.headers.contains_key(CONTENT_ENCODING));
+                    }
+                    assert_eq!(uploads.len(), 2);
+                    for (index, request) in uploads.iter().enumerate() {
+                        let (start, end) = if index == 0 { (0, 1) } else { (2, 2) };
+                        let object = format!("00000-{start:020}-{end:020}.{extension}{suffix}");
+                        let content_length: usize = request.headers["content-length"]
+                            .to_str()
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        assert_eq!(
+                            request.url.path(),
+                            format!("/test-bucket/data/events/messages/{object}")
+                        );
+                        assert_eq!(
+                            request
+                                .headers
+                                .get(CONTENT_ENCODING)
+                                .map(|value| value.to_str().unwrap()),
+                            encoding
+                        );
+                        assert_eq!(request.headers["content-type"], "application/octet-stream");
+                        assert_eq!(content_length, request.body.len());
+                        assert_eq!(
+                            compression.decode(&request.body),
+                            expected[index].as_bytes()
+                        );
+                    }
+                    let state = sink.state.lock().await;
+                    assert_eq!(state.messages_uploaded, 3);
+                    assert_eq!(state.messages_lost, 0);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn given_compressed_upload_when_retrying_should_reuse_body_key_and_encoding() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for compression in [Compression::Gzip, Compression::Zstd] {
+                let server = MockServer::start().await;
+                mock_write_probe(&server, "data/.iggy-sink-probe").await;
+                Mock::given(method("PUT"))
+                    .respond_with(ResponseTemplate::new(503))
+                    .up_to_n_times(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("PUT"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let config = S3SinkConfig {
+                    endpoint: Some(server.uri()),
+                    access_key_id: Some("test-access-key".into()),
+                    secret_access_key: Some("test-secret-key".into()),
+                    file_rotation: FileRotation::Messages,
+                    max_messages_per_file: Some(1),
+                    output_format: "raw".to_string(),
+                    compression,
+                    max_attempts: Some(2),
+                    retry_delay: Some("1ms".to_string()),
+                    ..test_config()
+                };
+                let mut sink = S3Sink::new(1, config);
+                sink.open().await.unwrap();
+                sink.consume(
+                    &TopicMetadata {
+                        stream: "events".to_string(),
+                        topic: "messages".to_string(),
+                    },
+                    raw_metadata(),
+                    vec![raw_message(0)],
+                )
+                .await
+                .unwrap();
+                let requests = server.received_requests().await.unwrap();
+                let uploads: Vec<_> = requests
+                    .iter()
+                    .filter(|request| request.method == "PUT")
+                    .collect();
+                assert_eq!(uploads.len(), 2);
+                assert_eq!(uploads[0].body, uploads[1].body);
+                assert_eq!(uploads[0].url.path(), uploads[1].url.path());
+                for request in uploads {
+                    assert_eq!(
+                        request.headers[CONTENT_ENCODING],
+                        compression.content_encoding().unwrap()
+                    );
+                    assert_eq!(compression.decode(&request.body), b"{\"value\":0}");
+                }
+                let state = sink.state.lock().await;
+                assert_eq!(state.messages_uploaded, 1);
+                assert_eq!(state.messages_lost, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn given_compressed_upload_when_failing_should_write_unencoded_loss_marker() {
+        let runtime = tokio::runtime::Runtime::new().expect("Start test runtime");
+        runtime.block_on(async {
+            for compression in [Compression::Gzip, Compression::Zstd] {
+                let server = MockServer::start().await;
+                mock_write_probe(&server, "data/.iggy-sink-probe").await;
+                Mock::given(method("PUT"))
+                    .respond_with(ResponseTemplate::new(403))
+                    .up_to_n_times(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("PUT"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let config = S3SinkConfig {
+                    endpoint: Some(server.uri()),
+                    access_key_id: Some("test-access-key".into()),
+                    secret_access_key: Some("test-secret-key".into()),
+                    file_rotation: FileRotation::Messages,
+                    max_messages_per_file: Some(1),
+                    output_format: "raw".to_string(),
+                    compression,
+                    max_attempts: Some(1),
+                    ..test_config()
+                };
+                let mut sink = S3Sink::new(1, config);
+                sink.open().await.unwrap();
+                let result = sink
+                    .consume(
+                        &TopicMetadata {
+                            stream: "events".to_string(),
+                            topic: "messages".to_string(),
+                        },
+                        raw_metadata(),
+                        vec![raw_message(0)],
+                    )
+                    .await;
+                assert!(matches!(result, Err(Error::CannotStoreData(_))));
+                let requests = server.received_requests().await.unwrap();
+                let uploads: Vec<_> = requests
+                    .iter()
+                    .filter(|request| request.method == "PUT")
+                    .collect();
+                assert_eq!(uploads.len(), 2);
+                assert_eq!(
+                    uploads[0].headers[CONTENT_ENCODING],
+                    compression.content_encoding().unwrap()
+                );
+                assert_eq!(
+                    uploads[1].url.path(),
+                    format!("{}.lost", uploads[0].url.path())
+                );
+                assert!(!uploads[1].headers.contains_key(CONTENT_ENCODING));
+                let marker = std::str::from_utf8(&uploads[1].body).unwrap();
+                assert!(marker.starts_with("offset_range: 0-0\nmessage_count: 1\nerror:"));
+                let state = sink.state.lock().await;
+                assert_eq!(state.messages_uploaded, 0);
+                assert_eq!(state.messages_lost, 1);
+            }
+        });
     }
 
     #[test]
@@ -934,7 +1210,7 @@ mod tests {
                     .expect("Sink should initialize before uploading");
                 let bucket = sink.bucket.as_ref().expect("S3 client should be available");
                 let result = sink
-                    .upload_with_retry(bucket, "data/message.bin", b"payload")
+                    .upload_with_retry(bucket, "data/message.bin", b"payload", Compression::None)
                     .await;
                 if matches!(status, 403 | 404) {
                     assert!(
@@ -1038,7 +1314,7 @@ mod tests {
             sink.validate_and_parse_config()
                 .expect("Valid configuration");
             let error = sink
-                .upload_with_retry(&bucket, "message.bin", b"payload")
+                .upload_with_retry(&bucket, "message.bin", b"payload", Compression::None)
                 .await
                 .expect_err("The only upload must fail");
             assert!(

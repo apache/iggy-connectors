@@ -91,20 +91,26 @@ With `include_metadata = true`, the table must contain these writable columns:
 
 String header keys keep their names unless prefixed with `~` or non-UTF-8; other keys use `~<kind>:<value>` names such as `~int32:1`. Text and typed header values become strings, binary or non-UTF-8 values become `{"data":"<base64>","iggy_header_encoding":"base64"}`, and missing headers become an empty object. `messages_metadata.current_offset` is a poll high-water mark and is not used as the row offset or a batch identity.
 
-Example table for mapped mode:
+Example of creating the target ScopeDB table for mapped mode (with metadata and headers enabled) via the ScopeDB Catalog API:
 
-```sql
-CREATE TABLE events (
-    id int,
-    event string,
-    iggy_stream string,
-    iggy_topic string,
-    iggy_partition_id uint,
-    iggy_offset uint,
-    iggy_timestamp timestamp,
-    iggy_id string,
-    iggy_headers object
-);
+```bash
+curl -X PUT "$SCOPEDB_ENDPOINT/v1/catalog/databases/scopedb/schemas/public/tables/events" \
+  -H "Authorization: Bearer $SCOPEDB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "events",
+    "columns": [
+      {"name": "id", "data_type": "int"},
+      {"name": "event", "data_type": "string"},
+      {"name": "iggy_stream", "data_type": "string"},
+      {"name": "iggy_topic", "data_type": "string"},
+      {"name": "iggy_partition_id", "data_type": "uint"},
+      {"name": "iggy_offset", "data_type": "uint"},
+      {"name": "iggy_timestamp", "data_type": "timestamp"},
+      {"name": "iggy_id", "data_type": "string"},
+      {"name": "iggy_headers", "data_type": "object"}
+    ]
+  }'
 ```
 
 ## Failures and delivery semantics

@@ -26,8 +26,8 @@ verbose = false
 [[streams]]
 stream = "telemetry"
 topics = ["logs"]
-# Each message holds one protobuf ExportLogsServiceRequest, as the Collector's
-# Kafka exporter writes it with the otlp_proto encoding.
+# "raw" for encoding = "otlp_proto". With encoding = "log_record", "json" gives
+# structured bodies, "text" gives string bodies and "raw" gives bytes bodies.
 schema = "raw"
 batch_length = 500
 consumer_group = "otlp_sink"
@@ -35,6 +35,11 @@ consumer_group = "otlp_sink"
 [plugin_config]
 # Required. The base URL, http(s)://host:4318. The sink appends /v1/logs.
 endpoint = "http://localhost:4318"
+
+# What a message holds. "otlp_proto" (default): one protobuf
+# ExportLogsServiceRequest, as the Collector's Kafka exporter writes it.
+# "log_record": anything, and the sink wraps each message in one log record.
+encoding = "otlp_proto"
 
 # "none" (default) or "gzip".
 compression = "none"
@@ -52,9 +57,18 @@ max_retry_delay = "10s"
 # limit most receivers use). Messages are never split across requests.
 max_request_bytes = 4000000
 
+# With encoding = "log_record": add the stream, topic, partition, offset and
+# message ID to each record as iggy.* attributes (default: true).
+# include_metadata = true
+
 verbose_logging = false
 
 # Sent with every export as HTTP headers. Values are treated as secrets. Do not
 # commit real credentials.
 # [plugin_config.headers]
 # authorization = "Bearer <YOUR_TOKEN_HERE>"
+
+# With encoding = "log_record": the attributes of the resource that every
+# record is exported under.
+# [plugin_config.resource_attributes]
+# "service.name" = "checkout"

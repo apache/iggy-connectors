@@ -328,14 +328,16 @@ fn is_retryable_status(status: StatusCode) -> bool {
     ) || status.is_server_error()
 }
 
-/// Exponential backoff with full jitter.
+/// Exponential backoff with full jitter, before retry number `attempt` (1-based).
 ///
-/// Cap grows as `base * 2^attempt`, clamped to 60 s. The actual sleep is
+/// Cap grows as `base * 2^(attempt - 1)`, clamped to 60 s. The actual sleep is
 /// a uniform random value in `[0, cap]`, so concurrent instances spread
 /// their retries instead of thundering back together.
 pub(crate) fn jittered_backoff(base: Duration, attempt: u32) -> Duration {
     const MAX: Duration = Duration::from_secs(60);
-    let cap = base.saturating_mul(2u32.saturating_pow(attempt)).min(MAX);
+    let cap = base
+        .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
+        .min(MAX);
     let cap_ms = cap.as_millis() as u64;
     Duration::from_millis(rand::rng().random_range(0..=cap_ms))
 }
@@ -506,5 +508,44 @@ mod tests {
             client.insert_query,
             "INSERT INTO `my``db`.`ta``ble` FORMAT JSONEachRow"
         );
+    }
+
+    #[test]
+    fn given_first_retry_should_not_exceed_base_delay() {
+        let base = Duration::from_secs(1);
+        for _ in 0..1000 {
+            let delay = jittered_backoff(base, 1);
+            assert!(
+                delay <= base,
+                "first retry waited {delay:?}, past the {base:?} retry_delay"
+            );
+        }
+    }
+
+    #[test]
+    fn given_successive_retries_should_double_the_window() {
+        let base = Duration::from_secs(1);
+        for retry in 1..=6 {
+            let window = base * 2u32.pow(retry - 1);
+            for _ in 0..1000 {
+                let delay = jittered_backoff(base, retry);
+                assert!(
+                    delay <= window,
+                    "retry {retry} waited {delay:?}, past its {window:?} window"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_large_retry_number_should_cap_at_sixty_seconds() {
+        for retry in [7, 32, u32::MAX] {
+            for _ in 0..1000 {
+                assert!(
+                    jittered_backoff(Duration::from_secs(1), retry) <= Duration::from_secs(60),
+                    "retry {retry} waited too long"
+                );
+            }
+        }
     }
 }

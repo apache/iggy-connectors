@@ -1,0 +1,107 @@
+---
+title: ScopeDB Sink
+description: "Append Iggy messages to an existing ScopeDB table, mapping JSON fields to columns or writing the payload to one column."
+---
+
+The ScopeDB sink appends Iggy messages to an existing ScopeDB table through the ScopeDB Rust SDK. It never creates tables or changes schemas. At startup it reads the table definition and checks that the columns it needs exist.
+
+## Configuration
+
+Use the runtime setup from the [sink guide](/docs/connectors/sinks/sink#configuration). Build the plugin from the repository root:
+
+```bash
+cargo build --release -p iggy_connector_scopedb_sink
+```
+
+Then save this connector file in the runtime's connector directory:
+
+```toml
+type = "sink"
+key = "scopedb"
+enabled = true
+version = 0
+name = "ScopeDB sink"
+path = "target/release/libiggy_connector_scopedb_sink"
+
+[[streams]]
+stream = "orders"
+topics = ["events"]
+schema = "json"
+batch_length = 1000
+consumer_group = "scopedb_sink_connector"
+
+[plugin_config]
+endpoint = "https://<workspace-endpoint>"
+table = "events"
+mode = "mapped"
+include_metadata = true
+include_headers = false
+```
+
+`endpoint` and `table` are required. Supply the API key through the `IGGY_CONNECTORS_SINK_SCOPEDB_PLUGIN_CONFIG_API_KEY` environment variable rather than the file. The key needs permission to read the table definition and append rows. Endpoints with embedded credentials, query parameters or fragments are rejected.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `api_key` | none | Bearer API key, when the endpoint requires one |
+| `database` | `scopedb` | Target database |
+| `schema` | `public` | Target schema |
+| `mode` | `mapped` | `mapped` or `raw` |
+| `payload_column` | `payload` | Destination column in raw mode |
+| `include_metadata` | `true` | Write the Iggy metadata columns |
+| `include_headers` | `false` | Write message headers to `iggy_headers` |
+| `batch_size` | `100` | Maximum rows per request, at most 200,000 |
+| `max_request_bytes` | `8388608` | Maximum uncompressed request size, at most 8388608 |
+| `max_concurrent_requests` | `1` | Concurrent requests per batch. Higher values allow out-of-order completion |
+| `max_retries` | `3` | Total attempts per request, including the first, from 1 to 3 |
+| `retry_delay` | `1s` | Initial exponential backoff |
+| `max_retry_delay` | `30s` | Maximum backoff, including `Retry-After` |
+| `retry_ambiguous` | `false` | Allow replay of ambiguous outcomes, which can duplicate rows |
+| `timeout` | `30s` | Startup deadline and timeout per write attempt |
+| `verbose_logging` | `false` | Log batch summaries at `info` instead of `debug` |
+
+Restart the connector after changing the table definition.
+
+## Modes
+
+In `mapped` mode, each payload must be a JSON object. Top-level fields are written to the writable columns with the same names, and other fields are ignored.
+
+In `raw` mode, the whole payload goes to `payload_column`. The column type decides the encoding: `binary` stores base64 of any payload, `string` stores UTF-8 text, `object` stores JSON objects, and `any` stores any JSON value.
+
+Integers must fit a signed 64-bit integer. Store larger identifiers as strings.
+
+## Metadata
+
+With `include_metadata = true`, the table must have these writable columns:
+
+| Column | ScopeDB type |
+| --- | --- |
+| `iggy_stream` | `string` |
+| `iggy_topic` | `string` |
+| `iggy_partition_id` | `uint` or `int` |
+| `iggy_offset` | `uint` or `int` |
+| `iggy_timestamp` | `timestamp` |
+| `iggy_id` | `string` |
+
+With `include_headers = true`, the table also needs an `iggy_headers` column of type `object` or `any`. An example table for mapped mode:
+
+```sql
+CREATE TABLE events (
+    id int,
+    event string,
+    iggy_stream string,
+    iggy_topic string,
+    iggy_partition_id uint,
+    iggy_offset uint,
+    iggy_timestamp timestamp,
+    iggy_id string,
+    iggy_headers object
+);
+```
+
+## Delivery behavior
+
+The sink uses the runtime's default at-most-once delivery, which commits offsets when messages are polled, before ScopeDB stores them. A failed batch is logged and not redelivered, and a crash after the commit can lose messages. The sink does not support the runtime's `at_least_once` delivery mode, and a connector configured with it does not start.
+
+Only HTTP `429` responses are retried by default. HTTP `5xx` and lost responses have an unknown outcome and are not replayed unless `retry_ambiguous` is set. Client-side write timeouts are never replayed. A batch split across several requests can partly succeed. Every rejected or failed row is logged with its stream, topic, partition and offset. There is no dead-letter queue.
+
+The [ScopeDB sink reference](https://github.com/apache/iggy-connectors/blob/master/sinks/scopedb_sink/README.md) covers header encoding, row-error recovery and testing against a live ScopeDB endpoint.

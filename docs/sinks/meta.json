@@ -18,6 +18,8 @@
     "surrealdb",
     "bigquery",
     "rabbitmq",
-    "redshift"
+    "redshift",
+    "otlp",
+    "scopedb"
   ]
 }

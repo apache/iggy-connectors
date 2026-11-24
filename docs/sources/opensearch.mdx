@@ -1,0 +1,82 @@
+---
+title: OpenSearch
+description: "Poll documents from an OpenSearch index and publish each one to Iggy as a JSON message, resuming from a saved watermark."
+---
+
+The OpenSearch source polls documents from an OpenSearch index or index pattern and publishes each document's `_source` to one Iggy stream and topic as a JSON message. It only reads from OpenSearch. Progress is tracked by a watermark, the sort position of the newest published document, which the runtime saves so a restart resumes after the last acknowledged batch.
+
+## Configuration
+
+Build the plugin from the repository root:
+
+```bash
+cargo build --release -p iggy_connector_opensearch_source
+```
+
+Create the destination stream and topic, then add this file to the [local provider](/docs/connectors/runtime#local-file-provider):
+
+```toml
+type = "source"
+key = "opensearch"
+enabled = true
+version = 0
+name = "OpenSearch source"
+path = "target/release/libiggy_connector_opensearch_source"
+plugin_config_format = "json"
+
+[[streams]]
+stream = "opensearch_stream"
+topic = "documents"
+schema = "json"
+batch_length = 100
+linger_time = "5ms"
+
+[plugin_config]
+url = "http://localhost:9200"
+index = "logs-*"
+polling_interval = "10s"
+batch_size = 100
+timestamp_field = "@timestamp"
+query = { match_all = {} }
+```
+
+`url`, `index` and `timestamp_field` are required. `index` can be a name or a pattern. A name that does not exist fails at startup, while a pattern that matches nothing yet is accepted. `timestamp_field` must be sortable in the index mapping. Set `username` and `password` together for HTTP basic authentication. `query` is a Query DSL object applied on every poll and defaults to `match_all`.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `polling_interval` | `10s` | Wait before each poll, including the first |
+| `batch_size` | `100` | Documents per search, from 1 to 10,000 |
+| `tiebreaker_field` | `_id` | Unique `keyword` field with doc values that orders documents with the same timestamp |
+| `request_timeout` | `30s` | Limit for one HTTP request |
+| `max_retries` | `3` | Total HTTP attempts per search, including the first |
+| `retry_delay` | `1s` | Base delay for exponential backoff |
+| `retry_max_delay` | `30s` | Backoff cap |
+| `max_open_retries` | `5` | Total attempts for each startup check |
+| `open_retry_max_delay` | `30s` | Backoff cap during startup |
+| `circuit_breaker_threshold` | `5` | Consecutive polls that fail with a network error, a `429` or `5xx`, or a partial result, before polling pauses |
+| `circuit_breaker_cool_down` | `60s` | How long polling pauses |
+| `verbose_logging` | `false` | Log batch counts at `info` instead of `debug` |
+
+The defaults read about ten documents a second. For a large first load, raise `batch_size` and lower `polling_interval`.
+
+## Ordering and the tie-breaker
+
+Each search sorts by `timestamp_field`, `tiebreaker_field` and `_index`, and pages with `search_after`. A new scan restarts at the watermark and skips documents already published at that timestamp, so a document that becomes searchable late with the same timestamp as the newest published one is found when the connector is caught up. While a scan spans several full pages, as in a large backlog, such a document can be skipped. A document that becomes searchable late with a timestamp older than the watermark is not read until the state is reset.
+
+`_id` has no doc values. A cluster with `indices.id_field_data.enabled=false` rejects sorting on it, and `_id` is only unique within a shard. In either case, set `tiebreaker_field` to a unique `keyword` field with doc values, such as an event ID. Startup checks its mapping in every matched index.
+
+Documents without `timestamp_field` are published on the first scan. One indexed later is skipped. To leave them out, add an `exists` filter to `query`. If your data can carry future timestamps, add a `range` filter with `lte: "now"`, because a future timestamp moves the watermark past every document indexed before that time.
+
+## Messages
+
+Each message's payload is the document's `_source` as JSON. Its ID is a 128-bit BLAKE3 hash of `_index` and the tie-breaker value, so a document fetched again keeps the same ID. The ID names the document, not a version of it, so an updated document keeps its ID too. The `opensearch.document_id` header carries `_id` and the `opensearch.index` header carries `_index`. A header value over 255 bytes is dropped with a warning. `origin_timestamp` is left unset, so Iggy records the ingestion time. Hits without `_source` are skipped with a warning.
+
+## Delivery behavior
+
+Delivery is at least once for the documents the source reads. The runtime sends the batch, saves the new watermark, and reports the result. A rejected batch is fetched again, and a batch that reached Iggy before a failed state save is replayed. Consumers can deduplicate on the message ID, but a consumer that drops repeated IDs also drops the new body of an updated document. The source stops after five consecutive rejected batches.
+
+A saved state records the `index`, `timestamp_field` and `query` it was saved under. Startup fails if they have changed, because the old watermark would skip documents. `tiebreaker_field` is not part of that check. Changing it makes the first scan publish the documents at the watermark again, under new message IDs. To start over, delete the saved state. With the default file storage it is the `source_<key>.state` file in the runtime's `[state] path` directory. With no saved state the source reads the index from the beginning.
+
+Network errors, HTTP `429` and `5xx` are retried with exponential backoff and jitter. `Retry-After` is ignored. Searches reject partial results, so a timed out or partly failed search does not move the watermark.
+
+The [OpenSearch source reference](https://github.com/apache/iggy-connectors/blob/master/sources/opensearch_source/README.md) covers the error types, the state format, the remaining limits and troubleshooting.

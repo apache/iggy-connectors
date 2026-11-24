@@ -1,0 +1,74 @@
+---
+title: OTLP Sink
+description: "Export OpenTelemetry logs from Iggy topics to any OTLP/HTTP receiver, such as an OpenTelemetry Collector."
+---
+
+The OTLP sink exports logs from Iggy topics to any backend that accepts the OpenTelemetry Protocol over HTTP, such as an OpenTelemetry Collector. It sends protobuf request bodies to the receiver's `/v1/logs` path. This first version handles logs only.
+
+## What a message holds
+
+Each message holds one protobuf `ExportLogsServiceRequest`, with the stream `schema` set to `raw`. This is the `otlp_proto` encoding that the OpenTelemetry Collector's Kafka exporter and receiver use, so a topic written by a Collector can be exported unchanged.
+
+The sink checks that each message decodes and forwards the original bytes. Resources, scopes and attributes are not rewritten. A message is dropped when it does not decode, holds no resource entry, or has a log record whose `trace_id` is set but not 16 bytes or whose `span_id` is set but not 8 bytes. An empty ID is valid. The sink logs one warning per batch with the number of dropped messages and the offset of the first one. The other messages in the batch are still exported.
+
+## Configuration
+
+Use the runtime setup from the [sink guide](/docs/connectors/sinks/sink#configuration). Build the plugin from the repository root:
+
+```bash
+cargo build --release -p iggy_connector_otlp_sink
+```
+
+Then save this connector file in the runtime's connector directory:
+
+```toml
+type = "sink"
+key = "otlp"
+enabled = true
+version = 0
+name = "OTLP sink"
+path = "target/release/libiggy_connector_otlp_sink"
+
+[[streams]]
+stream = "telemetry"
+topics = ["logs"]
+schema = "raw"
+batch_length = 500
+consumer_group = "otlp_sink"
+
+[plugin_config]
+endpoint = "https://otlp.example.com:4318"
+compression = "gzip"
+
+[plugin_config.headers]
+authorization = "Bearer <YOUR_TOKEN_HERE>"
+```
+
+`endpoint` is required. It is the base URL, and the sink appends `/v1/logs`. An endpoint that already ends in `/v1/logs` is rejected. An unknown key is rejected too, so a misspelled option stops the connector at startup.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `compression` | `none` | `none` or `gzip` |
+| `headers` | none | HTTP headers sent with every export, such as an authorization token. Values are never logged |
+| `timeout` | `10s` | Timeout of one attempt |
+| `max_retries` | `8` | Total attempts per request, including the first |
+| `retry_delay` | `1s` | First backoff, doubling on each retry with jitter |
+| `max_retry_delay` | `10s` | Upper bound on one backoff |
+| `max_request_bytes` | `4000000` | Upper bound on one encoded request. Messages are packed whole, and a single message above the limit is sent alone |
+| `verbose_logging` | `false` | Log each batch at `info` instead of `debug` |
+
+`headers` cannot be set from an environment variable. Set it in the connector file or through the HTTP config provider. `content-type` and `content-encoding` are rejected because the sink sets both.
+
+TLS is used when the endpoint scheme is `https`, verified against the system's root certificates. Client certificates are not supported.
+
+## Delivery behavior
+
+The runtime commits a batch's offsets before handing it to the sink, so a failed batch is not redelivered. A retry inside the sink can still deliver records twice, as described below. The sink does not support the runtime's `at_least_once` delivery mode, and a connector configured with it does not start.
+
+Instead, the sink retries inside each call for the failures the OTLP/HTTP specification calls retryable: `429`, `502`, `503`, `504` and transport errors. With the defaults, one request can wait about 45 seconds in backoff. Other statuses, including `3xx` redirects, are permanent and are not retried. A retry can deliver records twice when the receiver stored a request but its answer did not arrive in time.
+
+A permanent failure such as `401` or `404` loses the batch after one attempt, and the runtime goes on to the next batch. An expired token or a wrong endpoint path therefore drains the backlog until the configuration is fixed. The sink does not contact the endpoint at startup, so it starts even when the receiver is down.
+
+When the receiver reports a `partial_success` with rejected log records, those records are logged and counted, and are not retried.
+
+The [OTLP sink reference](https://github.com/apache/iggy-connectors/blob/master/sinks/otlp_sink/README.md) lists the counters the sink keeps and the remaining limits.

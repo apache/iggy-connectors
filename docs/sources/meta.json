@@ -7,6 +7,7 @@
     "postgres",
     "random",
     "mqtt",
-    "http"
+    "http",
+    "opensearch"
   ]
 }

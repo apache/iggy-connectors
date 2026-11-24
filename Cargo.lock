@@ -2968,6 +2968,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32c"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f132a176423ee852e8f0a35d43088d1850966b50745be818a88b76f64b1c6cb"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6022,8 +6031,8 @@ dependencies = [
  "ahash",
  "async-trait",
  "bytes",
- "ctor 1.0.13",
- "dtor 1.0.6",
+ "ctor 1.0.14",
+ "dtor 1.0.7",
  "humantime",
  "iggy",
  "iggy_common",
@@ -6043,7 +6052,7 @@ dependencies = [
  "tempfile",
  "testcontainers-modules",
  "tokio",
- "toml 1.1.8+spec-1.1.0",
+ "toml 1.2.2+spec-1.1.0",
  "tracing",
  "uuid",
 ]

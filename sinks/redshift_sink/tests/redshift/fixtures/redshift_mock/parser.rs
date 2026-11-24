@@ -30,8 +30,8 @@ use pgwire::{
 use sqlparser::{
     ast::{
         CharacterLength, CreateTable, DataType, Expr, HiveDistributionStyle, Ident, ObjectName,
-        ObjectNamePart, Select, SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement,
-        TableFactor, Value, VisitMut, VisitorMut,
+        ObjectNamePart, Select, SelectFlavor, SelectItem, SetExpr, SqliteTableOption,
+        Statement as SqlStatement, TableFactor, Value, VisitMut, VisitorMut,
     },
     dialect::{PostgreSqlDialect, RedshiftSqlDialect},
     parser::Parser as SqlParser,
@@ -279,6 +279,9 @@ impl ParsedStatement {
 
 pub fn redshift_create_table_to_postgres(create: &mut CreateTable) -> Result<(), String> {
     // These cannot be expressed as PostgreSQL CREATE TABLE.
+    let sqlite_options = &create.sqlite_table_options.options;
+    let without_rowid = sqlite_options.contains(&SqliteTableOption::WithoutRowid);
+    let strict = sqlite_options.contains(&SqliteTableOption::Strict);
     let unsupported = [
         ("OR REPLACE", create.or_replace),
         ("EXTERNAL", create.external),
@@ -286,10 +289,10 @@ pub fn redshift_create_table_to_postgres(create: &mut CreateTable) -> Result<(),
         ("ICEBERG", create.iceberg),
         ("SNAPSHOT", create.snapshot),
         ("DYNAMIC", create.dynamic),
-        ("WITHOUT ROWID", create.without_rowid),
+        ("WITHOUT ROWID", without_rowid),
         ("COPY GRANTS", create.copy_grants),
         ("REQUIRE USER", create.require_user),
-        ("STRICT", create.strict),
+        ("STRICT", strict),
     ];
 
     if let Some((feature, _)) = unsupported.into_iter().find(|(_, present)| *present) {

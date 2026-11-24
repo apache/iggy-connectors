@@ -45,6 +45,9 @@ static AMQP_MESSAGE_ID_HEADER_KEY: LazyLock<HeaderKey> = LazyLock::new(|| {
 // Keep encoded headers well below simd-json's 1,024-container parser limit.
 const MAX_HEADER_NESTING_DEPTH: usize = 400;
 
+// 16 + 13 + 11 + 14 + 13 literal JSON bytes around the body and metadata.
+const ENVELOPE_FIXED_BYTES: usize = 67;
+
 pub fn encode_delivery(delivery: &Delivery) -> Result<Vec<u8>, serde_json::Error> {
     let mut properties = Map::new();
     for (name, value) in [
@@ -81,7 +84,7 @@ pub fn encode_delivery(delivery: &Delivery) -> Result<Vec<u8>, serde_json::Error
         .map(|table| encode_table(table, 0))
         .transpose()?
         .unwrap_or_else(|| Value::Object(Map::new()));
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(ENVELOPE_FIXED_BYTES + delivery.data.len().div_ceil(3) * 4);
     output.extend_from_slice(b"{\"body_base64\":\"");
     {
         let mut encoder = base64::write::EncoderWriter::new(&mut output, &STANDARD);
@@ -418,7 +421,7 @@ mod tests {
 
 #[cfg(test)]
 mod envelope_tests {
-    use super::{encode_delivery, encode_value};
+    use super::{encode_delivery, encode_value, encode_value_at_depth};
     use lapin::{
         BasicProperties,
         message::Delivery,
@@ -487,6 +490,15 @@ mod envelope_tests {
         let actual: serde_json::Value =
             serde_json::from_slice(&encoded).expect("envelope must be JSON");
         assert_eq!(actual["properties"], json!({}));
+    }
+
+    #[test]
+    fn given_header_depth_400_and_401_should_apply_the_encoder_cap() {
+        let mut table = FieldTable::default();
+        table.insert("leaf".into(), AMQPValue::Boolean(true));
+        let value = AMQPValue::FieldTable(table);
+        assert!(encode_value_at_depth(&value, 399).is_ok());
+        assert!(encode_value_at_depth(&value, 400).is_err());
     }
 
     #[test]

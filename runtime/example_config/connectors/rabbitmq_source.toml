@@ -38,9 +38,10 @@ linger_time = "5ms"
 [plugin_config]
 amqp_url = "amqp://iggy_test:iggy_test_password@localhost:5672/%2f"
 queue = "example_queue"
+# Controls both the maximum batch and RabbitMQ prefetch window.
+# Lower this value if deliveries can be large because each prefetched delivery may use memory.
 batch_size = 100
-prefetch_count = 10
 batch_timeout = "10ms"
 include_metadata = false
-timeout_seconds = 30
+timeout_secs = 30
 verbose_logging = false

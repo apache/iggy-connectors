@@ -26,15 +26,16 @@ pub struct RabbitMqSourceConfig {
     pub amqp_url: SecretString,
     pub queue: String,
     #[serde(default = "default_batch_size")]
-    pub batch_size: u32,
-    #[serde(default = "default_prefetch_count")]
-    pub prefetch_count: u32,
+    pub batch_size: u16,
+    /// Omitted to keep retrying NACKed batches; a nonzero value enables the SDK breaker.
+    #[serde(default)]
+    pub max_consecutive_nacks: Option<u32>,
     #[serde(default = "default_batch_timeout")]
     pub batch_timeout: String,
     #[serde(default)]
     pub include_metadata: bool,
-    #[serde(default = "default_timeout_seconds", alias = "timeout_secs")]
-    pub timeout_seconds: u64,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
     #[serde(default)]
     pub verbose_logging: Option<bool>,
     #[serde(default)]
@@ -70,11 +71,10 @@ impl RabbitMqSourceConfig {
                 "batch_size must be positive".into(),
             ));
         }
-        if self.prefetch_count == 0 || self.prefetch_count > u32::from(u16::MAX) {
-            return Err(Error::InvalidConfigValue(format!(
-                "prefetch_count must be from 1 to {}",
-                u16::MAX
-            )));
+        if self.max_consecutive_nacks == Some(0) {
+            return Err(Error::InvalidConfigValue(
+                "max_consecutive_nacks must be greater than zero".into(),
+            ));
         }
         let timeout = humantime::parse_duration(&self.batch_timeout).map_err(|_| {
             Error::InvalidConfigValue("batch_timeout must be a duration such as 10ms or 1s".into())
@@ -84,9 +84,9 @@ impl RabbitMqSourceConfig {
                 "batch_timeout must be greater than zero".into(),
             ));
         }
-        if self.timeout_seconds == 0 {
+        if self.timeout_secs == 0 {
             return Err(Error::InvalidConfigValue(
-                "timeout_seconds must be greater than zero".into(),
+                "timeout_secs must be greater than zero".into(),
             ));
         }
         let now = Instant::now();
@@ -96,11 +96,11 @@ impl RabbitMqSourceConfig {
             ));
         }
         if now
-            .checked_add(Duration::from_secs(self.timeout_seconds))
+            .checked_add(Duration::from_secs(self.timeout_secs))
             .is_none()
         {
             return Err(Error::InvalidConfigValue(
-                "timeout_seconds is too large; use a smaller value".into(),
+                "timeout_secs is too large; use a smaller value".into(),
             ));
         }
         if let Some(tls) = &self.tls {
@@ -117,27 +117,16 @@ impl RabbitMqSourceConfig {
         }
         Ok(timeout)
     }
-
-    pub fn effective_prefetch_count(&self) -> u16 {
-        let count = self.prefetch_count.min(self.batch_size);
-        count as u16
-    }
 }
 
-const DEFAULT_PREFETCH_COUNT: u32 = 10;
-
-fn default_batch_size() -> u32 {
+fn default_batch_size() -> u16 {
     100
-}
-
-fn default_prefetch_count() -> u32 {
-    DEFAULT_PREFETCH_COUNT
 }
 
 fn default_batch_timeout() -> String {
     "10ms".to_owned()
 }
 
-fn default_timeout_seconds() -> u64 {
+fn default_timeout_secs() -> u64 {
     30
 }

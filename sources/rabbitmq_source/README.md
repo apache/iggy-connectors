@@ -37,21 +37,28 @@ This can cause message loss. The runtime currently accepts `exactly_once = true`
 | :--- | :---: | :--- | :--- |
 | `amqp_url` | Yes | None | RabbitMQ URL with the `amqp://` or `amqps://` scheme. |
 | `queue` | Yes | None | Name of an existing queue. The name must contain 1 to 255 bytes. |
-| `batch_size` | No | `100` | Maximum messages in a batch. It must be greater than zero. The effective prefetch can lower this limit. |
-| `prefetch_count` | No | `10` | Upper bound on unacknowledged deliveries that RabbitMQ sends to the source. It must be from 1 to 65,535. The effective prefetch is the smaller of this value and `batch_size`. |
+| `batch_size` | No | `100` | Maximum messages in a batch and the RabbitMQ consumer prefetch window. It must be from 1 to 65,535. |
 | `batch_timeout` | No | `"10ms"` | Maximum wait after the first delivery before the connector returns a batch. It must be greater than zero. |
+| `max_consecutive_nacks` | No | None | Consecutive rejected batches before the SDK stops the source. Omit to retry NACKed batches with capped backoff. It must be greater than zero. |
 | `include_metadata` | No | `false` | Set to `true` to emit the JSON envelope. Use the `json` destination schema. |
-| `timeout_seconds` | No | `30` | Timeout for connection setup, consumer setup, and acknowledgements. It must be greater than zero. |
+| `timeout_secs` | No | `30` | Timeout for connection setup, consumer setup, and acknowledgements. It must be greater than zero. |
 | `verbose_logging` | No | `false` | Logs prepared batches at info level when enabled. |
 | `tls.ca_file` | No | None | Optional PEM file for a custom CA. |
 | `tls.client_cert_file` | No | None | Optional PEM client certificate for mutual TLS. Set it with `tls.client_key_file`. |
 | `tls.client_key_file` | No | None | Optional PEM client key for mutual TLS. Set it with `tls.client_cert_file`. |
 
-The source sets the RabbitMQ consumer prefetch to the smaller of `batch_size` and
-`prefetch_count`. A batch cannot contain more messages than that effective prefetch.
-A batch can also end before it reaches either limit when `batch_timeout` expires or
-when it reaches the payload byte limit. The source acknowledges the batch before it
-collects the next one.
+The source sets the RabbitMQ consumer prefetch to `batch_size`, so the broker can send
+up to that many unacknowledged deliveries and a batch can contain up to that many
+messages. A batch can also end before it reaches that limit when `batch_timeout`
+expires or when it reaches the payload byte limit. The source acknowledges the batch
+before it collects the next one.
+
+A batch that Iggy does not accept stays pending and is replayed on the next poll, with
+the retry delay backing off to five seconds. The source retries without a limit by
+default. Set `max_consecutive_nacks` in `[plugin_config]` to a positive integer to stop
+the source after that many consecutive rejections. A stopped source keeps its connection
+and unacknowledged deliveries until the connector is restarted; RabbitMQ requeues them
+only after the connection closes.
 
 Each batch contains at most 64,000,000 bytes of prepared payloads. The source keeps
 one copy for retry and makes another copy for the runtime, for up to 128,000,000
@@ -61,14 +68,14 @@ up to 192,000,000 bytes.
 
 RabbitMQ prefetch counts messages, not bytes, so it cannot enforce the batch byte
 limit before delivery. Before the source acknowledges a batch, the broker can send
-up to the effective prefetch count. Each delivery can contain up to 64,000,000
-payload bytes, so prefetched deliveries can retain up to the effective prefetch
-count × 64,000,000 bytes in addition to the batch copies above. With the default
-effective prefetch of 10, that is up to 640,000,000 bytes, for a worst case of
-832,000,000 payload bytes together with the batch copies. Lower `prefetch_count`
-when the queue carries large messages. Headers, serialization, and runtime buffers
-use more memory, so these limits do not bound total process memory. In metadata
-mode, the limit counts the JSON envelope, including its Base64 body.
+up to `batch_size` deliveries. Each delivery can contain up to 64,000,000 payload
+bytes, so prefetched deliveries can retain up to `batch_size` × 64,000,000 bytes in
+addition to the batch copies above. With the default `batch_size` of 100, that is up
+to 6,400,000,000 bytes, for a worst case of 6,592,000,000 payload bytes together
+with the batch copies. Lower `batch_size` when the queue carries large messages.
+Headers, serialization, and runtime buffers use more memory, so these limits do not
+bound total process memory. In metadata mode, the limit counts the JSON envelope,
+including its Base64 body.
 
 Use `amqps://` when the RabbitMQ listener uses TLS. If you add a `[plugin_config.tls]` table, the URL must use `amqps://`. The client certificate and key must appear together.
 
@@ -96,10 +103,9 @@ linger_time = "5ms"
 amqp_url = "amqp://rabbit_user:replace-me@127.0.0.1:5672/%2f"
 queue = "events"
 batch_size = 100
-prefetch_count = 10
 batch_timeout = "10ms"
 include_metadata = false
-timeout_seconds = 30
+timeout_secs = 30
 verbose_logging = false
 ```
 
@@ -125,10 +131,9 @@ linger_time = "5ms"
 amqp_url = "amqp://rabbit_user:replace-me@127.0.0.1:5672/%2f"
 queue = "events"
 batch_size = 100
-prefetch_count = 10
 batch_timeout = "10ms"
 include_metadata = true
-timeout_seconds = 30
+timeout_secs = 30
 verbose_logging = false
 ```
 
@@ -149,6 +154,21 @@ amqps://user:password@broker.example:5671/%2f
 ```
 
 The default virtual host is `/`. Encode it as `%2f` in the URL path. Encode reserved characters in usernames and passwords. Do not commit real credentials.
+
+### AMQP frame size
+
+When `amqp_url` does not specify `frame_max`, the source adds `frame_max=4096`. To negotiate
+larger AMQP frames, such as to reduce fragmentation for workloads with large deliveries, set
+the value in the URL:
+
+```text
+amqp://user:password@broker.example:5672/%2f?frame_max=131072
+```
+
+The source preserves an explicitly supplied `frame_max`. This value limits an individual AMQP
+frame, not the total delivery size: AMQP can split a delivery across multiple frames, so larger
+deliveries do not by themselves require a higher value. Choose a value supported by the broker
+and client.
 
 ## TLS and Mutual TLS
 
@@ -196,7 +216,7 @@ Metadata mode sets the `json` schema and wraps the body as Base64. The envelope 
 
 The `properties` object contains each AMQP basic property that the publisher set, except `headers`, which has its own envelope field. String properties retain their values. `delivery_mode` and `priority` are JSON numbers. `timestamp` is a decimal string representing seconds since the Unix epoch. The AMQP message type uses the `type` key. Properties that the publisher did not set are omitted.
 
-When `include_metadata` is enabled, RabbitMQ headers can contain nested tables and arrays up to 400 levels deep. Deeper headers fail delivery preparation.
+When `include_metadata` is enabled, the metadata encoder rejects nested AMQP tables or arrays after 400 levels. The source adds `frame_max=4096` to an AMQP URL only when that parameter is absent, which reduces the maximum frame size accepted by the connection negotiation and lowers the parser risk. This is a parser hardening measure, not a guarantee that every deeply nested frame is rejected. RabbitMQ forwarding of such a frame to this source has not been proven by an integration test.
 
 ```json
 {
@@ -230,27 +250,34 @@ RabbitMQ → source holds delivery → runtime writes batch to Iggy
 
 The source keeps one batch in flight. If Iggy rejects a batch, the source retries that batch before it reads newer deliveries. RabbitMQ does not receive an acknowledgement for that batch.
 
-The source stops after five consecutive batch failures. Restore the Iggy connection and restart the source or connectors runtime. RabbitMQ can redeliver messages that remain unacknowledged.
+By default the source retries a batch that Iggy rejects without a limit, waiting with capped backoff between attempts. Set `max_consecutive_nacks` to a positive integer to stop the source after that many consecutive rejections. Restore the Iggy connection and restart the source or connectors runtime. RabbitMQ can redeliver messages that remain unacknowledged.
 
 If the connector stops while a delivery is unacknowledged, RabbitMQ can requeue it. Iggy can receive a duplicate if RabbitMQ redelivers a message after Iggy accepted it but before RabbitMQ received its acknowledgement.
 
-After Iggy accepts a batch, the source acknowledges the last delivery with `multiple: true`. If the acknowledgement fails or times out, the source attempts to close its RabbitMQ connection and returns success from `on_batch_result`. On the next poll, the source attempts to reconnect. It does not retry the acknowledgement or replay the batch. RabbitMQ can redeliver unacknowledged messages, which can create duplicates in Iggy.
+After Iggy accepts a batch, the source acknowledges the last delivery with `multiple: true`.
+If the acknowledgement fails or times out, the source attempts to close its RabbitMQ
+connection and returns success from `on_batch_result` because the batch is already in Iggy.
+It does not retry the acknowledgement or replay the batch. Consecutive acknowledgement
+failures wait before the next poll with the same jittered backoff as other RabbitMQ
+failures, from 1 to 2 seconds up to 5 to 6 seconds. On the next poll, the source attempts
+to reconnect. RabbitMQ can redeliver unacknowledged messages, which can create duplicates
+in Iggy. The source resets its retry counters only after a clean acknowledgement.
 
 ## Failure Handling
 
 | Condition | Behavior |
 | :--- | :--- |
 | RabbitMQ is unavailable at startup | Source initialization fails. Start RabbitMQ, then restart the connectors runtime. |
-| RabbitMQ disconnects after startup | The source waits for a random delay from 1 to 5 seconds, then retries connection and consume operations. |
+| RabbitMQ disconnects after startup | The source waits before each retry with jittered exponential backoff: 1 to 2 seconds, then 2 to 3 seconds, 4 to 5 seconds, and 5 to 6 seconds for every attempt after that. It then retries the connection and consume operations. |
 | Iggy rejects a batch | The source retains and retries the batch. RabbitMQ deliveries remain unacknowledged. |
-| A broker acknowledgement fails | The source attempts to close its RabbitMQ connection and attempts to reconnect on the next poll. RabbitMQ can redeliver unacknowledged messages, which can create duplicates in Iggy. |
+| A broker acknowledgement fails | The source attempts to close its RabbitMQ connection, waits with jittered exponential backoff (1 to 2 seconds, up to 5 to 6 seconds), and attempts to reconnect on the next poll. RabbitMQ can redeliver unacknowledged messages, which can create duplicates in Iggy. |
 | Empty body in raw mode | The connector logs and attempts to reject the delivery without requeuing it. If `basic.reject` succeeds, RabbitMQ dead-letters the delivery when a route exists, or drops it. If the reject fails or the acker is already unusable, the source closes the connection and RabbitMQ requeues the delivery. |
 | Payload exceeds 64,000,000 bytes | The connector logs and attempts to reject the delivery without requeuing it. If `basic.reject` succeeds, RabbitMQ dead-letters the delivery when a route exists, or drops it. If the reject fails or the acker is already unusable, the source closes the connection and RabbitMQ requeues the delivery. |
-| RabbitMQ header nesting exceeds 400 levels | The connector attempts to reject the delivery without requeuing it. If `basic.reject` fails or the acker is already unusable, the source closes the connection and RabbitMQ requeues the delivery. |
+| RabbitMQ header nesting exceeds 400 levels | The post-parse encoder rejects the delivery before emitting Iggy payload data. It does not change lapin/amq-protocol's parser behavior. |
 | Delivery preparation fails | The connector logs and attempts to reject the delivery without requeuing it. If `basic.reject` succeeds, RabbitMQ dead-letters the delivery when a route exists, or drops it. If the reject fails or the acker is already unusable, the source closes the connection and RabbitMQ requeues the delivery. |
 | Empty body in metadata mode | The connector can encode the empty body in the JSON envelope. |
 
-The 64,000,000-byte limit applies to each emitted payload and to the combined payloads in a batch. In metadata mode, the payload includes the JSON envelope.
+The 64,000,000-byte limit applies to each emitted payload and to the combined payloads in a batch. In metadata mode, the payload includes the JSON envelope. This limit and the 400-level encoder cap run after parsing; they do not bound parser recursion. The optional `frame_max` URL parameter provides only a negotiated frame-size mitigation.
 
 ## Operations
 

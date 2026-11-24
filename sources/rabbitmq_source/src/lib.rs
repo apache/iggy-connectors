@@ -210,6 +210,7 @@ mod tls {
 
 use std::{
     collections::BTreeMap,
+    num::NonZeroU32,
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
@@ -217,7 +218,8 @@ use std::{
 use async_trait::async_trait;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
-    source::SourceBatchResult, source_connector,
+    source::{BatchPolicy, SourceBatchResult},
+    source_connector,
 };
 use lapin::{
     Acker, Connection, ConnectionProperties, message::Delivery, options::BasicRejectOptions,
@@ -249,6 +251,7 @@ pub struct RabbitMqSource {
     overflow: Mutex<Option<(ProducedMessage, Acker, Instant)>>,
     deferred_failure: Mutex<Option<Failure>>,
     retry_attempts: AtomicU32,
+    consecutive_ack_failures: AtomicU32,
     last_warning: Mutex<BTreeMap<(&'static str, Option<String>), Instant>>,
 }
 
@@ -301,6 +304,26 @@ impl std::fmt::Debug for RabbitMqSource {
     }
 }
 
+const AMQP_FRAME_MAX: u32 = 4096;
+
+/// Adds a bounded frame_max wish only when the user did not set frame_max explicitly.
+fn merge_frame_max(amqp_url: &str) -> String {
+    let mut url = match url::Url::parse(amqp_url) {
+        Ok(url) => url,
+        Err(_) => return amqp_url.to_owned(),
+    };
+    if url
+        .query_pairs()
+        .any(|(name, _)| name.eq_ignore_ascii_case("frame_max"))
+    {
+        return url.to_string();
+    }
+
+    url.query_pairs_mut()
+        .append_pair("frame_max", &AMQP_FRAME_MAX.to_string());
+    url.to_string()
+}
+
 impl RabbitMqSource {
     pub fn new(id: u32, config: RabbitMqSourceConfig, _state: Option<ConnectorState>) -> Self {
         Self {
@@ -313,6 +336,7 @@ impl RabbitMqSource {
             overflow: Mutex::new(None),
             deferred_failure: Mutex::new(None),
             retry_attempts: AtomicU32::new(0),
+            consecutive_ack_failures: AtomicU32::new(0),
             last_warning: Mutex::new(BTreeMap::new()),
         }
     }
@@ -326,13 +350,14 @@ impl RabbitMqSource {
     }
 
     async fn connect(&self) -> Result<RabbitMqDriver, Failure> {
-        let duration = Duration::from_secs(self.config.timeout_seconds);
+        let duration = Duration::from_secs(self.config.timeout_secs);
         let runtime =
             lapin::runtime::default_runtime().map_err(|error| Failure::lapin("runtime", error))?;
+        let amqp_url = merge_frame_max(self.config.amqp_url.expose_secret());
         let connection = timeout(
             duration,
             Connection::connect_with_config(
-                self.config.amqp_url.expose_secret(),
+                &amqp_url,
                 ConnectionProperties::default(),
                 self.tls.clone(),
                 runtime,
@@ -341,22 +366,31 @@ impl RabbitMqSource {
         .await
         .map_err(|_| Failure::simple("connect", "RabbitMQ connection timed out"))?
         .map_err(|error| Failure::lapin("connect", error))?;
-        timeout(
+        let driver = timeout(
             duration,
-            RabbitMqDriver::consume(
-                connection,
-                &self.config.queue,
-                self.config.effective_prefetch_count(),
-            ),
+            RabbitMqDriver::consume(connection, &self.config.queue, self.config.batch_size),
         )
         .await
         .map_err(|_| Failure::simple("consumer_setup", "RabbitMQ consumer setup timed out"))?
-        .map_err(|error| Failure::lapin(error.operation, error.error))
+        .map_err(|error| Failure::lapin(error.operation, error.error))?;
+        self.retry_attempts.store(0, Ordering::Relaxed);
+        Ok(driver)
     }
 
     async fn wait_before_retry(&self, failure: &Failure) {
-        let attempts = self.retry_attempts.fetch_add(1, Ordering::Relaxed).min(3);
-        let maximum_ms = (1000u64 << attempts).min(5000);
+        let attempts = self.retry_attempts.fetch_add(1, Ordering::Relaxed);
+        self.back_off(attempts, failure).await;
+    }
+
+    async fn wait_before_ack_retry(&self, failure: &Failure) {
+        let attempts = self
+            .consecutive_ack_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.back_off(attempts, failure).await;
+    }
+
+    async fn back_off(&self, attempts: u32, failure: &Failure) {
+        let maximum_ms = (1000u64 << attempts.min(3)).min(5000);
         let delay_ms = maximum_ms + rand::random::<u64>() % 1000;
         let mut last = self.last_warning.lock().await;
         let key = (failure.operation, failure.reply_code.clone());
@@ -383,7 +417,7 @@ impl RabbitMqSource {
 
     async fn close_driver(&self, driver: RabbitMqDriver) {
         match timeout(
-            Duration::from_secs(self.config.timeout_seconds),
+            Duration::from_secs(self.config.timeout_secs),
             driver.close(),
         )
         .await
@@ -407,7 +441,7 @@ impl RabbitMqSource {
     ) -> RejectOutcome {
         warn!(connector_id = self.id, queue = %self.config.queue, reason, "Rejecting RabbitMQ delivery: {reason}");
         let result = timeout(
-            Duration::from_secs(self.config.timeout_seconds),
+            Duration::from_secs(self.config.timeout_secs),
             delivery.acker.reject(BasicRejectOptions { requeue: false }),
         )
         .await;
@@ -476,10 +510,15 @@ impl Source for RabbitMqSource {
         info!(
             connector_id = self.id,
             queue = %self.config.queue,
-            prefetch_count = self.config.effective_prefetch_count(),
+            prefetch_count = self.config.batch_size,
             "Opened RabbitMQ source"
         );
         Ok(())
+    }
+
+    fn batch_policy(&self) -> BatchPolicy {
+        BatchPolicy::default()
+            .with_max_consecutive_nacks(self.config.max_consecutive_nacks.and_then(NonZeroU32::new))
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
@@ -509,8 +548,7 @@ impl Source for RabbitMqSource {
             Some(driver) => driver,
             None => match self.connect().await {
                 Ok(driver) => {
-                    self.retry_attempts.store(0, Ordering::Relaxed);
-                    info!(connector_id = self.id, queue = %self.config.queue, "RabbitMQ source recovered");
+                    info!(connector_id = self.id, queue = %self.config.queue, "RabbitMQ source reconnected");
                     driver
                 }
                 Err(failure) => {
@@ -519,7 +557,7 @@ impl Source for RabbitMqSource {
                 }
             },
         };
-        let batch_size = usize::from(self.config.effective_prefetch_count());
+        let batch_size = usize::from(self.config.batch_size);
         let mut deliveries = Vec::with_capacity(batch_size);
         let mut payload_bytes = 0;
         let mut deadline = None;
@@ -623,7 +661,7 @@ impl Source for RabbitMqSource {
         };
         drop(pending);
         let result = timeout(
-            Duration::from_secs(self.config.timeout_seconds),
+            Duration::from_secs(self.config.timeout_secs),
             batch.acknowledge(),
         )
         .await
@@ -634,17 +672,27 @@ impl Source for RabbitMqSource {
         });
         if let Err(error) = result {
             /* An acker is single-use and the broker outcome is uncertain. Closing the
-             * connection lets RabbitMQ requeue unsettled deliveries, possibly causing duplicates. */
+             * connection lets RabbitMQ requeue unsettled deliveries, possibly causing duplicates.
+             * Back off per failure so a broker that keeps rejecting acknowledgements cannot turn
+             * the redelivery into an unthrottled duplicate loop. */
             self.overflow.lock().await.take();
             self.deferred_failure.lock().await.take();
             let driver = self.driver.lock().await.take();
             if let Some(driver) = driver {
                 self.close_driver(driver).await;
             }
-            warn!(connector_id = self.id, queue = %self.config.queue, %error, "RabbitMQ acknowledgement failed: {error}; the source will reconnect and RabbitMQ can redeliver unsettled messages");
+            let failure = Failure {
+                operation: "ack",
+                reply_code: None,
+                error: Error::Connection(format!(
+                    "{error}; closing the connection so RabbitMQ can redeliver unsettled messages"
+                )),
+            };
+            self.wait_before_ack_retry(&failure).await;
             return Ok(());
         }
 
+        let ack_failures = self.consecutive_ack_failures.swap(0, Ordering::Relaxed);
         let failure = self.deferred_failure.lock().await.take();
         if let Some(failure) = failure {
             let driver = self.driver.lock().await.take();
@@ -652,6 +700,11 @@ impl Source for RabbitMqSource {
                 self.close_driver(driver).await;
             }
             self.wait_before_retry(&failure).await;
+        } else {
+            let retry_attempts = self.retry_attempts.swap(0, Ordering::Relaxed);
+            if ack_failures > 0 || retry_attempts > 0 {
+                info!(connector_id = self.id, queue = %self.config.queue, "RabbitMQ source recovered");
+            }
         }
         Ok(())
     }
@@ -669,10 +722,12 @@ impl Source for RabbitMqSource {
 
 #[cfg(test)]
 mod source_tests {
-    use super::{Failure, RabbitMqSource};
+    use super::{AMQP_FRAME_MAX, Failure, RabbitMqSource, merge_frame_max};
     use crate::{batch::PendingBatch, config::RabbitMqSourceConfig};
     use iggy_connector_sdk::{ProducedMessage, Schema, Source, source::SourceBatchResult};
     use lapin::message::Delivery;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     fn source() -> RabbitMqSource {
         let config: RabbitMqSourceConfig =
@@ -689,6 +744,26 @@ mod source_tests {
             origin_timestamp: None,
             headers: None,
             payload,
+        }
+    }
+
+    #[test]
+    fn given_frame_max_should_be_added_but_never_overridden() {
+        let adjusted = merge_frame_max("amqp://localhost/%2f?heartbeat=30");
+        let url = url::Url::parse(&adjusted).expect("adjusted URL must be valid");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(name, _)| name == "frame_max")
+                .map(|(_, value)| value.into_owned()),
+            Some(AMQP_FRAME_MAX.to_string())
+        );
+        assert!(adjusted.contains("heartbeat=30"));
+
+        for input in [
+            "amqp://localhost/%2f?frame_max=65536",
+            "amqp://localhost/%2f?frame_max=4096&heartbeat=30",
+        ] {
+            assert_eq!(merge_frame_max(input), input);
         }
     }
 
@@ -808,11 +883,35 @@ mod source_tests {
         });
     }
 
-    #[test]
-    fn given_used_acknowledgement_when_batch_is_accepted_should_continue() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime must start");
-        runtime.block_on(async {
-            let source = source();
+    #[tokio::test(start_paused = true)]
+    async fn given_used_acknowledgement_when_batch_is_accepted_should_continue() {
+        let source = source();
+        let delivery = Delivery::mock(1, "".into(), "events".into(), false, vec![1]);
+        assert!(
+            delivery
+                .acker
+                .ack(Default::default())
+                .await
+                .expect("first acknowledgement must succeed")
+        );
+        *source.pending.lock().await = Some(PendingBatch::new(
+            Schema::Raw,
+            vec![(message(delivery.data), delivery.acker)],
+        ));
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("a failed acknowledgement must not stop the source");
+        assert!(source.pending.lock().await.is_none());
+        assert_eq!(source.consecutive_ack_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(source.retry_attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_repeated_failed_acknowledgements_should_count_and_back_off() {
+        let source = source();
+        for attempt in 0u32..2 {
+            let started = tokio::time::Instant::now();
             let delivery = Delivery::mock(1, "".into(), "events".into(), false, vec![1]);
             assert!(
                 delivery
@@ -829,8 +928,30 @@ mod source_tests {
                 .on_batch_result(SourceBatchResult::Ack)
                 .await
                 .expect("a failed acknowledgement must not stop the source");
-            assert!(source.pending.lock().await.is_none());
-        });
+            assert_eq!(
+                source.consecutive_ack_failures.load(Ordering::Relaxed),
+                attempt + 1
+            );
+            assert!(started.elapsed() >= Duration::from_secs(1u64 << attempt));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_successful_acknowledgement_should_reset_retry_counters() {
+        let source = source();
+        source.retry_attempts.store(3, Ordering::Relaxed);
+        source.consecutive_ack_failures.store(2, Ordering::Relaxed);
+        let delivery = Delivery::mock(1, "".into(), "events".into(), false, vec![1]);
+        *source.pending.lock().await = Some(PendingBatch::new(
+            Schema::Raw,
+            vec![(message(delivery.data), delivery.acker)],
+        ));
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("Ack must succeed");
+        assert_eq!(source.retry_attempts.load(Ordering::Relaxed), 0);
+        assert_eq!(source.consecutive_ack_failures.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -903,10 +1024,12 @@ mod source_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::RabbitMqSource;
     use super::batch::PendingBatch;
     use super::config::RabbitMqSourceConfig;
-    use iggy_connector_sdk::{ProducedMessage, Schema};
+    use iggy_connector_sdk::{ProducedMessage, Schema, Source};
     use lapin::message::Delivery;
+    use std::num::NonZeroU32;
 
     #[test]
     fn given_minimal_configuration_should_apply_defaults() {
@@ -915,11 +1038,10 @@ mod tests {
         )
         .expect("configuration must deserialize");
         assert_eq!(config.batch_size, 100);
-        assert_eq!(config.prefetch_count, 10);
-        assert_eq!(config.effective_prefetch_count(), 10);
         assert_eq!(config.batch_timeout, "10ms");
         assert!(!config.include_metadata);
-        assert_eq!(config.timeout_seconds, 30);
+        assert_eq!(config.timeout_secs, 30);
+        assert_eq!(config.max_consecutive_nacks, None);
         assert_eq!(
             config.validate().unwrap(),
             std::time::Duration::from_millis(10)
@@ -927,12 +1049,34 @@ mod tests {
     }
 
     #[test]
-    fn given_sink_timeout_secs_name_should_set_timeout_seconds() {
+    fn given_minimal_configuration_should_disable_the_nack_limit() {
+        let config: RabbitMqSourceConfig =
+            serde_json::from_str(r#"{"amqp_url":"amqp://localhost","queue":"events"}"#)
+                .expect("configuration must deserialize");
+        let source = RabbitMqSource::new(1, config, None);
+        assert_eq!(source.batch_policy().max_consecutive_nacks(), None);
+    }
+
+    #[test]
+    fn given_max_consecutive_nacks_should_set_the_sdk_limit() {
         let config: RabbitMqSourceConfig = serde_json::from_str(
-            r#"{"amqp_url":"amqp://localhost","queue":"events","timeout_secs":7}"#,
+            r#"{"amqp_url":"amqp://localhost","queue":"events","max_consecutive_nacks":12}"#,
         )
         .expect("configuration must deserialize");
-        assert_eq!(config.timeout_seconds, 7);
+        let source = RabbitMqSource::new(1, config, None);
+        assert_eq!(
+            source.batch_policy().max_consecutive_nacks(),
+            NonZeroU32::new(12)
+        );
+    }
+
+    #[test]
+    fn given_zero_max_consecutive_nacks_should_reject_configuration() {
+        let config: RabbitMqSourceConfig = serde_json::from_str(
+            r#"{"amqp_url":"amqp://localhost","queue":"events","max_consecutive_nacks":0}"#,
+        )
+        .expect("configuration must deserialize");
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -945,38 +1089,25 @@ mod tests {
     }
 
     #[test]
-    fn given_prefetch_count_outside_protocol_bounds_should_reject_configuration() {
-        for prefetch_count in [0, u32::from(u16::MAX) + 1] {
-            let config: RabbitMqSourceConfig = serde_json::from_value(serde_json::json!({
-                "amqp_url": "amqp://localhost",
-                "queue": "events",
-                "prefetch_count": prefetch_count,
-            }))
-            .expect("configuration must deserialize");
-            assert!(config.validate().is_err());
-        }
+    fn given_maximum_batch_size_should_accept_configuration() {
         let config: RabbitMqSourceConfig = serde_json::from_value(serde_json::json!({
             "amqp_url": "amqp://localhost",
             "queue": "events",
             "batch_size": u16::MAX,
-            "prefetch_count": u16::MAX,
         }))
         .expect("configuration must deserialize");
-        assert_eq!(config.effective_prefetch_count(), u16::MAX);
+        assert!(config.validate().is_ok());
+        assert_eq!(config.batch_size, u16::MAX);
     }
 
     #[test]
-    fn given_prefetch_count_and_batch_size_should_use_the_smaller_window() {
-        for (batch_size, prefetch_count, expected) in [(100, 10, 10), (10, 100, 10), (3, 3, 3)] {
-            let config: RabbitMqSourceConfig = serde_json::from_value(serde_json::json!({
-                "amqp_url": "amqp://localhost",
-                "queue": "events",
-                "batch_size": batch_size,
-                "prefetch_count": prefetch_count,
-            }))
-            .expect("configuration must deserialize");
-            assert_eq!(config.effective_prefetch_count(), expected);
-        }
+    fn given_batch_size_above_protocol_bounds_should_fail_deserialization() {
+        let config = serde_json::from_value::<RabbitMqSourceConfig>(serde_json::json!({
+            "amqp_url": "amqp://localhost",
+            "queue": "events",
+            "batch_size": u32::from(u16::MAX) + 1,
+        }));
+        assert!(config.is_err());
     }
 
     #[test]
@@ -985,8 +1116,8 @@ mod tests {
             serde_json::json!({"amqp_url":"http://localhost","queue":"events"}),
             serde_json::json!({"amqp_url":"amqp://localhost","queue":""}),
             serde_json::json!({"amqp_url":"amqp://localhost","queue":"events","batch_timeout":"0s"}),
-            serde_json::json!({"amqp_url":"amqp://localhost","queue":"events","timeout_seconds":0}),
-            serde_json::json!({"amqp_url":"amqp://localhost","queue":"events","timeout_seconds":u64::MAX}),
+            serde_json::json!({"amqp_url":"amqp://localhost","queue":"events","timeout_secs":0}),
+            serde_json::json!({"amqp_url":"amqp://localhost","queue":"events","timeout_secs":u64::MAX}),
             serde_json::json!({"amqp_url":"amqp://localhost","queue":"events","tls":{}}),
             serde_json::json!({"amqp_url":"amqps://localhost","queue":"events","tls":{"client_cert_file":"cert.pem"}}),
             serde_json::json!({"amqp_url":"amqp://localhost","queue":"x".repeat(256)}),

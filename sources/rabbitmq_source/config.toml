@@ -35,9 +35,13 @@ linger_time = "5ms"
 [plugin_config]
 amqp_url = "amqp://guest:guest@127.0.0.1:5672/%2f"
 queue = "events"
+# Controls both the maximum batch and RabbitMQ prefetch window.
+# Lower this value if deliveries can be large because each prefetched delivery may use memory.
 batch_size = 100
-prefetch_count = 10
 batch_timeout = "10ms"
+# Retry Iggy rejections until accepted by default.
+# Set this to a positive number if the source should stop after consecutive failures.
+# max_consecutive_nacks = 5
 include_metadata = false
-timeout_seconds = 30
+timeout_secs = 30
 verbose_logging = false

@@ -10,21 +10,23 @@ After five rejected batches in a row the source stops and needs a manual connect
 
 | Field | Required | Default | Description |
 | ----- | -------- | ------- | ----------- |
-| `bootstrap_servers` | yes | | Coordinator server address, for example `localhost:9123`. |
+| `bootstrap_servers` | yes | | Coordinator server address, for example `localhost:9123`, or several of them separated by commas. |
 | `database` | yes | | Apache Fluss database name. |
 | `table` | yes | | Apache Fluss table name. |
 | `table_type` | no | `log` | Only `log` is accepted. See [Limitations](#limitations). |
-| `starting_offset` | no | `earliest` | `earliest`, `latest` (each bucket's tail, resolved at startup), or an explicit non-negative offset such as `128`. Applies only to buckets absent from the persisted state. An explicit offset is used as is for every such bucket, so it suits a table whose bucket offsets you know, such as one with a single bucket. |
+| `starting_offset` | no | `earliest` | `earliest`, `latest` (each bucket's tail, resolved at startup), or an explicit non-negative offset such as `128`. Applies to the first start only, while no offsets are saved. An explicit offset is used as is for every bucket, so it suits a table whose bucket offsets you know, such as one with a single bucket. Once offsets are saved, a bucket they do not hold was added to the table later, and the next start reads it from its beginning. |
 | `columns` | no | all columns | Columns written to each message, in this order. Must name at least one column, and no column twice. They are picked after the rows are read, so the server still sends every column: a projection pushed down to `fluss-rs` 1.0 fails on rows tiered to remote storage before a column was added. |
-| `poll_interval` | no | `1s` | Delay before each poll. A poll that follows a full `batch_size` read starts at once, since more rows are likely waiting. After a failed poll the delay is at least `1s`, since the connector is polled again right after an error. |
+| `poll_interval` | no | `1s` | Delay before each poll. A poll that follows a full `batch_size` read, or the short read right after one, starts at once, since more rows are likely waiting. After a failed poll the delay is at least `1s`, since the connector is polled again right after an error. |
 | `poll_timeout` | no | `5s` | How long a single server poll waits for records. It and `poll_interval` cannot both be zero. Must not exceed `1day`. |
 | `request_timeout` | no | `30s` | How long the cluster may take to answer. Opening fails after that long without an answer. While reading, the connector asks each bucket leader for its end offset once per `request_timeout`, and when that request gets no answer in time it reports an error and connects again from the last acknowledged offsets. Must be greater than 0 and must not exceed `1day`. |
 | `batch_size` | no | `500` | Maximum records returned per poll (`scanner.log.max-poll-records`). Must be greater than 0. |
 | `payload_format` | no | `json` | Only `json` is accepted. See [Limitations](#limitations). |
 | `include_metadata` | no | `false` | Adds `_fluss_bucket`, `_fluss_offset` and `_fluss_timestamp` (the record timestamp in epoch milliseconds) to each JSON object. While it is on, a column that `columns` selects is rejected at startup when its name starts with `_fluss_`, since it would be overwritten. A column left out of `columns` is not checked. |
 | `sasl_username` | no | | Enables SASL/PLAIN together with `sasl_password`. Set both or neither. `fluss-rs` 1.0 has no TLS setting, so both cross the network in clear text. Use SASL only on a network you trust. |
-| `sasl_password` | no | | The connector never logs it and `/stats` never shows it, but the runtime does not redact it: it logs the raw plugin config at trace level and returns it from its config API, such as `GET /sources/{key}/configs/plugin`. |
+| `sasl_password` | no | | The connector never logs it and `/stats` never shows it, but the runtime does not redact it: its config API returns the raw plugin config, such as `GET /sources/{key}/configs/plugin`. A password made only of digits has to be set in the configuration file, since an environment variable turns it into a number, which the connector rejects. |
 | `verbose_logging` | no | `false` | Logs per-batch counts at info instead of debug. |
+
+A `poll_interval`, `poll_timeout` or `request_timeout` that cannot be parsed is replaced by its default, with a warning in the runtime log.
 
 ## Example
 
@@ -74,7 +76,7 @@ Temporal values keep every fractional digit the column holds, so the default `TI
 
 Rows are decoded with the table schema read when the connector starts. A row written before a column was added carries `null` for it, and a column added after startup stays out of the output until the connector restarts.
 
-Rows the cluster has already moved to remote storage are read from there, with the credentials the cluster hands out. The client reads remote storage on a local file system, S3 or OSS. Reading from a cluster that tiers to another store, such as HDFS, fails.
+Rows the cluster has already moved to remote storage are read from there, with the credentials the cluster hands out. The client reads remote storage on a local file system, S3 or OSS. Reading from a cluster that tiers to another store, such as HDFS, fails. The client downloads those segments into a `fluss-remote-logs*` directory under the system temp directory and removes it when the connector closes, so a runtime that is killed leaves the directory behind.
 
 Every message carries an `id` derived from its bucket and offset, so a consumer can spot a record replayed after an at-least-once redelivery (the Apache Iggy server does not deduplicate on it). The offset fills the low 64 bits, the bucket the next 32, and the top bit is always set, since a zero id would be replaced with a random one when the message is sent.
 
@@ -95,7 +97,9 @@ These are limits of this connector, not of the `fluss-rs` client.
 - **A saved state only fits the table it was read from.** The state records the table name and id, and the connector refuses to open over a state saved for another table, or for a table dropped and created again under the same name, until that state is removed. Table ids start over in every cluster, so a table with the same name and id on another cluster is not told apart.
 - **The reason a start failed is only in the runtime log.** The runtime reports a failed start as a generic initialization error in `last_error`, so the connector logs the cause at error level.
 - **A cluster outage does not show in the connector status.** While the servers refuse connections, the `fluss-rs` client retries inside each poll and returns no rows, so the source stays `running` and counts no error. Only warnings in the runtime log show the outage. Reading resumes from the same offsets once the cluster is back.
-- **A server that stops answering is noticed only after `request_timeout`.** `fluss-rs` 1.0 puts no deadline on a request, so a connection that stays open without answering would leave the scanner waiting on it. The connector then reports an error and connects again from the last acknowledged offsets. The new client keeps the columns the connector opened with, so if one of them was dropped, renamed or changed type in the meantime, polls fail until the connector is restarted.
+- **A server that stops answering is noticed only after `request_timeout`.** `fluss-rs` 1.0 puts no deadline on a request, so a connection that stays open without answering would leave the scanner waiting on it. The check runs between polls, so it can take `poll_timeout` plus `poll_interval` plus twice `request_timeout` until the connector reports an error and connects again from the last acknowledged offsets.
+- **Connecting again keeps what the connector opened with.** The new client reads the same table with the same columns. If the table was dropped and created again, or one of those columns was dropped, renamed or changed type, polls fail without connecting until the connector is restarted.
+- **A replaced client keeps its connections open.** `fluss-rs` 1.0 does not close the connections of a client that still waits for an answer on them, so they stay open until the server closes them or the runtime stops. A server that stays silent for hours adds a few sockets with each reconnect.
 - **An offset outside a bucket's range is not reset.** If a configured offset, or one restored from state after retention removed it, falls outside what the bucket still holds, polls keep failing until the offset is changed. The connector does not move to the earliest or latest offset on its own.
 
 ## Build and test

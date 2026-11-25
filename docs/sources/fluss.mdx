@@ -1,0 +1,83 @@
+---
+title: Apache Fluss
+description: "Read Apache Fluss log tables and publish each row to an Iggy topic as a JSON message, with offsets tracked per bucket."
+---
+
+The Apache Fluss source reads a log table and sends each row to one Iggy stream and topic as a JSON message. It is built on the `fluss-rs` 1.0 client. It tracks one offset per bucket and saves them through the runtime [state storage](/docs/connectors/runtime#state-storage), so a restart resumes where the previous run stopped.
+
+This page is a curated subset of the documentation. The canonical reference, with every setting, the full type mapping and all limits, is `sources/fluss_source/README.md` in apache/iggy-connectors.
+
+## Configuration
+
+Build `iggy_connector_fluss_source` from the same release source as the runtime. Add this file to the [local provider](/docs/connectors/runtime#local-file-provider):
+
+```toml
+type = "source"
+key = "fluss"
+enabled = true
+version = 0
+name = "Apache Fluss source"
+path = "libiggy_connector_fluss_source"
+
+[[streams]]
+stream = "fluss_events"
+topic = "events"
+schema = "json"
+batch_length = 100
+
+[plugin_config]
+bootstrap_servers = "localhost:9123"
+database = "mydb"
+table = "events"
+starting_offset = "earliest"
+poll_interval = "1s"
+poll_timeout = "5s"
+request_timeout = "30s"
+batch_size = 500
+include_metadata = false
+```
+
+`bootstrap_servers`, `database` and `table` are required. `bootstrap_servers` takes one coordinator address or several separated by commas. The connector produces JSON, so give the `[[streams]]` entry `schema = "json"`. With `raw` the runtime rejects every batch, and the source stops after five of them. The runtime creates a missing stream and topic itself.
+
+`starting_offset` is `earliest`, `latest` or an explicit offset such as `128`. It applies to the first start only, while no offsets are saved. `columns` selects the columns written to each message and their order. Without it the source writes every column.
+
+Set `sasl_username` and `sasl_password` together to use SASL/PLAIN. `fluss-rs` 1.0 has no TLS setting, so both cross the network in clear text. The runtime configuration API returns the plugin configuration with the password in it, so keep that API on a network you trust.
+
+## Polling
+
+`poll_interval` is the delay before each poll, and `poll_timeout` is how long one poll waits on the server for rows. They cannot both be zero. A poll that follows a full `batch_size` read starts at once, so a backlog is read without the delay.
+
+`request_timeout` limits how long the cluster may take to answer. Opening fails after that long without an answer. While it reads, the source asks each bucket leader for its end offset once per `request_timeout`. When no answer comes in time, the source reports an error and connects again from the last acknowledged offsets. `poll_timeout` and `request_timeout` must not exceed `1day`.
+
+## Delivery behavior
+
+A poll stages the new offsets with its batch. The runtime sends the batch to Iggy and saves the state, and only then the offsets move. When Iggy rejects a batch, the source sends the same rows again. Delivery is at least once: a crash after Iggy accepts a batch and before the state is saved produces the batch again.
+
+Every message carries an `id` built from its bucket and offset, so a consumer can spot a row that arrives twice. Set `include_metadata = true` to add `_fluss_bucket`, `_fluss_offset` and `_fluss_timestamp` to each JSON object.
+
+Do not set `exactly_once` for this source. After a restart the first poll can return other rows than the batch that was in flight.
+
+The saved state names the table it was read from. The source refuses to open over a state of another table, or of a table that was dropped and created again under the same name, until that state is removed.
+
+## Type mapping
+
+| Apache Fluss type | JSON |
+| ----------------- | ---- |
+| `BOOLEAN` | boolean |
+| `TINYINT`, `SMALLINT`, `INT`, `BIGINT`, `FLOAT`, `DOUBLE` | number |
+| `CHAR`, `STRING` | string |
+| `DECIMAL` | string in plain notation |
+| `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP_LTZ` | string with every fractional digit the column holds |
+| `BINARY`, `BYTES` | base64 string |
+| `ARRAY`, `MAP`, `ROW` | not supported |
+
+A `NaN` or infinite `FLOAT` or `DOUBLE` is written as `null`. A row that the mapping cannot convert, such as a date outside the supported range, is skipped and logged at error level with its bucket and offset.
+
+## Limitations
+
+- Only log tables are read. A primary-key table or a partitioned table is rejected at startup.
+- Only JSON payloads are produced.
+- A column of type `ARRAY`, `MAP` or `ROW` that `columns` selects is rejected at startup.
+- A column added after startup stays out of the output until the connector restarts.
+- An offset outside the range that a bucket still holds is not reset. Polls fail until the offset is changed.
+- A cluster outage does not show in the connector status. While the servers refuse connections, the client retries inside each poll and returns no rows.

@@ -74,6 +74,7 @@ const STATE_SAVE_FAILURE: &str = "Failed to save state for source connector";
 const NACK_LIMIT: &str = "consecutive NACK limit reached";
 const NO_ANSWER: &str = "Apache Fluss did not answer";
 const CONNECTED_AGAIN: &str = "connected again";
+const OTHER_TABLE: &str = "the saved state was read from table";
 const EARLIEST_OFFSET: i64 = -2;
 
 #[derive(Debug, Deserialize)]
@@ -987,6 +988,48 @@ async fn given_connections_that_go_silent_should_connect_again_and_deliver_every
         .expect("connectors runtime")
         .http_url();
     wait_for_source_status(&Client::new(), &api_url, ConnectorStatus::Running).await;
+}
+
+/// The table is dropped and created again while the source's connections are silent, so the
+/// client the source makes afterwards is refused. No retry clears that, so the source has to
+/// stop connecting instead of building a new client on every poll.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/fluss/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_table_replaced_while_connections_are_silent_should_stop_connecting(
+    harness: &TestHarness,
+    fixture: FlussSourceSilentConnectionFixture,
+) {
+    let payloads = numbered_payloads("before-silence", TEST_ROW_COUNT);
+    fixture
+        .append_rows(&payloads)
+        .await
+        .expect("Failed to append rows");
+    let client = harness.root_client().await.unwrap();
+    let received = poll_records(&client, payloads.len(), POLL_ATTEMPTS).await;
+    assert_rows_delivered(&received, &payloads, 0);
+    wait_for_saved_offset(&state_path(harness), 0, TEST_ROW_COUNT as i64).await;
+
+    fixture.silence_source_connections();
+    fixture
+        .recreate_table()
+        .await
+        .expect("Failed to recreate the table");
+
+    wait_for_runtime_log(harness, OTHER_TABLE, OUTAGE_TIMEOUT).await;
+    let connections = fixture.source_connections();
+    tokio::time::sleep(FAILED_POLL_WINDOW).await;
+    assert_eq!(
+        fixture.source_connections(),
+        connections,
+        "A refused source should not connect again on every poll"
+    );
+    let refusals = runtime_log(harness).matches(OTHER_TABLE).count();
+    assert!(
+        refusals > 1,
+        "Later polls should keep reporting the refusal, saw it {refusals} time(s)"
+    );
 }
 
 /// The README says a column added after startup stays out of the output until the connector

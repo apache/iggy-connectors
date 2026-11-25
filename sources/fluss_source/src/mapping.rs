@@ -26,8 +26,6 @@ use serde::{Serialize, Serializer};
 
 const MILLIS_PER_SECOND: i64 = 1_000;
 const NANOS_PER_MILLI: i64 = 1_000_000;
-/// The output of `DateTime::<Utc>::to_rfc3339`, written without the `String` it allocates.
-const RFC3339_UTC: &str = "%Y-%m-%dT%H:%M:%S%.f+00:00";
 
 /// One row written as a JSON object straight into the payload, with the `metadata` entries
 /// after the columns. Names and values are written from the schema and the Arrow batch as
@@ -37,13 +35,13 @@ const RFC3339_UTC: &str = "%Y-%m-%dT%H:%M:%S%.f+00:00";
 /// PostgreSQL source formats them. A number of milliseconds would drop the microseconds of
 /// the default `TIMESTAMP(6)`. `TIMESTAMP` carries no timezone and is written without one,
 /// while `TIMESTAMP_LTZ` is an instant and is written in UTC.
-pub(crate) struct JsonRow<'a, R: InternalRow + ?Sized> {
+pub(crate) struct JsonRow<'a, R: InternalRow> {
     row: &'a R,
     columns: &'a [Column],
     metadata: &'a [(&'a str, i64)],
 }
 
-impl<'a, R: InternalRow + ?Sized> JsonRow<'a, R> {
+impl<'a, R: InternalRow> JsonRow<'a, R> {
     pub(crate) fn new(row: &'a R, columns: &'a [Column], metadata: &'a [(&'a str, i64)]) -> Self {
         Self {
             row,
@@ -57,25 +55,11 @@ impl<'a, R: InternalRow + ?Sized> JsonRow<'a, R> {
 /// The scanner reads every column of the table, so a projected column keeps its table
 /// position rather than its place in the projection.
 pub(crate) struct Column {
-    position: usize,
-    field: DataField,
+    pub(crate) position: usize,
+    pub(crate) field: DataField,
 }
 
-impl Column {
-    pub(crate) fn new(position: usize, field: DataField) -> Self {
-        Self { position, field }
-    }
-
-    pub(crate) fn field(&self) -> &DataField {
-        &self.field
-    }
-
-    pub(crate) fn position(&self) -> usize {
-        self.position
-    }
-}
-
-impl<R: InternalRow + ?Sized> Serialize for JsonRow<'_, R> {
+impl<R: InternalRow> Serialize for JsonRow<'_, R> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut object =
             serializer.serialize_map(Some(self.columns.len() + self.metadata.len()))?;
@@ -118,13 +102,13 @@ fn is_supported(data_type: &DataType) -> bool {
     )
 }
 
-struct JsonField<'a, R: InternalRow + ?Sized> {
+struct JsonField<'a, R: InternalRow> {
     row: &'a R,
     position: usize,
     field: &'a DataField,
 }
 
-impl<R: InternalRow + ?Sized> Serialize for JsonField<'_, R> {
+impl<R: InternalRow> Serialize for JsonField<'_, R> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let row = self.row;
         let position = self.position;
@@ -161,8 +145,10 @@ impl<R: InternalRow + ?Sized> Serialize for JsonField<'_, R> {
                 serializer.serialize_i64(row.get_long(position).map_err(read_error)?)
             }
             // serde_json writes NaN and infinity as null, since JSON has no encoding for them.
+            // A `FLOAT` stays an `f32`, since widened to `f64` its 0.1 is written as
+            // 0.10000000149011612.
             DataType::Float(_) => {
-                serializer.serialize_f64(f64::from(row.get_float(position).map_err(read_error)?))
+                serializer.serialize_f32(row.get_float(position).map_err(read_error)?)
             }
             DataType::Double(_) => {
                 serializer.serialize_f64(row.get_double(position).map_err(read_error)?)
@@ -209,8 +195,11 @@ impl<R: InternalRow + ?Sized> Serialize for JsonField<'_, R> {
                     timestamp.get_epoch_millisecond(),
                     timestamp.get_nano_of_millisecond(),
                 )
-                .ok_or_else(out_of_range)?;
-                serializer.collect_str(&instant.naive_utc().format(RFC3339_UTC))
+                .ok_or_else(out_of_range)?
+                .naive_utc();
+                // The output of `DateTime::<Utc>::to_rfc3339`, written in pieces because that
+                // call and `format` both build a `String` first.
+                serializer.collect_str(&format_args!("{}T{}+00:00", instant.date(), instant.time()))
             }
             DataType::Bytes(_) => serializer.collect_str(&Base64Display::new(
                 row.get_bytes(position).map_err(read_error)?,
@@ -268,7 +257,10 @@ mod tests {
         fields
             .iter()
             .enumerate()
-            .map(|(position, field)| Column::new(position, field.clone()))
+            .map(|(position, field)| Column {
+                position,
+                field: field.clone(),
+            })
             .collect()
     }
 
@@ -475,8 +467,14 @@ mod tests {
         row.set_field(1, "left out");
         row.set_field(2, "kept");
         let projected = vec![
-            Column::new(2, field("payload", DataTypes::string())),
-            Column::new(0, field("id", DataTypes::int())),
+            Column {
+                position: 2,
+                field: field("payload", DataTypes::string()),
+            },
+            Column {
+                position: 0,
+                field: field("id", DataTypes::int()),
+            },
         ];
 
         let payload =
@@ -502,6 +500,18 @@ mod tests {
         assert_eq!(object["nan"], Value::Null);
         assert_eq!(object["infinite"], Value::Null);
         assert_eq!(object["finite"], Value::from(2.5));
+    }
+
+    #[test]
+    fn given_float_column_when_mapped_should_write_its_shortest_form() {
+        let fields = vec![field("ratio", DataTypes::float())];
+        let mut row = GenericRow::new(1);
+        row.set_field(0, 0.1f32);
+
+        let payload = serde_json::to_string(&JsonRow::new(&row, &columns(&fields), &[]))
+            .expect("Failed to map row");
+
+        assert_eq!(payload, r#"{"ratio":0.1}"#);
     }
 
     #[test]
@@ -736,6 +746,60 @@ mod tests {
                 .filter_map(|_| char::from_u32((self.next() % 0x3000) as u32))
                 .collect()
         }
+    }
+
+    /// The zoned timestamp is written in pieces, so each one is compared with what chrono's
+    /// `format` writes for the same instant, years outside 0 to 9999 included.
+    #[test]
+    fn given_zoned_timestamps_when_mapped_should_match_the_rfc_3339_format() {
+        const INSTANTS: usize = 20_000;
+        const RFC3339_UTC: &str = "%Y-%m-%dT%H:%M:%S%.f+00:00";
+        let fields = vec![field("at", DataTypes::timestamp_ltz_with_precision(9))];
+        let columns = columns(&fields);
+        let mut random = Xorshift(0x2545_F491_4F6C_DD1D);
+        let edges = [
+            (0, 0),
+            (-1, 0),
+            (-1, 999_999),
+            (1_700_000_000_123, 456_000),
+            (1_700_000_000_000, 1),
+            (253_402_300_799_999, 999_999),
+            (253_402_300_800_000, 0),
+            (-62_167_219_200_000, 0),
+            (-62_167_219_200_001, 0),
+        ];
+        let sampled = (0..INSTANTS).map(|_| {
+            let millis = random.pick(-70_000_000_000_000..260_000_000_000_000);
+            let nanos = match random.next() % 3 {
+                0 => 0,
+                1 => (random.next() % 1_000) as i32 * 1_000,
+                _ => (random.next() % 1_000_000) as i32,
+            };
+            (millis, nanos)
+        });
+        let mut compared = 0;
+
+        for (millis, nanos) in edges.into_iter().chain(sampled.collect::<Vec<_>>()) {
+            let Some(expected) = instant(millis, nanos) else {
+                continue;
+            };
+            let mut row = GenericRow::new(1);
+            row.set_field(
+                0,
+                TimestampLtz::from_millis_nanos(millis, nanos).expect("Failed to build timestamp"),
+            );
+
+            let payload = serde_json::to_string(&JsonRow::new(&row, &columns, &[]))
+                .expect("Failed to map row");
+
+            assert_eq!(
+                payload,
+                format!(r#"{{"at":"{}"}}"#, expected.naive_utc().format(RFC3339_UTC)),
+                "{millis} ms, {nanos} ns"
+            );
+            compared += 1;
+        }
+        assert!(compared > INSTANTS / 2, "only {compared} instants compared");
     }
 
     /// A row either maps to one JSON object holding every column, or fails on a temporal value

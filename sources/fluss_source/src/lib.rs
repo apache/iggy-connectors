@@ -32,6 +32,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -94,7 +95,7 @@ pub struct FlussSourceConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct State {
-    /// Next offset to read per bucket. Absent buckets fall back to the configured start.
+    /// Next offset to read per bucket. It holds every bucket the table had when it was saved.
     bucket_offsets: HashMap<i32, i64>,
     messages_produced: u64,
     /// The table the offsets were read from, set by `open()` before anything is saved.
@@ -152,7 +153,7 @@ struct StagedBatch {
     records: ScanRecords,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartingOffset {
     Earliest,
     Latest,
@@ -247,9 +248,14 @@ pub struct FlussSource {
     /// up: the scanner keeps waiting on it and every poll comes back empty. The next poll drops
     /// the client and connects again at the committed offsets.
     connection_lost: AtomicBool,
-    /// Set when the last scanner poll returned `max_poll_records` records, so more are likely
-    /// waiting and the next poll reads without waiting for `poll_interval`.
+    /// Why the table can no longer be read by a client made after `open()`. No retry clears it,
+    /// so once set every poll returns it without connecting.
+    refusal: OnceLock<String>,
+    /// Set when the last scanner poll returned `max_poll_records` records.
     full_batch_read: AtomicBool,
+    /// Set when more rows are likely waiting, so the next poll reads without waiting for
+    /// `poll_interval`. See [`Self::note_read`].
+    backlog_likely: AtomicBool,
     /// Set when `open()` resolved start offsets that are not on disk yet. Polls send them alone,
     /// holding back any rows read, until a batch is acknowledged, so a restart does not resolve
     /// `latest` again and skip what was written in between.
@@ -336,7 +342,9 @@ impl FlussSource {
             replay: Mutex::new(None),
             rewind_required: AtomicBool::new(false),
             connection_lost: AtomicBool::new(false),
+            refusal: OnceLock::new(),
             full_batch_read: AtomicBool::new(false),
+            backlog_likely: AtomicBool::new(false),
             start_offsets_unsaved: AtomicBool::new(false),
         }
     }
@@ -346,19 +354,38 @@ impl FlussSource {
     /// that repeats, such as an offset out of range or a cluster that cannot be reached again,
     /// would be retried at network speed.
     ///
-    /// After a full batch it reads again at once, since waiting `poll_interval` between full
-    /// batches would cap the source at `batch_size` rows per interval. An idle table still
-    /// waits on the server for up to `poll_timeout`.
+    /// While more rows are likely waiting it reads again at once, since waiting `poll_interval`
+    /// there would cap the source at one fetch response per interval. An idle table still waits
+    /// on the server for up to `poll_timeout`.
     fn pause_before_poll(&self) -> Duration {
         if self.rewind_required.load(Ordering::Acquire)
             || self.connection_lost.load(Ordering::Acquire)
         {
             self.poll_interval.max(MIN_PAUSE_AFTER_FAILED_POLL)
-        } else if self.full_batch_read.load(Ordering::Acquire) {
+        } else if self.backlog_likely.load(Ordering::Acquire) {
             Duration::ZERO
         } else {
             self.poll_interval
         }
+    }
+
+    /// Records how many rows the scanner returned. A full batch means more rows are buffered.
+    /// So does a short batch right after a full one: the client asks the server for the next
+    /// rows only once a response is read out, so the tail of a response comes back short while
+    /// the next response is already on its way.
+    fn note_read(&self, count: usize) {
+        let full = count >= self.max_poll_records;
+        let after_full = self.full_batch_read.swap(full, Ordering::AcqRel);
+        self.backlog_likely
+            .store(full || (after_full && count > 0), Ordering::Release);
+    }
+
+    /// Keeps a refusal that no retry can clear, so later polls do not connect to find it again.
+    fn remember_refusal(&self, checked: Result<(), Error>) -> Result<(), Error> {
+        if let Err(Error::InitError(reason)) = &checked {
+            let _ = self.refusal.set(reason.clone());
+        }
+        checked
     }
 
     fn client_config(&self) -> Config {
@@ -590,7 +617,7 @@ impl FlussSource {
         }
     }
 
-    fn build_message<R: InternalRow + ?Sized>(
+    fn build_message<R: InternalRow>(
         &self,
         bucket: i32,
         offset: i64,
@@ -661,12 +688,22 @@ impl FlussSource {
     /// never fetches a bucket that still has buffered records, and sends nothing between
     /// collecting them and failing, so no fetch is in flight for those buckets.
     async fn read(&self) -> Result<ScanRecords, Error> {
+        if let Some(refusal) = self.refusal.get() {
+            return Err(Error::InitError(refusal.clone()));
+        }
         let mut reader = self.reader.lock().await;
         if self.connection_lost.load(Ordering::Acquire) {
             // Dropped before connecting, so a failed attempt does not leave the old client in
             // place. Its fetch tasks stay parked on the silent connections.
             *reader = None;
-            *reader = Some(self.connect_again().await?);
+            *reader = Some(
+                self.answered(
+                    "the new connection",
+                    self.request_timeout,
+                    self.connect_at_committed_offsets(),
+                )
+                .await??,
+            );
             self.connection_lost.store(false, Ordering::Release);
             self.rewind_required.store(false, Ordering::Release);
             info!(
@@ -774,18 +811,6 @@ impl FlussSource {
     /// Builds a new client and subscribes it at the committed offsets. The columns chosen by
     /// `open()` stay in use, so the table has to be the one it opened, with those columns still
     /// in place. A column added since then stays out, as it does without a reconnect.
-    async fn connect_again(&self) -> Result<Reader, Error> {
-        let limit = self.request_timeout;
-        timeout(limit, self.connect_at_committed_offsets())
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::Connection(format!(
-                    "Apache Fluss did not answer within {limit:?} while the connector connected \
-                     again"
-                )))
-            })
-    }
-
     async fn connect_at_committed_offsets(&self) -> Result<Reader, Error> {
         let connection = FlussConnection::new(self.client_config())
             .await
@@ -800,11 +825,15 @@ impl FlussSource {
                 .await
                 .map_err(connection_error)?;
             let table_info = table.get_table_info();
-            ensure_same_table(
+            self.remember_refusal(ensure_same_table(
                 opened_table.as_ref(),
                 &TableIdentity::new(&self.table_path, table_info.get_table_id()),
-            )?;
-            ensure_same_columns(&self.columns, table_info.get_row_type(), &self.table_path)?;
+            ))?;
+            self.remember_refusal(ensure_same_columns(
+                &self.columns,
+                table_info.get_row_type(),
+                &self.table_path,
+            ))?;
             table.new_scan().create_log_scanner().map_err(|error| {
                 Error::Connection(format!("failed to create log scanner: {error}"))
             })?
@@ -868,13 +897,14 @@ impl FlussSource {
             };
             let columns: Vec<mapping::Column> = positions
                 .into_iter()
-                .map(|position| {
-                    mapping::Column::new(position, table_row_type.fields()[position].clone())
+                .map(|position| mapping::Column {
+                    position,
+                    field: table_row_type.fields()[position].clone(),
                 })
                 .collect();
-            mapping::ensure_supported_types(columns.iter().map(mapping::Column::field))?;
+            mapping::ensure_supported_types(columns.iter().map(|column| &column.field))?;
             if self.include_metadata {
-                ensure_no_metadata_collision(columns.iter().map(mapping::Column::field))?;
+                ensure_no_metadata_collision(columns.iter().map(|column| &column.field))?;
             }
 
             let scanner = table.new_scan().create_log_scanner().map_err(|error| {
@@ -906,7 +936,7 @@ impl FlussSource {
                 self.id, self.table_path
             );
         }
-        let offsets = match start {
+        let offsets = match start_for_untracked_buckets(start, &restored) {
             StartingOffset::Earliest => {
                 Self::resolve_start_offsets(bucket_count, EARLIEST_OFFSET, &restored)
             }
@@ -982,8 +1012,7 @@ impl Source for FlussSource {
             Some(records) => records,
             None => {
                 let records = self.read().await?;
-                self.full_batch_read
-                    .store(records.count() >= self.max_poll_records, Ordering::Release);
+                self.note_read(records.count());
                 records
             }
         };
@@ -1129,6 +1158,19 @@ fn ensure_same_table(saved: Option<&TableIdentity>, current: &TableIdentity) -> 
     }
 }
 
+/// `starting_offset` is for the first start. Once offsets are saved they hold every bucket the
+/// table had, so a bucket they do not hold was added later and all of its rows are new.
+fn start_for_untracked_buckets(
+    configured: StartingOffset,
+    restored: &HashMap<i32, i64>,
+) -> StartingOffset {
+    if restored.is_empty() {
+        configured
+    } else {
+        StartingOffset::Earliest
+    }
+}
+
 /// Rows are decoded by the positions and types the columns had when the connector opened, so a
 /// scanner made later is only usable while each of them is still there.
 fn ensure_same_columns(
@@ -1138,14 +1180,14 @@ fn ensure_same_columns(
 ) -> Result<(), Error> {
     let fields = current.fields();
     match opened.iter().find(|column| {
-        fields.get(column.position()).is_none_or(|field| {
-            field.name() != column.field().name() || field.data_type() != column.field().data_type()
+        fields.get(column.position).is_none_or(|field| {
+            field.name() != column.field.name() || field.data_type() != column.field.data_type()
         })
     }) {
         Some(column) => Err(Error::InitError(format!(
             "column '{}' of table '{table_path}' changed since the connector opened. Restart the \
              connector to read the table as it is now",
-            column.field().name()
+            column.field.name()
         ))),
         None => Ok(()),
     }
@@ -1883,7 +1925,7 @@ mod tests {
     #[test]
     fn given_full_batch_should_read_again_without_pausing() {
         let source = FlussSource::new(1, test_config(), None);
-        source.full_batch_read.store(true, Ordering::Release);
+        source.note_read(source.max_poll_records);
 
         assert_eq!(source.pause_before_poll(), Duration::ZERO);
 
@@ -1937,7 +1979,10 @@ mod tests {
         let mut config = test_config();
         config.include_metadata = Some(include_metadata);
         let mut source = FlussSource::new(1, config, None);
-        source.columns = vec![mapping::Column::new(0, field("id"))];
+        source.columns = vec![mapping::Column {
+            position: 0,
+            field: field("id"),
+        }];
         let mut row = GenericRow::new(1);
         row.set_field(0, 7i32);
         (source, row)
@@ -2092,12 +2137,118 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_short_batch_after_a_full_one_should_read_again_without_pausing() {
+        let source = FlussSource::new(1, test_config(), None);
+        source.note_read(source.max_poll_records);
+        source.note_read(1);
+
+        assert_eq!(source.pause_before_poll(), Duration::ZERO);
+
+        // The next short batch is not the tail of a full response any more.
+        source.note_read(1);
+        assert_eq!(source.pause_before_poll(), source.poll_interval);
+    }
+
+    #[test]
+    fn given_empty_read_after_a_full_batch_should_pause() {
+        let source = FlussSource::new(1, test_config(), None);
+        source.note_read(source.max_poll_records);
+        source.note_read(0);
+
+        assert_eq!(source.pause_before_poll(), source.poll_interval);
+    }
+
+    #[test]
+    fn given_no_saved_offsets_should_start_untracked_buckets_as_configured() {
+        let restored = HashMap::new();
+
+        for configured in [
+            StartingOffset::Earliest,
+            StartingOffset::Latest,
+            StartingOffset::Explicit(7),
+        ] {
+            assert_eq!(
+                start_for_untracked_buckets(configured, &restored),
+                configured
+            );
+        }
+    }
+
+    #[test]
+    fn given_saved_offsets_should_start_a_bucket_they_do_not_hold_at_its_beginning() {
+        let restored = HashMap::from([(0, 42)]);
+
+        for configured in [
+            StartingOffset::Earliest,
+            StartingOffset::Latest,
+            StartingOffset::Explicit(7),
+        ] {
+            assert_eq!(
+                start_for_untracked_buckets(configured, &restored),
+                StartingOffset::Earliest
+            );
+        }
+    }
+
+    /// Nothing answers at the bootstrap address, so a poll that connected would be seen there.
+    #[test]
+    fn given_refusal_should_fail_later_polls_without_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to listen");
+        listener
+            .set_nonblocking(true)
+            .expect("Failed to make the listener non-blocking");
+        let port = listener
+            .local_addr()
+            .expect("Failed to read the listener's address")
+            .port();
+        let mut config = test_config();
+        config.bootstrap_servers = format!("127.0.0.1:{port}");
+        let source = FlussSource::new(1, config, None);
+        source.connection_lost.store(true, Ordering::Release);
+        source
+            .remember_refusal(Err(Error::InitError("the table changed".to_owned())))
+            .expect_err("The refusal should be passed on");
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+
+        for _ in 0..2 {
+            let error = runtime
+                .block_on(source.read())
+                .err()
+                .expect("A refused source should not read");
+            assert!(
+                matches!(&error, Error::InitError(message) if message == "the table changed"),
+                "unexpected error: {error}"
+            );
+        }
+
+        let accepted = listener.accept();
+        assert!(
+            matches!(&accepted, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "The source should not have connected, got {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn given_error_that_a_retry_can_clear_should_not_be_remembered() {
+        let source = FlussSource::new(1, test_config(), None);
+
+        source
+            .remember_refusal(Err(Error::Connection("the cluster is away".to_owned())))
+            .expect_err("The error should be passed on");
+        source
+            .remember_refusal(Ok(()))
+            .expect("A passed check should stay passed");
+
+        assert!(source.refusal.get().is_none());
+    }
+
     fn opened_columns(fields: &[DataField]) -> Vec<mapping::Column> {
         fields
             .iter()
             .cloned()
             .enumerate()
-            .map(|(position, field)| mapping::Column::new(position, field))
+            .map(|(position, field)| mapping::Column { position, field })
             .collect()
     }
 
@@ -2404,7 +2555,10 @@ mod tests {
             .fields()
             .iter()
             .enumerate()
-            .map(|(position, field)| mapping::Column::new(position, field.clone()))
+            .map(|(position, field)| mapping::Column {
+                position,
+                field: field.clone(),
+            })
             .collect();
         let rows: Vec<GenericRow> = [(0, 19_782), (1, i32::MAX), (2, 19_783)]
             .into_iter()

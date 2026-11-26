@@ -258,11 +258,13 @@ appends a uuid for parallel-safe ephemeral containers. Reuse fixtures use a fixe
 nextest processes attach to the same container via `ReuseDirective::Always`. Do
 not hand-roll a different prefix - the sweep only finds `iggy-test-*`.
 
-As of now only `elasticsearch` and `doris` share a container. Both have a slow
-boot (JVM / Doris FE+BE, tens of seconds), so reusing one across the whole
-regression beats spinning a fresh one per test. Every other fixture boots a
-fresh, ephemeral container per test - cheap enough that the isolation is worth
-more than the reuse.
+As of now only `elasticsearch`, `doris` and `questdb` share a container.
+Elasticsearch and Doris have a slow boot (JVM / Doris FE+BE, tens of seconds),
+so reusing one across the whole regression beats spinning a fresh one per test.
+QuestDB boots faster, but its suite has many short tests, and each test writes
+to its own table, so they stay isolated on one server. Every other fixture
+boots a fresh, ephemeral container per test - cheap enough that the isolation
+is worth more than the reuse.
 
 ### The `#[iggy_harness]` proc macro
 

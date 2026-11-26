@@ -12,6 +12,7 @@
     "meilisearch",
     "mongodb",
     "postgres",
+    "questdb",
     "quickwit",
     "s3",
     "stdout",

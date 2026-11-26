@@ -1,0 +1,112 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "questdb"
+enabled = true
+version = 0
+name = "QuestDB sink"
+path = "<BASE_DIR>/target/release/libiggy_connector_questdb_sink"
+plugin_config_format = "toml"
+verbose = false
+
+[[streams]]
+stream = "events"
+topics = ["questdb_events"]
+schema = "json"
+batch_length = 1000
+consumer_group = "questdb_sink"
+
+[delivery]
+# Store offsets only after QuestDB acknowledged the batch, and deliver a
+# failed batch again. Without this table the runtime delivers at most once,
+# and a failed write loses the messages of its batch. A retried batch can
+# write rows twice. To keep one copy, create the table with the DEDUP keys
+# that the README names under "Delivery semantics".
+guarantee = "at_least_once"
+
+[plugin_config]
+# QuestDB connect string. Use `wss::` for TLS. See
+# https://questdb.com/docs/connect/clients/connect-string/
+connection_string = "ws::addr=localhost:9000;"
+# Set `sf_dir` to keep unacknowledged frames on disk across disconnects and
+# restarts. Its parent directory must exist. Give each connector instance its
+# own `sender_id` or `sf_dir`. Add `sf_durability=periodic` to fsync the frames,
+# so that a host failure loses only the last `sf_sync_interval_millis`.
+# connection_string = "ws::addr=localhost:9000;sf_dir=/var/lib/iggy/questdb-sf;sender_id=iggy;"
+table = "iggy_events"
+
+# message | origin | payload | server
+# An auto-created table names its designated timestamp `timestamp`. A payload
+# field with that name collides with it, and QuestDB rejects the frame. Create
+# the table with another timestamp column, or remove the field with the
+# `delete_fields` transform.
+timestamp_source = "message"
+# Required when timestamp_source = "payload", and rejected with any other
+# source.
+# timestamp_field = "event_time"
+# Used only when timestamp_source = "payload". A value other than "auto" is
+# rejected with another source, and an invalid value with any source.
+# auto | seconds | millis | micros | nanos
+timestamp_unit = "auto"
+
+# Payload fields to store as SYMBOL rather than VARCHAR.
+symbol_columns = []
+# Payload fields holding RFC-4122 strings to store as UUID.
+uuid_columns = []
+# Payload fields to store as LONG, for integers above 2^53 such as nanosecond
+# epochs, snowflake ids and hashes. A fractional, non-numeric or out-of-range
+# value here is rejected.
+integer_columns = []
+
+include_stream_column = true
+include_topic_column = true
+# The partition and the offset identify a message. Turn them on only as DEDUP
+# keys for a payload that has no key of its own.
+include_partition_column = false
+include_offset_column = false
+include_headers = false
+
+# ok | durable | local_durable. `durable` needs QuestDB Enterprise with
+# replication, and request_durable_ack=on, replicated or local,replicated in the
+# connect string. `local_durable` needs QuestDB 10.2.0 or Enterprise 4.2.1 with
+# cairo.commit.mode=adaptive, and request_durable_ack=local. Leave it unset to
+# follow the connect string.
+# ack_level = "ok"
+
+# How long a chunk waits for its ack without progress. "0s" means fire and
+# forget with ack_level = "ok", and is not allowed with "durable" or
+# "local_durable". Shutdown waits for a chunk in progress until this long
+# passes without progress.
+flush_timeout = "30s"
+# Maximum rows per chunk. Each chunk waits once for its ack.
+batch_size = 1000
+
+# Flush when the buffer reaches this many bytes, so wide rows stay under the
+# QWP frame cap of about 4 MiB.
+max_flush_bytes = 1000000
+
+# Write every JSON number as a DOUBLE, so a field sent as both 2 and 2.5 keeps
+# one column type. List integers above 2^53 in integer_columns instead of
+# turning this off. Turn it off only if every numeric field is an integer and
+# the table is created with explicit types.
+numbers_as_double = true
+
+# Add a truncated payload to the log line of a rejected record. This writes
+# user data to the log.
+log_rejected_payload = false
+verbose_logging = false

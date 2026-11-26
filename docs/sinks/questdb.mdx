@@ -102,7 +102,7 @@ An auto-created table names its designated timestamp `timestamp`. A payload fiel
 
 ## Delivery Semantics
 
-The delivery guarantee is set in the `[delivery]` table of the connector, not in `plugin_config`. With `guarantee = "at_least_once"`, the runtime stores the offsets of a batch only after QuestDB acknowledged every row of it at `ack_level`, and delivers a failed batch again. Use it for every table that must not lose rows. It is also how the official QuestDB clients work. On a disconnect or a failover they send again the rows that the server did not acknowledge yet, and the server removes the duplicates. Without the `[delivery]` table the runtime delivers at most once, which is best effort: a failed write loses the messages of its batch, and the sink only logs their offsets.
+The delivery guarantee is set in the `[delivery]` table of the connector, not in `plugin_config`. With `guarantee = "at_least_once"`, the runtime stores the offsets of a batch only after QuestDB acknowledged every row of it at `ack_level`, and delivers a failed batch again. Use it for every table that must not lose rows. It is also how the official QuestDB clients work. On a disconnect or a failover they send again the rows that the server did not acknowledge yet, and the server removes the duplicates. Without the `[delivery]` table the runtime delivers at most once, which is best effort: a failed write loses the messages of its batch from the first one that QuestDB did not confirm to the end of the batch, and the sink only logs their offsets. The chunks that QuestDB confirmed before the failure stay written.
 
 A retried batch writes the rows that QuestDB already took a second time. You can use the sink without `DEDUP`, and the table then holds those rows twice, which may or may not be a problem for your data. If duplicates do not matter to you, leave `DEDUP` out: ingestion is faster and lighter for the server without it. To keep one copy, let QuestDB remove the duplicates by the `DEDUP` keys of the table. Create the table with keys that identify a row: the designated timestamp, plus the columns of your payload that are unique for it, for example an order id.
 
@@ -123,7 +123,7 @@ A record that the sink cannot write is a rejected record, for example one with a
 
 - **`ok`**: QuestDB accepted the rows.
 - **`local_durable`**: QuestDB flushed the rows to its own disk, so they survive a power loss on the QuestDB host. It needs `request_durable_ack=local` in the connect string and `cairo.commit.mode=adaptive` on the server. It works with QuestDB open source.
-- **`durable`**: QuestDB Enterprise shipped the write-ahead log of the rows, so they survive a failover. It needs `request_durable_ack=on` in the connect string and replication on the server.
+- **`durable`**: QuestDB Enterprise shipped the write-ahead log of the rows, so they survive a failover. It needs `request_durable_ack=on`, `replicated`, `local,replicated` or `replicated,local` in the connect string and replication on the server.
 
 If `ack_level` is unset, `request_durable_ack` in the connect string selects the level.
 

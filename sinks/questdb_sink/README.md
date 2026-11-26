@@ -95,8 +95,10 @@ guarantee = "at_least_once"
 ```
 
 Without this table the runtime delivers at most once, which is best effort: a
-failed write loses the messages of its batch, and the sink only logs their
-offsets. The example configuration sets at least once. See
+failed write loses the messages of its batch from the first one that QuestDB
+did not confirm to the end of the batch, and the sink only logs their offsets.
+The chunks that QuestDB confirmed before the failure stay written. The example
+configuration sets at least once. See
 [Delivery semantics](#delivery-semantics).
 
 ### Batch sizing
@@ -510,11 +512,11 @@ without an error.
 DEDUP keys must include the designated timestamp, so a retried row is a
 duplicate only if it gets the same timestamp again. With
 `timestamp_source = "server"`, QuestDB stamps each copy on arrival, and the
-connector logs a warning at start. The same holds for a message whose
-timestamp is zero, which Iggy uses for "not set": the origin timestamp with
-`origin`, and the message timestamp with `message`. The connector then uses its
-own clock. Use `message` or `payload` for a table that must not have
-duplicates.
+connector logs a warning at start. The same holds with `origin` for a message
+whose origin timestamp is zero, which Iggy uses for "not set": the connector
+then uses its own clock. The server sets the message timestamp of every
+message it appends, so `message` does not fall back to the clock. Use
+`message` or `payload` for a table that must not have duplicates.
 
 Each batch waits for its own acknowledgement. `flush_interval` and
 `flush_max_messages` in `[delivery]` delay only when the runtime stores the
@@ -568,13 +570,16 @@ A batch fails when:
   that has no error of its own. The client can also report a terminal
   rejection of a frame that QuestDB already acknowledged, without ending the
   connection. That report fails one later batch, although no rows were lost.
+  When batches of two topics race, one rejection can fail two batches, and a
+  later rejection that only the client reports then fails none. The client
+  still logs every rejection.
   At least once, these failures are transient, so the runtime retries the
   batch instead of stopping.
 - A chunk fails to write. The connector does not attempt the remaining chunks
   of the batch. It logs the offsets and message ids of the messages that
   QuestDB did not confirm, and of the messages that it did not attempt. At
   least once, the runtime delivers the whole batch again.
-- 10 batches in a row on one topic each leave a chunk unacknowledged within
+- 10 batches in a row on one partition each leave a chunk unacknowledged within
   `flush_timeout`. A single late ack is only a warning, because the frames stay
   queued and are delivered later.
 - The client's inbox of rejection reports overflows and drops events. A terminal

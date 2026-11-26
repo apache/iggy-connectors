@@ -190,10 +190,50 @@ struct State {
     rows_published: u64,
     rejected_rows: u64,
     pending_acks: u64,
-    /// Consecutive batches per stream and topic that finished with at least one
-    /// chunk still unacknowledged. A batch that leaves none clears its own
-    /// entry, also when it failed for another reason.
-    consecutive_pending_ack_batches: HashMap<(String, String), u64>,
+    /// Consecutive batches per stream, topic and partition that finished with
+    /// at least one chunk still unacknowledged. A batch that leaves none clears
+    /// its own entry, also when it failed for another reason.
+    consecutive_pending_ack_batches: HashMap<(String, String, u32), u64>,
+}
+
+impl State {
+    /// Counts a batch in the run of its partition, and returns the length of
+    /// that run, or 0 for a batch that left every chunk acknowledged.
+    ///
+    /// Keyed by stream, topic and partition, because the runtime runs one
+    /// `consume` per topic against this one instance, and each batch holds the
+    /// messages of one partition. A coarser key would let the batches of a
+    /// healthy partition or topic reset the run belonging to a stalled one, and
+    /// the escalation would never fire.
+    fn count_pending_ack_batch(
+        &mut self,
+        topic_metadata: &TopicMetadata,
+        partition_id: u32,
+        pending_acks: usize,
+    ) -> u64 {
+        if pending_acks > 0 {
+            let run = self
+                .consecutive_pending_ack_batches
+                .entry((
+                    topic_metadata.stream.clone(),
+                    topic_metadata.topic.clone(),
+                    partition_id,
+                ))
+                .or_insert(0);
+            *run += 1;
+            *run
+        } else {
+            // A healthy batch copies no names: the map holds one entry per
+            // stalled partition, so the scan is short and usually empty.
+            self.consecutive_pending_ack_batches
+                .retain(|(stream, topic, partition), _| {
+                    stream != &topic_metadata.stream
+                        || topic != &topic_metadata.topic
+                        || *partition != partition_id
+                });
+            0
+        }
+    }
 }
 
 impl QuestDbSink {
@@ -1068,29 +1108,11 @@ impl Sink for QuestDbSink {
         state.rows_published += total.rows_published as u64;
         state.rejected_rows += total.rejected_rows as u64;
         state.pending_acks += total.pending_acks as u64;
-        // Keyed by stream and topic, because the runtime runs one `consume` per
-        // topic against this one instance. A shared counter would let a healthy
-        // topic reset the run belonging to a stalled one, and the escalation
-        // would never fire. `partition_id` is not part of the key: it varies
-        // between batches inside one task, which would reset the run just as
-        // wrongly.
-        let stalled = if total.pending_acks > 0 {
-            let run = state
-                .consecutive_pending_ack_batches
-                .entry((topic_metadata.stream.clone(), topic_metadata.topic.clone()))
-                .or_insert(0);
-            *run += 1;
-            *run
-        } else {
-            // A healthy batch copies no names: the map holds one entry per
-            // stalled topic, so the scan is short and usually empty.
-            state
-                .consecutive_pending_ack_batches
-                .retain(|(stream, topic), _| {
-                    stream != &topic_metadata.stream || topic != &topic_metadata.topic
-                });
-            0
-        };
+        let stalled = state.count_pending_ack_batch(
+            topic_metadata,
+            messages_metadata.partition_id,
+            total.pending_acks,
+        );
         drop(state);
 
         if let Some(error) = failure.or(total.window_failure) {
@@ -2757,6 +2779,57 @@ mod tests {
             .consume(&topic_metadata, messages_metadata, Vec::new())
             .await;
         assert!(matches!(result, Err(Error::InitError(_))));
+    }
+
+    fn empty_state() -> State {
+        State {
+            messages_processed: 0,
+            rows_published: 0,
+            rejected_rows: 0,
+            pending_acks: 0,
+            consecutive_pending_ack_batches: HashMap::new(),
+        }
+    }
+
+    fn topic(name: &str) -> TopicMetadata {
+        TopicMetadata {
+            stream: "s".to_owned(),
+            topic: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn given_a_healthy_partition_between_stalled_batches_when_counting_should_keep_the_stalled_run()
+    {
+        let mut state = empty_state();
+        let orders = topic("orders");
+        let mut stalled = 0;
+        for _ in 0..PENDING_ACK_BATCHES_BEFORE_ESCALATION {
+            stalled = state.count_pending_ack_batch(&orders, 1, 1);
+            assert_eq!(state.count_pending_ack_batch(&orders, 2, 0), 0);
+        }
+        assert_eq!(stalled, PENDING_ACK_BATCHES_BEFORE_ESCALATION);
+    }
+
+    #[test]
+    fn given_a_healthy_batch_on_the_stalled_partition_when_counting_should_reset_its_run() {
+        let mut state = empty_state();
+        let orders = topic("orders");
+        assert_eq!(state.count_pending_ack_batch(&orders, 1, 1), 1);
+        assert_eq!(state.count_pending_ack_batch(&orders, 1, 1), 2);
+        assert_eq!(state.count_pending_ack_batch(&orders, 1, 0), 0);
+        assert_eq!(state.count_pending_ack_batch(&orders, 1, 1), 1);
+    }
+
+    #[test]
+    fn given_the_same_partition_on_another_topic_when_counting_should_keep_the_runs_apart() {
+        let mut state = empty_state();
+        let orders = topic("orders");
+        let fills = topic("fills");
+        assert_eq!(state.count_pending_ack_batch(&orders, 1, 1), 1);
+        assert_eq!(state.count_pending_ack_batch(&fills, 1, 0), 0);
+        assert_eq!(state.count_pending_ack_batch(&orders, 1, 1), 2);
+        assert_eq!(state.count_pending_ack_batch(&fills, 1, 1), 1);
     }
 
     #[test]

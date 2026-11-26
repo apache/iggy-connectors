@@ -33,9 +33,10 @@ consumer_group = "questdb_sink"
 [delivery]
 # Store offsets only after QuestDB acknowledged the batch, and deliver a
 # failed batch again. Without this table the runtime delivers at most once,
-# and a failed write loses the messages of its batch. A retried batch can
-# write rows twice. To keep one copy, create the table with the DEDUP keys
-# that the README names under "Delivery semantics".
+# and a failed write loses the messages of its batch from the first one that
+# QuestDB did not confirm. A retried batch can write rows twice. To keep one
+# copy, create the table with the DEDUP keys that the README names under
+# "Delivery semantics".
 guarantee = "at_least_once"
 
 [plugin_config]

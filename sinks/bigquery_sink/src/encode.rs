@@ -419,7 +419,7 @@ fn json_object(payload: Payload) -> Result<OwnedValue, String> {
         Payload::Json(value) => value,
         Payload::Text(text) | Payload::Proto(text) => {
             let mut bytes = text.into_bytes();
-            simd_json::to_owned_value(&mut bytes)
+            iggy_connector_sdk::json::to_owned_value(&mut bytes)
                 .map_err(|e| format!("payload text is not valid JSON: {e}"))?
         }
         other => {
@@ -1116,8 +1116,7 @@ fn raw_text(payload: Payload, kind: RawKind) -> Result<String, String> {
     };
     if kind == RawKind::Json {
         let mut bytes = text.as_bytes().to_vec();
-        simd_json::to_borrowed_value(&mut bytes)
-            .map_err(|e| format!("payload is not valid JSON: {e}"))?;
+        simd_json::to_tape(&mut bytes).map_err(|e| format!("payload is not valid JSON: {e}"))?;
     }
     Ok(text)
 }
@@ -1479,7 +1478,7 @@ mod tests {
         let mut bytes = text.as_bytes().to_vec();
         message(
             offset,
-            Payload::Json(simd_json::to_owned_value(&mut bytes).unwrap()),
+            Payload::Json(iggy_connector_sdk::json::to_owned_value(&mut bytes).unwrap()),
         )
     }
 
@@ -1601,7 +1600,7 @@ mod tests {
                     format!(r#"{{"user_id":{index}}}"#)
                 };
                 let mut bytes = text.into_bytes();
-                simd_json::to_owned_value(&mut bytes).unwrap()
+                iggy_connector_sdk::json::to_owned_value(&mut bytes).unwrap()
             })
             .collect();
         let mut rejected = Vec::new();

@@ -87,6 +87,27 @@ mod tests {
     }
 
     #[test]
+    fn should_replace_a_key_that_repeats_in_the_message() {
+        let transform = UpdateFields::new(UpdateFieldsConfig {
+            fields: vec![Field {
+                key: "env".to_string(),
+                value: FieldValue::Static(OwnedValue::from("redacted")),
+                condition: None,
+            }],
+        });
+        let msg = create_test_message(r#"{"env": "staging", "msg": "login", "env": "prod"}"#);
+        let result = transform
+            .transform_json(&create_test_topic_metadata(), msg)
+            .unwrap()
+            .unwrap();
+        let bytes = result.payload.try_into_vec().unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"env":"redacted","msg":"login"}"#
+        );
+    }
+
+    #[test]
     fn should_update_only_existing_keys_when_key_exists() {
         let transform = UpdateFields::new(UpdateFieldsConfig {
             fields: vec![

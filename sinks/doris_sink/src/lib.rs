@@ -1800,7 +1800,7 @@ mod tests {
 
     fn json_msg(offset: u64) -> ConsumedMessage {
         let mut bytes = br#"{"k":1}"#.to_vec();
-        let value = simd_json::to_owned_value(&mut bytes).unwrap();
+        let value = iggy_connector_sdk::json::to_owned_value(&mut bytes).unwrap();
         ConsumedMessage {
             id: offset as u128,
             offset,
@@ -2335,7 +2335,7 @@ mod tests {
 
     fn owned(json: &str) -> OwnedValue {
         let mut bytes = json.as_bytes().to_vec();
-        simd_json::to_owned_value(&mut bytes).expect("valid JSON")
+        iggy_connector_sdk::json::to_owned_value(&mut bytes).expect("valid JSON")
     }
 
     #[test]

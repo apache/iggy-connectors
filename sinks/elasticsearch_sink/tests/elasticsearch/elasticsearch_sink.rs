@@ -224,6 +224,54 @@ async fn elasticsearch_sink_preserves_json_structure(
     );
 }
 
+/// Elasticsearch rejects a document that repeats a key, so the sink must send the last value only.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/elasticsearch/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn json_message_with_a_repeated_key_is_indexed_with_its_last_value(
+    harness: &TestHarness,
+    fixture: ElasticsearchSinkFixture,
+) {
+    let client = harness.root_client().await.expect("root client");
+    let stream_id: Identifier = seeds::names::STREAM.try_into().expect("stream ID");
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().expect("topic ID");
+    // Raw bytes, because serde_json would drop the first copy before the message reaches Iggy.
+    let mut message = IggyMessage::builder()
+        .id(1)
+        .payload(Bytes::from_static(
+            br#"{"env":"staging","msg":"login","env":"prod"}"#,
+        ))
+        .build()
+        .expect("message with a repeated key");
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            std::slice::from_mut(&mut message),
+        )
+        .await
+        .expect("send message with a repeated key");
+
+    fixture
+        .wait_for_documents(1)
+        .await
+        .expect("Elasticsearch must index the document");
+    fixture
+        .refresh_index()
+        .await
+        .expect("Failed to refresh index");
+    let search_result = fixture
+        .search_documents()
+        .await
+        .expect("Failed to search documents");
+
+    let source = &search_result.hits.hits[0].source;
+    assert_eq!(source["env"], "prod");
+    assert_eq!(source["msg"], "login");
+}
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/elasticsearch/sink.toml")),
     seed = seeds::connector_stream

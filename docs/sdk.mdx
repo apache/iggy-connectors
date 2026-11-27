@@ -7,6 +7,8 @@ SDK provides the commonly used structs and traits such as `Sink` and `Source`, a
 
 Moreover, it contains both, the `decoders` and `encoders` modules, implementing either `StreamDecoder` or `StreamEncoder` traits, which are used when consuming or producing data from/to Iggy streams. All the supported schemas - **JSON**, **Raw bytes**, **Text**, **Protocol Buffers**, **FlatBuffers**, and **Avro** - have both a decoder and an encoder.
 
+JSON is parsed with `iggy_connector_sdk::json::to_owned_value`. When an object repeats a key, the last value wins, as in serde_json and most JSON backends. simd-json's own `to_owned_value` and `to_borrowed_value` keep every copy in an object of up to 32 keys, so plugins parse JSON with the SDK function as well. The `disallowed-methods` entries of the repository's [`clippy.toml`](https://github.com/apache/iggy-connectors/blob/master/clippy.toml) reject the simd-json functions that keep the copies, and a plugin built outside the repository can copy them into its own `clippy.toml`.
+
 ## Traits
 
 A source produces messages to the configured stream and topic. A sink consumes messages from the configured stream(s) and topic(s):

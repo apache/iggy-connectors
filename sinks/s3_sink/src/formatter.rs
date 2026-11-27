@@ -233,7 +233,7 @@ mod tests {
 
     fn make_json_payload(json_str: &str) -> Payload {
         let mut bytes = json_str.as_bytes().to_vec();
-        let value = simd_json::to_owned_value(&mut bytes).unwrap();
+        let value = iggy_connector_sdk::json::to_owned_value(&mut bytes).unwrap();
         Payload::Json(value)
     }
 

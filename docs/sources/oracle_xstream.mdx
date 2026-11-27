@@ -65,7 +65,7 @@ tables = ["APP.ORDERS"]
 | `tables` | list | all captured tables | `OWNER.TABLE` names or `OWNER.*`, which also covers tables created later |
 | `poll_interval` | string | `100ms` | Pause before each poll |
 | `poll_budget` | string | `500ms` | Time a poll may spend collecting a batch when the stream is busy. An idle receive blocks for 1 to 2 seconds regardless |
-| `max_batch_events` | u32 | `1000` | Row changes per batch |
+| `max_batch_events` | u32 | `1000` | Changes (rows and schema changes) per batch |
 | `reattach_backoff` | string | `5s` | Pause before re-attaching after a stale session (`ORA-26812`) or an unreachable database |
 | `max_reattach_attempts` | u32 | `5` | Attempt limit for re-attaching |
 | `verbose_logging` | bool | `false` | Log every batch |
@@ -86,7 +86,7 @@ The connector produces one Iggy message per row change, in Oracle commit order. 
 }
 ```
 
-The message id is derived from the transaction id and the row number inside the transaction, so a replay carries the same ids. Row messages carry exactly the columns of their change record. Apply a schema change to the target when its message arrives.
+The message id is derived from the transaction id and the number of the change inside the transaction. The number keeps counting when a large transaction spans several batches, and a replay carries the same ids. Row messages carry exactly the columns of their change record. Apply a schema change to the target when its message arrives.
 
 ## Schema changes
 
@@ -100,6 +100,7 @@ Stopping on DDL is not offered, because Oracle replays the DDL record after a re
 - On a negative acknowledgement, the same batch is sent again from memory without detaching from the outbound server.
 - A batch that fills in the middle of a transaction ends there. Its acknowledgement does not move the low position into the open transaction, so a crash replays that whole transaction.
 - Unacknowledged transactions are replayed in full after a restart, a killed runtime or a lost session.
+- If Oracle reports that the saved position is below its processed low position (`ORA-21560`), the connector attaches once more without a position and the outbound server picks its own start. Changes between the two positions are not replayed.
 - A checkpoint written for another outbound server or another version fails the connector at start. Undecodable state starts from the outbound server's own position.
 
 ## Limits

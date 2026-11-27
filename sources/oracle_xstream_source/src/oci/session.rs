@@ -297,25 +297,35 @@ impl Session {
     fn read_ddl_statement(&self, lcr: Handle) -> Result<String, StreamError> {
         let mut statement: Text = null_mut();
         let mut statement_len = 0u32;
-        // SAFETY: every other output is documented as optional and passed as NULL; the statement pointer is
-        // copied into an owned string below before the next OCI call can invalidate it.
+        // Oracle documents these outputs as optional, but passing NULL crashes the 19c client (exit 139).
+        let mut slots = [TextOut::default(); 5];
+        let [
+            object_type,
+            logon_user,
+            current_schema,
+            base_owner,
+            base_name,
+        ] = &mut slots;
+        let mut flag = 0u64;
+        // SAFETY: all out parameters point at live locals; the statement pointer is copied into an owned string
+        // below before the next OCI call can invalidate it.
         let rc = unsafe {
             (self.client.ddl_info_get)(
                 self.service,
                 self.error,
-                null_mut(),
-                null_mut(),
+                &mut object_type.pointer,
+                &mut object_type.length,
                 &mut statement,
                 &mut statement_len,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
+                &mut logon_user.pointer,
+                &mut logon_user.length,
+                &mut current_schema.pointer,
+                &mut current_schema.length,
+                &mut base_owner.pointer,
+                &mut base_owner.length,
+                &mut base_name.pointer,
+                &mut base_name.length,
+                &mut flag,
                 lcr,
                 OCI_DEFAULT,
             )

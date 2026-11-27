@@ -2,7 +2,7 @@
 
 The Oracle Source connector streams committed row changes (`INSERT`, `UPDATE`, `DELETE`) from Oracle Database into Apache Iggy through **XStream Out**. An outbound server inside the database captures changes from the redo log, assembles whole transactions and delivers them in commit order. The connector is the client of that outbound server.
 
-> **Licence.** Per Oracle documentation, the XStream APIs are available  with the Oracle GoldenGate product. Every user of this connector needs it. The Oracle client library is loaded at run time and is never redistributed with Iggy.
+> **Licence.** Per Oracle documentation, the XStream APIs are available with the Oracle GoldenGate product. Every user of this connector needs it. The Oracle client library is loaded at run time and is never redistributed with Iggy.
 
 Target: Oracle 19c Enterprise Edition and later, multitenant (CDB) and non-CDB.
 
@@ -22,7 +22,7 @@ Target: Oracle 19c Enterprise Edition and later, multitenant (CDB) and non-CDB.
 - `tables`: optional list of `OWNER.TABLE` names or `OWNER.*`, which also covers tables created later. Absent or empty forwards every table the outbound server captures.
 - `poll_interval`: pause before each poll. Defaults to `"100ms"`.
 - `poll_budget`: time a poll may spend collecting a batch when the stream is busy. Defaults to `"500ms"`. An idle receive blocks for 1 to 2 seconds regardless.
-- `max_batch_events`: rows per batch. Defaults to `1000`.
+- `max_batch_events`: changes (rows and schema changes) per batch. Defaults to `1000`.
 - `reattach_backoff`, `max_reattach_attempts`: pause and attempt limit for a stale session (`ORA-26812`) or an unreachable database. Default `"5s"` and `5`.
 - `verbose_logging`: log every batch.
 
@@ -72,9 +72,10 @@ The database must be in `ARCHIVELOG` mode, and the captured tables need suppleme
 - A DDL statement on a captured table never stops the connector. `COMMENT`, `CREATE INDEX` and `GRANT OBJECT` are skipped. Everything else is forwarded in stream order as one message with `op` `ddl`, the Oracle `command` and the `statement` text, and without `before` or `after`. This covers `ALTER TABLE` (add, modify, rename or drop column), `CREATE TABLE`, `TRUNCATE TABLE`, `DROP TABLE` and `RENAME`.
 - Row messages carry exactly the columns of their LCR, so apply a schema change to the target when its message arrives. Stopping on DDL is not offered because Oracle replays the DDL record after a restart.
 - Delivery is at least once. A batch is staged until the runtime acknowledges it. On acknowledgement the connector commits its checkpoint and tells Oracle the processed low position, which lets the database purge redo it no longer needs. On a negative acknowledgement the same batch is sent again from memory without detaching from the outbound server.
-- The message id is derived from the transaction id and the row number inside the transaction, so a replay carries the same ids.
+- The message id is derived from the transaction id and the number of the change inside the transaction. The number keeps counting when a large transaction spans several batches, and a replay carries the same ids.
 - A batch that fills in the middle of a transaction ends there. Acknowledging it does not move the low position into the open transaction, so a crash replays that whole transaction.
 - Unacknowledged transactions are replayed in full after a restart, a killed runtime or a lost session.
+- If Oracle reports that the saved position is below its processed low position (`ORA-21560`), the connector attaches once more without a position, so the outbound server picks its own start. Changes between the two positions are not replayed.
 
 ## State
 

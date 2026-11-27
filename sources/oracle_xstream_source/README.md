@@ -2,7 +2,7 @@
 
 The Oracle Source connector streams committed row changes (`INSERT`, `UPDATE`, `DELETE`) from Oracle Database into Apache Iggy through **XStream Out**. An outbound server inside the database captures changes from the redo log, assembles whole transactions and delivers them in commit order. The connector is the client of that outbound server.
 
-> **Licence.** Oracle documents that the XStream APIs require a license for the Oracle GoldenGate product. Every user of this connector needs it. The Oracle client library is loaded at run time and is never redistributed with Iggy.
+> **Licence.** Per Oracle documentation, the XStream APIs are available  with the Oracle GoldenGate product. Every user of this connector needs it. The Oracle client library is loaded at run time and is never redistributed with Iggy.
 
 Target: Oracle 19c Enterprise Edition and later, multitenant (CDB) and non-CDB.
 
@@ -37,7 +37,7 @@ tables = ["APP.ORDERS"]
 
 ## Database setup
 
-Run as a DBA, once. The sketch below is the 19c form measured in the design spikes; see the design documents for the 26ai form.
+Run as a DBA, once. The sketch below is the 19c form.
 
 ```sql
 -- in the CDB root
@@ -80,7 +80,7 @@ The database must be in `ARCHIVELOG` mode, and the captured tables need suppleme
 
 The checkpoint holds a version, the outbound server name, the opaque position of the last acknowledged commit and a counter. A checkpoint written for another outbound server or another version fails `open`. Undecodable state starts from the outbound server's own position.
 
-## Limits of this version
+## Limits
 
 - `NUMBER`, `VARCHAR2`, `NVARCHAR2`, `CHAR`, `NCHAR`, `DATE`, `TIMESTAMP` (with and without time zone), `RAW`, `BINARY_FLOAT` and `BINARY_DOUBLE` are forwarded. A row with any other column type (LOB, `LONG`, `XMLType`, `INTERVAL`, `ROWID`) stops the connector with a message that names the table and column.
 - There is no initial snapshot: the stream starts at the outbound server's position.

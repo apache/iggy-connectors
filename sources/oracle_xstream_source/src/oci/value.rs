@@ -211,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn given_timestamp_parts_when_formatting_should_include_offset_only_when_present() {
+    fn given_timestamp_parts_when_formatting_should_add_offset_if_present() {
         let mut parts = DateTimeParts {
             year: 2026,
             month: 11,

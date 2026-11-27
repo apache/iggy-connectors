@@ -37,7 +37,6 @@ pub struct OracleSourceConfig {
     pub username: String,
     pub password: SecretString,
     pub outbound_server: String,
-    /// Path of `libclntsh`; the platform default name is used when absent.
     pub oci_library_path: Option<String>,
     /// `OWNER.TABLE` names to forward. Empty or absent forwards everything the outbound server captures.
     pub tables: Option<Vec<String>>,

@@ -78,8 +78,7 @@ fn build_row_message(row: &RowChange) -> Result<StagedMessage, Error> {
     )
 }
 
-/// A schema change travels in order with the rows around it, so a consumer sees the new shape exactly where it
-/// starts to apply.
+/// Shares the transaction's ordinals with the rows, so a consumer sees the new shape exactly where it applies.
 fn build_ddl_message(ddl: &DdlChange) -> Result<StagedMessage, Error> {
     let event = json!({
         "table": ddl.table,
@@ -252,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn given_binary_and_float_values_when_converting_should_use_base64_and_numbers() {
+    fn given_binary_and_float_when_converting_should_use_base64_and_number() {
         assert_eq!(
             value_to_json(&Value::Binary(vec![0xde, 0xad, 0xbe, 0xef])),
             json!("3q2+7w==")

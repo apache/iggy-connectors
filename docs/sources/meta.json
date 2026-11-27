@@ -4,6 +4,7 @@
     "source",
     "elasticsearch",
     "influxdb",
+    "oracle_xstream",
     "postgres",
     "random",
     "mqtt",

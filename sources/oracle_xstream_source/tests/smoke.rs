@@ -49,7 +49,7 @@ fn config() -> OracleSourceConfig {
 
 #[tokio::test]
 #[ignore = "needs a licensed Oracle with an XStream outbound server, see the README"]
-async fn given_changes_on_captured_tables_when_polling_should_deliver_them_once_across_a_restart() {
+async fn given_captured_changes_when_restarting_should_deliver_them_once() {
     let expected: usize = env::var("ORACLE_XSTREAM_EXPECT_ROWS")
         .ok()
         .and_then(|text| text.parse().ok())

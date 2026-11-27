@@ -85,6 +85,7 @@ pub struct Session {
     server_attached: bool,
     session_begun: bool,
     buffers: ColumnBuffers,
+    next_ordinal: u32,
 }
 
 // SAFETY: the handles are plain OCI pointers with no thread affinity when the environment is created with
@@ -146,6 +147,7 @@ impl Session {
             server_attached: false,
             session_begun: false,
             buffers: ColumnBuffers::new(),
+            next_ordinal: 0,
         };
         session.open(params, position)?;
         Ok(session)
@@ -168,7 +170,7 @@ impl Session {
                 CHARSET_AL32UTF8,
                 CHARSET_AL32UTF8,
             );
-            if rc != OCI_SUCCESS && rc != OCI_SUCCESS_WITH_INFO {
+            if !succeeded(rc) {
                 return Err(StreamError::Oci {
                     operation: "OCIEnvNlsCreate",
                     code: rc,
@@ -203,32 +205,20 @@ impl Session {
                 "OCIServerAttach",
             )?;
             self.server_attached = true;
-            self.check(
-                (client.attr_set)(
-                    self.service,
-                    HTYPE_SVCCTX,
-                    self.server,
-                    0,
-                    ATTR_SERVER,
-                    self.error,
-                ),
-                "OCIAttrSet server",
-            )?;
+            self.set_service_attr(self.server, ATTR_SERVER, "OCIAttrSet server")?;
             for (kind, text) in [
                 (ATTR_USERNAME, &params.username),
                 (ATTR_PASSWORD, &params.password),
             ] {
-                self.check(
-                    (client.attr_set)(
-                        self.user,
-                        HTYPE_SESSION,
-                        text.as_ptr() as Handle,
-                        text.len() as u32,
-                        kind,
-                        self.error,
-                    ),
-                    "OCIAttrSet credentials",
-                )?;
+                let rc = (client.attr_set)(
+                    self.user,
+                    HTYPE_SESSION,
+                    text.as_ptr() as Handle,
+                    text.len() as u32,
+                    kind,
+                    self.error,
+                );
+                self.check(rc, "OCIAttrSet credentials")?;
             }
             self.check(
                 (client.session_begin)(
@@ -241,17 +231,7 @@ impl Session {
                 "OCISessionBegin",
             )?;
             self.session_begun = true;
-            self.check(
-                (client.attr_set)(
-                    self.service,
-                    HTYPE_SVCCTX,
-                    self.user,
-                    0,
-                    ATTR_SESSION,
-                    self.error,
-                ),
-                "OCIAttrSet session",
-            )?;
+            self.set_service_attr(self.user, ATTR_SESSION, "OCIAttrSet session")?;
             let name = params.outbound_server.as_bytes();
             let (position_ptr, position_len) = match position {
                 Some(bytes) => (bytes.as_ptr(), bytes.len() as u16),
@@ -272,8 +252,21 @@ impl Session {
         }
     }
 
+    fn set_service_attr(
+        &self,
+        value: Handle,
+        kind: u32,
+        operation: &'static str,
+    ) -> Result<(), StreamError> {
+        // SAFETY: the service context, `value` and the error handle are live handles of this session.
+        let rc = unsafe {
+            (self.client.attr_set)(self.service, HTYPE_SVCCTX, value, 0, kind, self.error)
+        };
+        self.check(rc, operation)
+    }
+
     fn check(&self, rc: Sword, operation: &'static str) -> Result<(), StreamError> {
-        if rc == OCI_SUCCESS || rc == OCI_SUCCESS_WITH_INFO {
+        if succeeded(rc) {
             return Ok(());
         }
         let mut code = 0i32;
@@ -304,31 +297,25 @@ impl Session {
     fn read_ddl_statement(&self, lcr: Handle) -> Result<String, StreamError> {
         let mut statement: Text = null_mut();
         let mut statement_len = 0u32;
-        let (mut object_type, mut logon_user, mut current_schema): (Text, Text, Text) =
-            (null_mut(), null_mut(), null_mut());
-        let (mut base_owner, mut base_name): (Text, Text) = (null_mut(), null_mut());
-        let (mut object_type_len, mut logon_user_len, mut current_schema_len) = (0u16, 0u16, 0u16);
-        let (mut base_owner_len, mut base_name_len) = (0u16, 0u16);
-        let mut flag = 0u64;
-        // SAFETY: all out parameters point at live locals; the statement pointer is copied into an owned string
-        // below before the next OCI call can invalidate it.
+        // SAFETY: every other output is documented as optional and passed as NULL; the statement pointer is
+        // copied into an owned string below before the next OCI call can invalidate it.
         let rc = unsafe {
             (self.client.ddl_info_get)(
                 self.service,
                 self.error,
-                &mut object_type,
-                &mut object_type_len,
+                null_mut(),
+                null_mut(),
                 &mut statement,
                 &mut statement_len,
-                &mut logon_user,
-                &mut logon_user_len,
-                &mut current_schema,
-                &mut current_schema_len,
-                &mut base_owner,
-                &mut base_owner_len,
-                &mut base_name,
-                &mut base_name_len,
-                &mut flag,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
                 lcr,
                 OCI_DEFAULT,
             )
@@ -339,27 +326,16 @@ impl Session {
     }
 
     fn read_header(&self, lcr: Handle) -> Result<Header, StreamError> {
-        let nulls = || null_mut::<u8>();
-        let (
-            mut source_db,
-            mut command,
-            mut owner,
-            mut object,
-            mut tag,
-            mut transaction,
-            mut position,
-        ) = (
-            nulls(),
-            nulls(),
-            nulls(),
-            nulls(),
-            nulls(),
-            nulls(),
-            nulls(),
-        );
-        let (mut source_db_len, mut command_len, mut owner_len, mut object_len) =
-            (0u16, 0u16, 0u16, 0u16);
-        let (mut tag_len, mut transaction_len, mut position_len) = (0u16, 0u16, 0u16);
+        let mut slots = [TextOut::default(); 7];
+        let [
+            source_db,
+            command,
+            owner,
+            object,
+            tag,
+            transaction,
+            position,
+        ] = &mut slots;
         let (mut old_columns, mut new_columns) = (0u16, 0u16);
         let mut date = [0u8; OCI_DATE_BUFFER];
         let mut flags = 0u64;
@@ -369,23 +345,23 @@ impl Session {
             (self.client.header_get)(
                 self.service,
                 self.error,
-                &mut source_db,
-                &mut source_db_len,
-                &mut command,
-                &mut command_len,
-                &mut owner,
-                &mut owner_len,
-                &mut object,
-                &mut object_len,
-                &mut tag,
-                &mut tag_len,
-                &mut transaction,
-                &mut transaction_len,
+                &mut source_db.pointer,
+                &mut source_db.length,
+                &mut command.pointer,
+                &mut command.length,
+                &mut owner.pointer,
+                &mut owner.length,
+                &mut object.pointer,
+                &mut object.length,
+                &mut tag.pointer,
+                &mut tag.length,
+                &mut transaction.pointer,
+                &mut transaction.length,
                 date.as_mut_ptr() as Handle,
                 &mut old_columns,
                 &mut new_columns,
-                &mut position,
-                &mut position_len,
+                &mut position.pointer,
+                &mut position.length,
                 &mut flags,
                 lcr,
                 OCI_DEFAULT,
@@ -395,11 +371,11 @@ impl Session {
         // SAFETY: each (pointer, length) pair was just filled in by OCILCRHeaderGet.
         unsafe {
             Ok(Header {
-                command: text(command, command_len),
-                owner: text(owner, owner_len),
-                object: text(object, object_len),
-                transaction_id: text(transaction, transaction_len),
-                position: bytes(position, position_len),
+                command: command.text(),
+                owner: owner.text(),
+                object: object.text(),
+                transaction_id: transaction.text(),
+                position: position.bytes(),
                 source_time: decode_date(&date),
             })
         }
@@ -434,9 +410,13 @@ impl Session {
         let mut columns = Vec::with_capacity(usize::from(count));
         for index in 0..usize::from(count).min(MAX_COLUMNS) {
             // SAFETY: index < count, and OCI filled the first `count` entries of each array.
-            let name = unsafe { text(self.buffers.names[index], self.buffers.name_lengths[index]) };
-            let value = self.column_value(index);
-            columns.push(Column { name, value });
+            let name = unsafe {
+                TextOut::new(self.buffers.names[index], self.buffers.name_lengths[index]).text()
+            };
+            columns.push(Column {
+                name,
+                value: self.column_value(index),
+            });
         }
         Ok(columns)
     }
@@ -511,13 +491,14 @@ impl Session {
         }))
     }
 
-    /// Reads every pending chunk of an LCR that carries LOB, LONG or XMLType data. v1 does not forward those
-    /// values, so only the column names are kept, to report them.
+    /// Reads every pending chunk of an LCR that carries LOB, LONG or XMLType data. Those values are not
+    /// forwarded, so only the column names are kept, to report them.
     fn drain_chunks(&self) -> Result<Vec<String>, StreamError> {
         let mut names = Vec::new();
         loop {
-            let (mut name, mut data): (Text, Text) = (null_mut(), null_mut());
-            let (mut name_len, mut dtype, mut charset_id) = (0u16, 0u16, 0u16);
+            let mut name = TextOut::default();
+            let mut data: Text = null_mut();
+            let (mut dtype, mut charset_id) = (0u16, 0u16);
             let (mut flags, mut more) = (0u64, 0u64);
             let mut length = 0u32;
             // SAFETY: all out parameters are live locals, and the receive that produced this LCR is active.
@@ -525,8 +506,8 @@ impl Session {
                 (self.client.chunk_receive)(
                     self.service,
                     self.error,
-                    &mut name,
-                    &mut name_len,
+                    &mut name.pointer,
+                    &mut name.length,
                     &mut dtype,
                     &mut flags,
                     &mut charset_id,
@@ -539,8 +520,8 @@ impl Session {
             if rc != OCI_STILL_EXECUTING {
                 self.check(rc, "OCIXStreamOutChunkReceive")?;
             }
-            // SAFETY: `name` and `name_len` were just filled in by the chunk receive.
-            let column = unsafe { text(name, name_len) };
+            // SAFETY: `name` was just filled in by the chunk receive.
+            let column = unsafe { name.text() };
             if !column.is_empty() && !names.contains(&column) {
                 names.push(column);
             }
@@ -618,13 +599,12 @@ impl LcrStream for Session {
                 OCI_DEFAULT,
             )
         };
-        let ok = rc == OCI_SUCCESS || rc == OCI_SUCCESS_WITH_INFO;
         // OCI_STILL_EXECUTING arrives together with an LCR and means the receive stays active;
         // success with no LCR is the idle return.
-        if rc != OCI_STILL_EXECUTING && lcr.is_null() && (ok || rc == OCI_NO_DATA) {
-            return Ok(Received::Idle);
-        }
         if rc != OCI_STILL_EXECUTING {
+            if lcr.is_null() && (succeeded(rc) || rc == OCI_NO_DATA) {
+                return Ok(Received::Idle);
+            }
             self.check(rc, "OCIXStreamOutLCRReceive")?;
         }
         let header = self.read_header(lcr)?;
@@ -664,13 +644,15 @@ impl LcrStream for Session {
         self.check(rc, "OCIXStreamOutProcessedLWMSet")
     }
 
+    fn next_ordinal(&mut self) -> &mut u32 {
+        &mut self.next_ordinal
+    }
+
     fn detach(&mut self) -> Result<(), StreamError> {
         let deadline = Instant::now() + DETACH_DRAIN_TIMEOUT;
         loop {
-            match self.receive() {
-                Ok(Received::Idle) => break,
-                Ok(_) => {}
-                Err(_) => break,
+            if matches!(self.receive(), Ok(Received::Idle) | Err(_)) {
+                break;
             }
             if Instant::now() >= deadline {
                 return Err(StreamError::Protocol(
@@ -716,14 +698,44 @@ fn mark_unsupported(columns: &mut [Column], name: &str) {
     }
 }
 
-/// # Safety
-/// `pointer` must be null or point at `length` readable bytes.
-unsafe fn bytes(pointer: Text, length: u16) -> Vec<u8> {
-    if pointer.is_null() || length == 0 {
-        return Vec::new();
+fn succeeded(rc: Sword) -> bool {
+    rc == OCI_SUCCESS || rc == OCI_SUCCESS_WITH_INFO
+}
+
+/// A (pointer, length) pair that OCI fills in for a text or byte value it owns.
+#[derive(Clone, Copy)]
+struct TextOut {
+    pointer: Text,
+    length: u16,
+}
+
+impl Default for TextOut {
+    fn default() -> Self {
+        Self::new(null_mut(), 0)
     }
-    // SAFETY: guaranteed by the caller.
-    unsafe { std::slice::from_raw_parts(pointer, usize::from(length)) }.to_vec()
+}
+
+impl TextOut {
+    fn new(pointer: Text, length: u16) -> Self {
+        Self { pointer, length }
+    }
+
+    /// # Safety
+    /// `pointer` must be null or point at `length` readable bytes.
+    unsafe fn bytes(self) -> Vec<u8> {
+        if self.pointer.is_null() || self.length == 0 {
+            return Vec::new();
+        }
+        // SAFETY: guaranteed by the caller.
+        unsafe { std::slice::from_raw_parts(self.pointer, usize::from(self.length)) }.to_vec()
+    }
+
+    /// # Safety
+    /// Same contract as [`TextOut::bytes`].
+    unsafe fn text(self) -> String {
+        // SAFETY: guaranteed by the caller.
+        String::from_utf8_lossy(&unsafe { self.bytes() }).into_owned()
+    }
 }
 
 /// # Safety
@@ -734,17 +746,10 @@ unsafe fn text_long(pointer: Text, length: u32) -> String {
     }
     // SAFETY: guaranteed by the caller.
     let raw = unsafe { std::slice::from_raw_parts(pointer, length as usize) };
-    // Measured on 19c: the reported length of a DDL statement includes the terminating NUL byte.
+    // On 19c the reported length of a DDL statement includes the terminating NUL byte.
     String::from_utf8_lossy(raw)
         .trim_end_matches('\0')
         .to_owned()
-}
-
-/// # Safety
-/// Same contract as [`bytes`].
-unsafe fn text(pointer: Text, length: u16) -> String {
-    // SAFETY: guaranteed by the caller.
-    String::from_utf8_lossy(&unsafe { bytes(pointer, length) }).into_owned()
 }
 
 #[cfg(test)]

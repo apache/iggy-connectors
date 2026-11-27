@@ -28,13 +28,12 @@ pub const ORA_POSITION_BELOW_LOW_POSITION: i32 = 21560;
 pub enum Value {
     Null,
     Text(String),
-    /// Canonical decimal text of an Oracle `NUMBER`.
     Number(String),
     Float(f64),
     Binary(Vec<u8>),
     /// ISO 8601 text, with an offset when the column carries a time zone.
     Timestamp(String),
-    /// A column type that v1 does not decode (LOB, LONG, XMLType, INTERVAL and others).
+    /// A column type the connector does not decode (LOB, LONG, XMLType, INTERVAL and others).
     Unsupported,
 }
 
@@ -79,7 +78,7 @@ pub struct RowChange {
 pub struct DdlChange {
     /// `OWNER.OBJECT`
     pub table: String,
-    /// Oracle's command name, for example `ALTER TABLE` or `CREATE TABLE`.
+    /// Oracle's command name, for example `ALTER TABLE`.
     pub command: String,
     pub statement: String,
     pub transaction_id: String,
@@ -137,10 +136,13 @@ impl StreamError {
     }
 }
 
-/// A blocking XStream Out client session. Implemented by the OCI session and by test fakes.
+/// The seam between the connector and OCI, so tests can replace the database.
 pub trait LcrStream: Send {
     fn receive(&mut self) -> Result<Received, StreamError>;
     fn set_processed_low_position(&mut self, position: &[u8]) -> Result<(), StreamError>;
+    /// Ordinal of the next change in the transaction being read. It lives with the attachment, not with a batch:
+    /// a batch can end mid-transaction, and a new attach replays that transaction from its start.
+    fn next_ordinal(&mut self) -> &mut u32;
     /// Receives until the stream is idle, then detaches. A receive that last returned an LCR is still
     /// active, and Oracle refuses to detach it (ORA-03127).
     fn detach(&mut self) -> Result<(), StreamError>;
@@ -167,13 +169,12 @@ pub enum DrainError {
     UnsupportedType { table: String, column: String },
 }
 
-/// DDL that changes neither the shape of a row nor which rows exist. Every other statement, including ones this
-/// list has never seen, is forwarded as a schema-change event so that nothing is dropped silently.
+/// DDL that changes neither the shape of a row nor which rows exist. Anything else, including statements not in
+/// this list, is forwarded so that nothing is dropped silently.
 const HARMLESS_DDL: [&str; 3] = ["COMMENT", "CREATE INDEX", "GRANT OBJECT"];
 const SCHEMA_WILDCARD_SUFFIX: &str = ".*";
 
-/// Selects the tables to forward: `OWNER.TABLE` entries and `OWNER.*` entries that also cover tables created later.
-/// An empty filter forwards every table the outbound server captures.
+/// `OWNER.TABLE` entries, plus `OWNER.*` entries that also cover tables created later. An empty filter allows all.
 #[derive(Debug, Default)]
 pub struct TableFilter {
     tables: HashSet<String>,
@@ -215,7 +216,6 @@ pub fn drain_batch(
 ) -> Result<Drained, DrainError> {
     let deadline = Instant::now() + limits.budget;
     let mut drained = Drained::default();
-    let mut ordinal = 0u32;
     let mut transaction_open = false;
     while drained.changes.len() < limits.max_events
         && (transaction_open || Instant::now() < deadline)
@@ -228,13 +228,14 @@ pub fn drain_batch(
                     continue;
                 }
                 reject_unsupported(&row)?;
-                row.ordinal = ordinal;
-                ordinal += 1;
+                let ordinal = stream.next_ordinal();
+                row.ordinal = *ordinal;
+                *ordinal += 1;
                 drained.changes.push(Change::Row(row));
             }
             Received::Commit { position } => {
                 transaction_open = false;
-                ordinal = 0;
+                *stream.next_ordinal() = 0;
                 drained.last_commit = Some(position);
             }
             Received::Ddl(mut ddl) => {
@@ -242,8 +243,9 @@ pub fn drain_batch(
                 if !filter.allows(&ddl.table) || HARMLESS_DDL.contains(&ddl.command.as_str()) {
                     continue;
                 }
-                ddl.ordinal = ordinal;
-                ordinal += 1;
+                let ordinal = stream.next_ordinal();
+                ddl.ordinal = *ordinal;
+                *ordinal += 1;
                 drained.changes.push(Change::Ddl(ddl));
             }
         }
@@ -279,6 +281,7 @@ pub(crate) mod testing {
     pub struct ScriptedStream {
         script: VecDeque<Result<Received, StreamError>>,
         processed: ProcessedPositions,
+        next_ordinal: u32,
     }
 
     impl ScriptedStream {
@@ -287,6 +290,7 @@ pub(crate) mod testing {
             let stream = Self {
                 script: script.into(),
                 processed: Arc::clone(&processed),
+                next_ordinal: 0,
             };
             (stream, processed)
         }
@@ -300,6 +304,10 @@ pub(crate) mod testing {
         fn set_processed_low_position(&mut self, position: &[u8]) -> Result<(), StreamError> {
             self.processed.lock().expect("lock").push(position.to_vec());
             Ok(())
+        }
+
+        fn next_ordinal(&mut self) -> &mut u32 {
+            &mut self.next_ordinal
         }
 
         fn detach(&mut self) -> Result<(), StreamError> {
@@ -370,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn given_two_transactions_when_draining_should_end_at_last_commit_and_restart_ordinals() {
+    fn given_two_transactions_when_draining_should_restart_ordinals() {
         let drained = drain(
             vec![
                 insert("APP.T", "1.1.1", 1),
@@ -396,7 +404,40 @@ mod tests {
     }
 
     #[test]
-    fn given_batch_full_mid_transaction_when_draining_should_keep_the_previous_commit() {
+    fn given_transaction_split_across_batches_when_draining_should_keep_ordinals_unique() {
+        let (mut stream, _) = ScriptedStream::new(
+            vec![
+                insert("APP.T", "1.1.1", 1),
+                insert("APP.T", "1.1.1", 2),
+                insert("APP.T", "1.1.1", 3),
+                commit(1),
+            ]
+            .into_iter()
+            .map(Ok)
+            .collect(),
+        );
+        let filter = TableFilter::default();
+        let first = drain_batch(&mut stream, limits(2), &filter).expect("first batch");
+        let second = drain_batch(&mut stream, limits(2), &filter).expect("second batch");
+        let keys: Vec<(String, u32)> = first
+            .changes
+            .iter()
+            .chain(&second.changes)
+            .map(|change| match change {
+                Change::Row(row) => (row.transaction_id.clone(), row.ordinal),
+                Change::Ddl(ddl) => (ddl.transaction_id.clone(), ddl.ordinal),
+            })
+            .collect();
+        let unique: HashSet<&(String, u32)> = keys.iter().collect();
+        assert_eq!(
+            unique.len(),
+            keys.len(),
+            "duplicate (xid, ordinal): {keys:?}"
+        );
+    }
+
+    #[test]
+    fn given_full_batch_mid_transaction_when_draining_should_keep_previous_commit() {
         let drained = drain(
             vec![
                 insert("APP.T", "1.1.1", 1),
@@ -414,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn given_table_filter_when_draining_should_skip_other_tables_and_keep_their_commits() {
+    fn given_table_filter_when_draining_should_skip_other_tables_keep_commits() {
         let filter = TableFilter::new(&["app.orders".to_owned()]);
         let drained = drain(
             vec![
@@ -433,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn given_shape_changing_ddl_when_draining_should_forward_it_in_order_with_the_rows() {
+    fn given_shape_changing_ddl_when_draining_should_forward_it_in_order() {
         let drained = drain(
             vec![
                 insert("APP.T", "1.1.1", 1),
@@ -462,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn given_destructive_or_unknown_ddl_when_draining_should_forward_it_instead_of_stopping() {
+    fn given_destructive_or_unknown_ddl_when_draining_should_forward_it() {
         let drained = drain(
             vec![
                 ddl("APP.T", "TRUNCATE TABLE", "1.1.1"),
@@ -481,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn given_harmless_ddl_when_draining_should_skip_it_and_still_advance_the_commit() {
+    fn given_harmless_ddl_when_draining_should_skip_it_and_advance() {
         let drained = drain(
             vec![
                 ddl("APP.T", "COMMENT", "1.1.1"),
@@ -556,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn given_ora_codes_when_classifying_should_recognise_stale_session_and_old_position() {
+    fn given_ora_codes_when_classifying_should_flag_stale_and_old_position() {
         let oci = |code| StreamError::Oci {
             operation: "attach",
             code,

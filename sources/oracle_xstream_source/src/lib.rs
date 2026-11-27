@@ -76,8 +76,8 @@ impl std::fmt::Debug for OracleSource {
     }
 }
 
-/// A batch handed to the runtime and not yet acknowledged. It stays here so that a NACK can resend it
-/// without detaching from the outbound server, which would restart the server's capture pipeline.
+/// A batch handed to the runtime and not yet acknowledged. Waits till a NACK can resend it
+/// before detaching from the outbound serve. This is used to restart the server's capture pipeline.
 struct Staged {
     messages: Vec<StagedMessage>,
     candidate: State,
@@ -146,9 +146,8 @@ impl OracleSource {
         self.connect().await
     }
 
-    /// Attaches, resuming from the last acknowledged position. A position below the server's processed low
-    /// position is retried once from the server's own start, and stale sessions and unreachable databases
-    /// are retried with a backoff.
+    /// A saved position below the server's processed low position is retried once from the server's own start.
+    /// Stale sessions and unreachable databases are retried with a backoff.
     async fn connect(&self) -> Result<BoxedStream, Error> {
         let settings = self.settings()?;
         let (Some(client), Some(params)) = (&self.client, &self.params) else {
@@ -159,11 +158,10 @@ impl OracleSource {
         loop {
             attempt += 1;
             let (client, params, from) = (Arc::clone(client), Arc::clone(params), position.clone());
-            let outcome = tokio::task::spawn_blocking(move || {
+            let outcome = blocking("attach", move || {
                 Session::connect(client, &params, from.as_deref())
             })
-            .await
-            .map_err(|error| Error::Connection(format!("attach task failed: {error}")))?;
+            .await?;
             let error = match outcome {
                 Ok(session) => return Ok(Box::new(session)),
                 Err(error) => error,
@@ -224,7 +222,7 @@ impl OracleSource {
         let Some(mut session) = self.session.lock().await.take() else {
             return;
         };
-        let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = blocking("low position", move || {
             let result = session.set_processed_low_position(&position);
             (session, result)
         })
@@ -239,10 +237,7 @@ impl OracleSource {
                 );
                 drop_blocking(session).await;
             }
-            Err(error) => warn!(
-                "Low position task of {CONNECTOR_NAME} ID: {} failed: {error}",
-                self.id
-            ),
+            Err(error) => warn!("{CONNECTOR_NAME} ID: {} {error}", self.id),
         }
     }
 }
@@ -297,13 +292,12 @@ impl Source for OracleSource {
             budget: settings.poll_budget,
         };
         let filter = Arc::clone(&self.filter);
-        let (session, outcome) = tokio::task::spawn_blocking(move || {
+        let (session, outcome) = blocking("receive", move || {
             let mut session = session;
             let outcome = drain_batch(session.as_mut(), limits, &filter);
             (outcome.is_ok().then_some(session), outcome)
         })
-        .await
-        .map_err(|error| Error::Connection(format!("receive task failed: {error}")))?;
+        .await?;
         match outcome {
             Ok(drained) => {
                 *self.session.lock().await = session;
@@ -355,16 +349,12 @@ impl Source for OracleSource {
 
     async fn close(&mut self) -> Result<(), Error> {
         if let Some(mut session) = self.session.lock().await.take() {
-            let outcome = tokio::task::spawn_blocking(move || session.detach()).await;
-            match outcome {
+            match blocking("detach", move || session.detach()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     warn!("Detach of {CONNECTOR_NAME} ID: {} failed: {error}", self.id)
                 }
-                Err(error) => warn!(
-                    "Detach task of {CONNECTOR_NAME} ID: {} failed: {error}",
-                    self.id
-                ),
+                Err(error) => warn!("{CONNECTOR_NAME} ID: {} {error}", self.id),
             }
         }
         let state = self.state.lock().await;
@@ -407,9 +397,19 @@ fn headers(message: &StagedMessage) -> Option<BTreeMap<HeaderKey, HeaderValue>> 
     Some(BTreeMap::from([table, operation]))
 }
 
+/// OCI calls block, so they run off the async threads.
+async fn blocking<T: Send + 'static>(
+    task_name: &str,
+    task: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Error> {
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|error| Error::Connection(format!("{task_name} task failed: {error}")))
+}
+
 async fn drop_blocking(session: BoxedStream) {
-    if let Err(error) = tokio::task::spawn_blocking(move || drop(session)).await {
-        warn!("Releasing the Oracle session failed: {error}");
+    if let Err(error) = blocking("release", move || drop(session)).await {
+        warn!("{error}");
     }
 }
 
@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_persisted_state_should_restore_position_and_counter() {
+    async fn given_saved_state_when_opening_should_restore_position_and_counter() {
         let stored = state_with(STATE_VERSION, "IGGY_XOUT", Some(vec![1, 2, 3]), 500);
         let source = OracleSource::new(1, test_config(), Some(stored));
         let state = source.state.lock().await;
@@ -479,14 +479,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_no_state_should_start_fresh() {
+    async fn given_no_state_when_opening_should_start_fresh() {
         let source = OracleSource::new(1, test_config(), None);
         let state = source.state.lock().await;
         assert_eq!(*state, State::new("IGGY_XOUT"));
     }
 
     #[tokio::test]
-    async fn given_invalid_state_should_start_fresh() {
+    async fn given_invalid_state_when_opening_should_start_fresh() {
         let source = OracleSource::new(
             1,
             test_config(),
@@ -496,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn state_should_round_trip_through_connector_state() {
+    fn given_state_when_serializing_should_round_trip() {
         let original = State {
             version: STATE_VERSION,
             server_name: "IGGY_XOUT".to_owned(),
@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_state_of_another_version_when_opening_should_fail_with_the_versions() {
+    async fn given_other_state_version_when_opening_should_fail() {
         let stored = state_with(STATE_VERSION + 1, "IGGY_XOUT", None, 0);
         let mut source = OracleSource::new(1, test_config(), Some(stored));
         let error = source
@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_state_of_another_server_when_opening_should_fail_naming_both() {
+    async fn given_other_server_state_when_opening_should_fail() {
         let stored = state_with(STATE_VERSION, "OTHER_XOUT", None, 0);
         let mut source = OracleSource::new(1, test_config(), Some(stored));
         let error = source
@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_invalid_config_when_opening_should_return_the_config_error() {
+    async fn given_invalid_config_when_opening_should_fail() {
         let mut config = test_config();
         config.max_batch_events = Some(0);
         let mut source = OracleSource::new(1, config, None);
@@ -550,7 +550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_a_transaction_when_polling_should_stage_messages_with_candidate_state() {
+    async fn given_transaction_when_polling_should_stage_candidate_state() {
         let (source, _) = source_with(two_row_transaction()).await;
         let batch = source.poll().await.expect("poll");
         assert_eq!(batch.messages.len(), 2);
@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_ack_when_batch_is_staged_should_commit_state_and_set_the_low_position() {
+    async fn given_ack_when_batch_staged_should_commit_state_and_low_position() {
         let (source, processed) = source_with(two_row_transaction()).await;
         source.poll().await.expect("poll");
         source
@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_nack_when_polling_again_should_resend_the_same_batch_without_reading_oracle() {
+    async fn given_nack_when_polling_again_should_resend_same_batch() {
         let (source, processed) = source_with(two_row_transaction()).await;
         let first = source.poll().await.expect("poll");
         source
@@ -622,8 +622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_commit_without_captured_rows_when_polling_should_advance_the_position_through_ack()
-     {
+    async fn given_empty_commit_when_polling_should_advance_position_on_ack() {
         let (source, processed) = source_with(vec![Ok(commit(9))]).await;
         let batch = source.poll().await.expect("poll");
         assert!(batch.messages.is_empty());
@@ -637,7 +636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_idle_stream_when_polling_should_return_an_empty_batch_without_state() {
+    async fn given_idle_stream_when_polling_should_return_empty_batch() {
         let (source, _) = source_with(Vec::new()).await;
         let batch = source.poll().await.expect("poll");
         assert!(batch.messages.is_empty());
@@ -645,7 +644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_ddl_between_transactions_when_polling_should_emit_it_in_order_and_advance() {
+    async fn given_ddl_between_transactions_when_polling_should_emit_in_order() {
         let (source, processed) = source_with(vec![
             Ok(insert("APP.T", "1.1.1", 1)),
             Ok(commit(1)),
@@ -693,8 +692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_receive_error_when_polling_should_drop_the_session_and_report_a_connection_error()
-     {
+    async fn given_receive_error_when_polling_should_drop_session_and_fail() {
         let failure = StreamError::Oci {
             operation: "OCIXStreamOutLCRReceive",
             code: 3113,
@@ -713,7 +711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_table_filter_when_polling_should_forward_only_the_configured_tables() {
+    async fn given_table_filter_when_polling_should_forward_only_listed_tables() {
         let mut config = test_config();
         config.tables = Some(vec!["APP.T".to_owned()]);
         let source = OracleSource::new(1, config, None);

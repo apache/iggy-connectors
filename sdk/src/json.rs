@@ -61,7 +61,10 @@ fn keep_last_owned(root: &mut OwnedValue) {
             OwnedValue::Object(fields) => {
                 // Only an object on the vec backend can hold a repeated key, because simd-json
                 // inserts into a hash-backed one with a check.
-                if fields.is_vec() && repeats_a_key(fields.keys().map(String::as_str)) {
+                if fields.len() > 1
+                    && fields.is_vec()
+                    && repeats_a_key(fields.keys().map(String::as_str))
+                {
                     let mut unique =
                         owned::Object::with_capacity_and_hasher(fields.len(), Default::default());
                     for (key, field) in std::mem::take(&mut **fields) {

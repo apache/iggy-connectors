@@ -43,6 +43,7 @@ members = [
     "sources/influxdb_source",
     "sources/mqtt_source",
     "sources/opensearch_source",
+    "sources/oracle_xstream_source",
     "sources/postgres_source",
     "sources/random_source",
     "testing",
@@ -111,6 +112,7 @@ iggy_connector_sdk = { path = "sdk", version = "0.6.0" }
 iggy_connector_testing = { path = "testing" }
 integration = { git = "https://github.com/apache/iggy", rev = "b2be19aefcf7c75d228426a71a8e29f908b1916f", default-features = false }
 lapin = "4.12.3"
+libloading = "0.8.9"
 # Pinned exactly: `metadata::stm::stream`'s keyed stats evictions lean on
 # left-right draining the previous batch's `absorb_second` before the current
 # batch's `absorb_first`, which is an implementation detail of 0.11.8's

@@ -54,7 +54,7 @@ The database must be in `ARCHIVELOG` mode, and the captured tables need suppleme
 
 ## Delivery
 
-- Order follows the commit order of Oracle. One Iggy message is produced per row change, with the payload:
+- Order follows the commit order of Oracle only within one partition. Set `partition_id = 0` on the stream (see the example config), or use a topic with one partition. Without it the runtime spreads messages over the partitions of an existing topic, and the commit order is lost. One Iggy message is produced per row change, with the payload:
 
 ```json
 {
@@ -83,11 +83,11 @@ The checkpoint holds a version, the outbound server name, the opaque position of
 
 ## Limits
 
-- `NUMBER`, `VARCHAR2`, `NVARCHAR2`, `CHAR`, `NCHAR`, `DATE`, `TIMESTAMP` (with and without time zone), `RAW`, `BINARY_FLOAT` and `BINARY_DOUBLE` are forwarded. A row with any other column type (LOB, `LONG`, `XMLType`, `INTERVAL`, `ROWID`) stops the connector with a message that names the table and column.
+- `NUMBER`, `VARCHAR2`, `NVARCHAR2`, `CHAR`, `NCHAR`, `DATE`, `TIMESTAMP` (with and without time zone), `RAW`, `BINARY_FLOAT` and `BINARY_DOUBLE` are forwarded. A forwarded row with any other column type (LOB, `LONG`, `XMLType`, `INTERVAL`, `ROWID`) ends the poll there. The commits read before it are delivered and acknowledged, then the connector stops with an error that names the table and column.
+- The changes of the transaction that holds the row are not delivered, and they are replayed when the connector is started again after the column is removed or the table is excluded.
+- Rows of tables excluded by `tables` are skipped and never stop the connector.
 - There is no initial snapshot: the stream starts at the outbound server's position.
 - Not tested: Standard Edition 2, RAC, Data Guard, managed cloud databases.
-
-A stop for an unsupported column type is sticky: every later poll returns the same error until the connector is restarted.
 
 ## Tests
 

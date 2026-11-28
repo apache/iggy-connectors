@@ -159,14 +159,16 @@ pub struct Drained {
     pub changes: Vec<Change>,
     /// Position of the last commit LCR seen. Rows after it belong to a transaction still in progress.
     pub last_commit: Option<Vec<u8>>,
+    /// Set when a forwarded row has a column the connector cannot decode. `changes` then ends at `last_commit`, so
+    /// the commits read before the row can still be delivered and acknowledged.
+    pub blocked: Option<UnsupportedColumn>,
 }
 
-#[derive(Debug, Error)]
-pub enum DrainError {
-    #[error(transparent)]
-    Stream(#[from] StreamError),
-    #[error("unsupported column type in {table}.{column}")]
-    UnsupportedType { table: String, column: String },
+#[derive(Debug, Clone, PartialEq, Error)]
+#[error("unsupported column type in {table}.{column}")]
+pub struct UnsupportedColumn {
+    pub table: String,
+    pub column: String,
 }
 
 /// DDL that changes neither the shape of a row nor which rows exist. Anything else, including statements not in
@@ -205,18 +207,18 @@ impl TableFilter {
     }
 }
 
-/// Reads LCRs until the batch is full, the budget is spent with no transaction open, or the stream is idle.
-///
+/// Reads LCRs until the batch is full, the stream is idle, or a row has an unsupported column.
 /// A batch that fills mid-transaction ends there: its `last_commit` stays at the previous commit, so
 /// acknowledging it never moves the processed low position into the open transaction.
 pub fn drain_batch(
     stream: &mut dyn LcrStream,
     limits: Limits,
     filter: &TableFilter,
-) -> Result<Drained, DrainError> {
+) -> Result<Drained, StreamError> {
     let deadline = Instant::now() + limits.budget;
     let mut drained = Drained::default();
     let mut transaction_open = false;
+    let mut committed = 0;
     while drained.changes.len() < limits.max_events
         && (transaction_open || Instant::now() < deadline)
     {
@@ -227,7 +229,11 @@ pub fn drain_batch(
                 if !filter.allows(&row.table) {
                     continue;
                 }
-                reject_unsupported(&row)?;
+                if let Some(unsupported) = unsupported_column(&row) {
+                    drained.changes.truncate(committed);
+                    drained.blocked = Some(unsupported);
+                    break;
+                }
                 let ordinal = stream.next_ordinal();
                 row.ordinal = *ordinal;
                 *ordinal += 1;
@@ -237,6 +243,7 @@ pub fn drain_batch(
                 transaction_open = false;
                 *stream.next_ordinal() = 0;
                 drained.last_commit = Some(position);
+                committed = drained.changes.len();
             }
             Received::Ddl(mut ddl) => {
                 transaction_open = true;
@@ -253,19 +260,15 @@ pub fn drain_batch(
     Ok(drained)
 }
 
-fn reject_unsupported(row: &RowChange) -> Result<(), DrainError> {
-    let unsupported = row
-        .old
+fn unsupported_column(row: &RowChange) -> Option<UnsupportedColumn> {
+    row.old
         .iter()
         .chain(&row.new)
-        .find(|column| column.value == Value::Unsupported);
-    match unsupported {
-        Some(column) => Err(DrainError::UnsupportedType {
+        .find(|column| column.value == Value::Unsupported)
+        .map(|column| UnsupportedColumn {
             table: row.table.clone(),
             column: column.name.clone(),
-        }),
-        None => Ok(()),
-    }
+        })
 }
 
 #[cfg(test)]
@@ -372,7 +375,7 @@ mod tests {
         script: Vec<Received>,
         max_events: usize,
         filter: &TableFilter,
-    ) -> Result<Drained, DrainError> {
+    ) -> Result<Drained, StreamError> {
         let (mut stream, _) = ScriptedStream::new(script.into_iter().map(Ok).collect());
         drain_batch(&mut stream, limits(max_events), filter)
     }
@@ -568,14 +571,34 @@ mod tests {
         if let Received::Row(change) = &mut row {
             change.new.push(column("BODY", Value::Unsupported));
         }
-        let error = drain(vec![row], 100, &TableFilter::default()).expect_err("must stop");
-        assert!(
-            matches!(
-                error,
-                DrainError::UnsupportedType { ref table, ref column } if table == "APP.DOCS" && column == "BODY"
-            ),
-            "{error:?}"
+        let drained = drain(vec![row], 100, &TableFilter::default()).expect("drain");
+        assert_eq!(
+            drained.blocked,
+            Some(UnsupportedColumn {
+                table: "APP.DOCS".to_owned(),
+                column: "BODY".to_owned(),
+            })
         );
+    }
+
+    #[test]
+    fn given_unsupported_column_after_a_commit_when_draining_should_keep_only_the_committed_changes()
+     {
+        let mut bad = insert("APP.DOCS", "2.2.2", 3);
+        if let Received::Row(change) = &mut bad {
+            change.new.push(column("BODY", Value::Unsupported));
+        }
+        let script = vec![
+            insert("APP.T", "1.1.1", 1),
+            commit(7),
+            insert("APP.T", "2.2.2", 2),
+            bad,
+            insert("APP.T", "2.2.2", 4),
+        ];
+        let drained = drain(script, 100, &TableFilter::default()).expect("drain");
+        assert_eq!(drained.changes.len(), 1);
+        assert_eq!(drained.last_commit, Some(vec![7]));
+        assert!(drained.blocked.is_some());
     }
 
     #[test]
@@ -593,7 +616,7 @@ mod tests {
         })]);
         let error =
             drain_batch(&mut stream, limits(10), &TableFilter::default()).expect_err("error");
-        assert!(matches!(error, DrainError::Stream(ref inner) if inner.ora_code() == Some(3113)));
+        assert_eq!(error.ora_code(), Some(3113));
     }
 
     #[test]

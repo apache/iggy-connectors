@@ -72,7 +72,7 @@ tables = ["APP.ORDERS"]
 
 ## Messages
 
-The connector produces one Iggy message per row change, in Oracle commit order. The headers `table` and `op` carry the table name and the operation (`insert`, `update`, `delete` or `ddl`).
+The connector produces one Iggy message per row change, in Oracle commit order within a partition. Set `partition_id = 0` on the stream, or use a topic with one partition: without it the runtime spreads messages over the partitions of an existing topic and the commit order is lost. The headers `table` and `op` carry the table name and the operation (`insert`, `update`, `delete` or `ddl`).
 
 ```json
 {
@@ -105,6 +105,6 @@ Stopping on DDL is not offered, because Oracle replays the DDL record after a re
 
 ## Limits
 
-- `NUMBER`, `VARCHAR2`, `NVARCHAR2`, `CHAR`, `NCHAR`, `DATE`, `TIMESTAMP` (with and without time zone), `RAW`, `BINARY_FLOAT` and `BINARY_DOUBLE` are forwarded. A row with any other column type (LOB, `LONG`, `XMLType`, `INTERVAL`, `ROWID`) stops the connector with a message that names the table and column. The stop is sticky: every later poll returns the same error until the connector is restarted.
+- `NUMBER`, `VARCHAR2`, `NVARCHAR2`, `CHAR`, `NCHAR`, `DATE`, `TIMESTAMP` (with and without time zone), `RAW`, `BINARY_FLOAT` and `BINARY_DOUBLE` are forwarded. A forwarded row with any other column type (LOB, `LONG`, `XMLType`, `INTERVAL`, `ROWID`) ends the poll there. The commits read before it are delivered and acknowledged, then the connector stops with an error that names the table and column. The changes of the transaction that holds the row are not delivered, and they are replayed when the connector is started again after the column is removed or the table is excluded. Rows of tables excluded by `tables` are skipped and never stop the connector.
 - There is no initial snapshot. The stream starts at the outbound server's position.
 - Not tested: Standard Edition 2, RAC, Data Guard and managed cloud databases.

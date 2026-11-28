@@ -40,7 +40,7 @@ use config::Settings;
 use event::{StagedMessage, build_message};
 use oci::{Client, ConnectParams, Session};
 use state::{STATE_VERSION, State};
-use stream::{DrainError, Drained, LcrStream, Limits, TableFilter, drain_batch};
+use stream::{Drained, LcrStream, Limits, TableFilter, drain_batch};
 
 source_connector!(OracleSource);
 
@@ -280,11 +280,11 @@ impl Source for OracleSource {
     async fn poll(&self) -> Result<ProducedMessages, Error> {
         let settings = self.settings()?;
         sleep(settings.poll_interval).await;
-        if let Some(reason) = self.fatal.lock().await.clone() {
-            return Err(Error::SchemaMismatch(reason));
-        }
         if let Some(staged) = self.staged.lock().await.as_ref() {
             return Ok(staged.to_produced());
+        }
+        if let Some(reason) = self.fatal.lock().await.clone() {
+            return Err(Error::SchemaMismatch(reason));
         }
         let session = self.take_session().await?;
         let limits = Limits {
@@ -301,6 +301,14 @@ impl Source for OracleSource {
         match outcome {
             Ok(drained) => {
                 *self.session.lock().await = session;
+                if let Some(blocked) = &drained.blocked {
+                    let reason = blocked.to_string();
+                    warn!(
+                        "{CONNECTOR_NAME} ID: {} will stop after this batch is acknowledged: {reason}",
+                        self.id
+                    );
+                    *self.fatal.lock().await = Some(reason);
+                }
                 if settings.verbose {
                     info!(
                         "{CONNECTOR_NAME} ID: {} drained {} changes, last commit: {}",
@@ -311,17 +319,12 @@ impl Source for OracleSource {
                 }
                 self.stage(drained).await
             }
-            Err(DrainError::Stream(error)) => {
+            Err(error) => {
                 warn!(
                     "Receive failed for {CONNECTOR_NAME} ID: {}, will re-attach: {error}",
                     self.id
                 );
                 Err(Error::Connection(error.to_string()))
-            }
-            Err(error @ DrainError::UnsupportedType { .. }) => {
-                let reason = error.to_string();
-                *self.fatal.lock().await = Some(reason.clone());
-                Err(Error::SchemaMismatch(reason))
             }
         }
     }
@@ -329,12 +332,15 @@ impl Source for OracleSource {
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
         match result {
             SourceBatchResult::Ack => {
-                let Some(staged) = self.staged.lock().await.take() else {
-                    return Ok(());
-                };
-                *self.state.lock().await = staged.candidate;
-                if let Some(position) = staged.commit_position {
-                    self.set_low_position(position).await;
+                let staged = self.staged.lock().await.take();
+                if let Some(staged) = staged {
+                    *self.state.lock().await = staged.candidate;
+                    if let Some(position) = staged.commit_position {
+                        self.set_low_position(position).await;
+                    }
+                }
+                if let Some(reason) = self.fatal.lock().await.clone() {
+                    return Err(Error::SchemaMismatch(reason));
                 }
             }
             SourceBatchResult::Nack => {
@@ -673,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_unsupported_type_when_polling_should_fail_and_keep_failing() {
+    async fn given_unsupported_type_when_polling_should_deliver_earlier_commits_then_stop_on_ack() {
         let mut row = insert("APP.T", "1.1.1", 1);
         if let Received::Row(change) = &mut row {
             change.new.push(crate::stream::testing::column(
@@ -681,14 +687,53 @@ mod tests {
                 crate::stream::Value::Unsupported,
             ));
         }
-        let (source, _) = source_with(vec![Ok(row), Ok(commit(1))]).await;
-        let first = source.poll().await.expect_err("must fail");
+        let (source, processed) = source_with(vec![
+            Ok(insert("APP.T", "1.1.1", 1)),
+            Ok(commit(1)),
+            Ok(row),
+        ])
+        .await;
+        let batch = source
+            .poll()
+            .await
+            .expect("the committed prefix is delivered");
+        assert_eq!(batch.messages.len(), 1);
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("a nack does not stop the source");
+        let resent = source.poll().await.expect("the prefix is sent again");
+        assert_eq!(resent.messages.len(), 1);
+        let stop = source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect_err("the ack stops the source");
         assert!(
-            matches!(&first, Error::SchemaMismatch(reason) if reason.contains("APP.T.BODY")),
-            "{first:?}"
+            matches!(&stop, Error::SchemaMismatch(reason) if reason.contains("APP.T.BODY")),
+            "{stop:?}"
         );
-        let second = source.poll().await.expect_err("the failure is sticky");
-        assert_eq!(first, second);
+        assert_eq!(*processed.lock().expect("lock"), vec![vec![1u8]]);
+    }
+
+    #[tokio::test]
+    async fn given_unsupported_type_without_earlier_commit_when_acknowledging_should_stop() {
+        let mut row = insert("APP.T", "1.1.1", 1);
+        if let Received::Row(change) = &mut row {
+            change.new.push(crate::stream::testing::column(
+                "BODY",
+                crate::stream::Value::Unsupported,
+            ));
+        }
+        let (source, _) = source_with(vec![Ok(row)]).await;
+        let batch = source.poll().await.expect("an empty batch");
+        assert!(batch.messages.is_empty());
+        let stop = source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect_err("the ack stops the source");
+        assert!(matches!(stop, Error::SchemaMismatch(_)), "{stop:?}");
+        let later = source.poll().await.expect_err("later polls keep failing");
+        assert!(matches!(later, Error::SchemaMismatch(_)), "{later:?}");
     }
 
     #[tokio::test]

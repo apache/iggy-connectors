@@ -28,6 +28,8 @@ verbose = false
 [[streams]]
 stream = "oracle"
 topic = "changes"
+# One partition keeps the Oracle commit order. Without it, messages are spread over the partitions of an existing topic.
+partition_id = 0
 schema = "json"
 batch_length = 1000
 linger_time = "5ms"

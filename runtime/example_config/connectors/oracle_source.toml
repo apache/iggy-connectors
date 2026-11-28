@@ -1,0 +1,49 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "source"
+key = "oracle"
+# Disabled until the outbound server exists and the credentials are filled in. Requires an Oracle GoldenGate licence.
+enabled = false
+version = 0
+name = "Oracle source"
+path = "target/release/libiggy_connector_oracle_xstream_source"
+plugin_config_format = "toml"
+verbose = false
+
+[[streams]]
+stream = "oracle"
+topic = "changes"
+# One partition keeps the Oracle commit order. Without it, messages are spread over the partitions of an existing topic.
+partition_id = 0
+schema = "json"
+batch_length = 1000
+linger_time = "5ms"
+
+[plugin_config]
+connect_string = "dbhost:1521/ORCLCDB"
+username = "c##xstrmadmin"
+password = "change-me"
+outbound_server = "IGGY_XOUT"
+# oci_library_path = "/opt/oracle/instantclient/libclntsh.so"
+# tables = ["APP.ORDERS", "APP.CUSTOMERS"]   # "APP.*" also covers tables created later
+poll_interval = "100ms"
+poll_budget = "500ms"
+max_batch_events = 1000
+reattach_backoff = "5s"
+max_reattach_attempts = 5
+verbose_logging = false
